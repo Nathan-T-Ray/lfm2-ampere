@@ -73,13 +73,33 @@ __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __res
         // 8 KB to shared, synchronised, and read it straight back.
         const int warp = tid >> 5;
         const int lane = tid & 31;
+        // Two blocks at a time, with their reduction chains written adjacently.
+        //
+        // Each Q8_1 block needs a 5-step shfl_xor sum and there are eight
+        // independent blocks per warp.  Issued one at a time those five steps
+        // are a serial ~125-cycle dependency chain, eight times over: measured
+        // at 1.07 us of this kernel's 2.11 us of execution, the single largest
+        // item in the 81 norms that together cost 220 us per token.
+        // Two blocks at a time, with their reduction chains written adjacently.
+        //
+        // Each Q8_1 block needs a 5-step shfl_xor sum and there are eight
+        // independent blocks per warp.  Issued one at a time those five steps
+        // are a serial ~125-cycle dependency chain, eight times over: measured
+        // at 1.07 us of this kernel's 2.11 us of execution, the largest single
+        // item in the 81 norms that cost 220 us per token.
+        //
+        // Two at a time measures best (1.07 -> 0.86 us).  Four and eight were
+        // tried and are worse -- the extra live registers cost more than the
+        // overlap gains.  Each block still runs the same five steps in the same
+        // order from the same starting value, so this is bit-identical.
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int i = tid + j * 256;
-            const float t = xv[j] * inv * wv[j];
-            if (y32) y32[i] = t;
-            if (y16) y16[i] = __float2half(t);
-            if (yq8) quantize_q8_1_warp(t, yq8 + warp + 8 * j, lane);
+        for (int j = 0; j < 8; j += 2) {
+            const int i0 = tid + j * 256, i1 = tid + (j + 1) * 256;
+            const float t0 = xv[j] * inv * wv[j];
+            const float t1 = xv[j + 1] * inv * wv[j + 1];
+            if (y32) { y32[i0] = t0; y32[i1] = t1; }
+            if (y16) { y16[i0] = __float2half(t0); y16[i1] = __float2half(t1); }
+            if (yq8) quantize_q8_1_warp2(t0, t1, yq8 + warp + 8 * j, yq8 + warp + 8 * j + 8, lane);
         }
         return;
     }

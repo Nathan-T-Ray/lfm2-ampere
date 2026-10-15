@@ -75,6 +75,22 @@ oracle-tools: $(BUILD)/oracle_logits $(BUILD)/oracle_ppl
 $(BUILD)/bench_launch: tests/bench_launch.cu | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
 
+$(BUILD)/bench_norm: tests/bench_norm.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_norm.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+$(BUILD)/bench_small: tests/bench_small.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_small.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+# True marginal cost of the small kernels, and a phase ablation of the norm.
+# The per-kernel profiler adds ~2.1 us of event instrument to every reading,
+# which is larger than several of these kernels; these measure back to back
+# under one event pair instead.
+bench-norm: $(BUILD)/bench_norm
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_norm
+
+bench-small: $(BUILD)/bench_small
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_small
+
 # Gate G3: launch cost, event-bracket cost and graph-replay cost.  Run this
 # before believing any per-kernel profile.
 bench-launch: $(BUILD)/bench_launch

@@ -43,6 +43,32 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
 // Warp-cooperative Q8_1 quantisation: one warp per 32-element block, one
 // element per lane.  Mirrors ggml-cuda's quantize_q8_1 exactly.
 // ---------------------------------------------------------------------------
+// Interleaved form for two independent 32-element blocks: the same per-block
+// operations in the same order, but the two reduction chains sit adjacent so
+// their latencies overlap instead of serialising.  Each block still performs
+// the same five shfl_xor steps in the same sequence, so every value produced
+// is bit-identical to calling the single-block form twice.
+__device__ __forceinline__ void quantize_q8_1_warp2(const float x0, const float x1,
+                                                    block_q8_1 * __restrict__ y0,
+                                                    block_q8_1 * __restrict__ y1, int lane) {
+    const unsigned a0 = __reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(x0)));
+    const unsigned a1 = __reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(x1)));
+    float s0 = x0, s1 = x1;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+    }
+    const float d0 = __uint_as_float(a0) / 127.0f;
+    const float d1 = __uint_as_float(a1) / 127.0f;
+    y0->qs[lane] = (a0 == 0u) ? (int8_t) 0 : (int8_t) roundf(x0 / d0);
+    y1->qs[lane] = (a1 == 0u) ? (int8_t) 0 : (int8_t) roundf(x1 / d1);
+    if (lane == 0) {
+        y0->ds = __floats2half2_rn(d0, s0);
+        y1->ds = __floats2half2_rn(d1, s1);
+    }
+}
+
 __device__ __forceinline__ void quantize_q8_1_warp(const float xi, block_q8_1 * y, int lane) {
     // A maximum is exact and independent of reduction order, so the hardware
     // reduction gives a bit-identical answer.  For non-negative floats the IEEE
