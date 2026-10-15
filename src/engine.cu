@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
   fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
@@ -437,15 +438,27 @@ int main(int argc, char ** argv) {
     next = toks.back();
     int pos = (int)toks.size() - 1;
 
-    printf("out:");
+    const bool bench = getenv("LK_BENCH") != nullptr;
+    if (!bench) printf("out:");
+    auto t0 = std::chrono::steady_clock::now();
+    int ngen_done = 0;
     for (int i = 0; i < ngen; ++i) {
         forward(*e, next, pos, st);
         CK(cudaMemcpy(&next, e->d_next, 4, cudaMemcpyDeviceToHost));
-        printf(" %d", next);
-        fflush(stdout);
+        if (!bench) { printf(" %d", next); fflush(stdout); }
+        ++ngen_done;
         ++pos;
         if (pos + 1 >= max_seq) break;
     }
-    printf("\n");
+    CK(cudaStreamSynchronize(st));
+    auto t1 = std::chrono::steady_clock::now();
+    if (!bench) printf("\n");
+    const double sec = std::chrono::duration<double>(t1 - t0).count();
+    const double tps = ngen_done / sec;
+    // Per-token weight traffic at batch-1, top-4-of-64 experts (bytes).
+    const double BYTES_PER_TOKEN = 1466751488.0;
+    printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f\n",
+           pos + 1, ngen_done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
+           100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0);
     return 0;
 }
