@@ -117,37 +117,53 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 }
 
 // ---------------------------------------------------------------------------
+// MoE router: logits[j] = dot(h, gate_inp[j]) for the 64 experts, then
+// sigmoid, top-4 by (sigmoid + bias), weights from the UNBIASED sigmoid,
+// renormalised.  Matches llama.cpp's SIGMOID gating path exactly.
+//
+// Originally this was ONE block of 64 threads, each computing a whole
+// 2048-element dot serially -- i.e. 2048 dependent loads per thread, 38 times
+// per token, on a GPU with 84 SMs sitting idle.  Now one WARP per expert
+// (64 warps = 2048 threads), lanes striding the row, with a warp reduction.
+// The sigmoid/top-4 logic is unchanged and still runs on one thread, so the
+// result is identical.
 __global__ void k_router_top4(const float * __restrict__ h, const float * __restrict__ gate_inp,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out) {
     __shared__ float s_logit[LK_N_EXPERTS];
-    __shared__ float s_sel[LK_N_EXPERTS];
-    for (int j = threadIdx.x; j < LK_N_EXPERTS; j += blockDim.x) {
+    // 1024 threads = 32 warps; each warp covers 2 of the 64 experts.
+    // (2048 threads would exceed maxThreadsPerBlock.)
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarp = blockDim.x >> 5;
+    for (int e = warp; e < LK_N_EXPERTS; e += nwarp) {
+        const float * row = gate_inp + (size_t)e * LK_HIDDEN;
         float acc = 0.0f;
-        const float * row = gate_inp + (size_t)j * LK_HIDDEN;
-        for (int i = 0; i < LK_HIDDEN; ++i) acc += row[i] * h[i];
-        s_logit[j] = acc;
-        s_sel[j] = 1.0f / (1.0f + __expf(-acc)) + bias[j];
+        for (int i = lane; i < LK_HIDDEN; i += 32) acc += row[i] * h[i];
+        acc = warp_sum(acc);
+        if (lane == 0) s_logit[e] = acc;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        float sel[LK_N_EXPERTS];
+        for (int j = 0; j < LK_N_EXPERTS; ++j)
+            sel[j] = 1.0f / (1.0f + expf(-s_logit[j])) + bias[j];
         float prob[LK_TOP_K];
         int idx[LK_TOP_K];
         for (int k = 0; k < LK_TOP_K; ++k) { idx[k] = -1; prob[k] = -1e30f; }
         for (int j = 0; j < LK_N_EXPERTS; ++j) {
             for (int k = 0; k < LK_TOP_K; ++k) {
-                if (s_sel[j] > prob[k]) {
+                if (sel[j] > prob[k]) {
                     for (int m = LK_TOP_K - 1; m > k; --m) { prob[m] = prob[m-1]; idx[m] = idx[m-1]; }
-                    prob[k] = s_sel[j]; idx[k] = j;
+                    prob[k] = sel[j]; idx[k] = j;
                     break;
                 }
             }
         }
-        // weights come from the UNBIASED sigmoid
         float wsum = 0.0f;
         float wv[LK_TOP_K];
         for (int k = 0; k < LK_TOP_K; ++k) {
-            wv[k] = 1.0f / (1.0f + __expf(-s_logit[idx[k]]));
+            wv[k] = 1.0f / (1.0f + expf(-s_logit[idx[k]]));
             wsum += wv[k];
         }
         if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;

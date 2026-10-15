@@ -343,7 +343,7 @@ static void forward(Engine & e, cudaStream_t st) {
             // llama.cpp's ggml_rms_norm emits f32 and ffn_gate_inp is F32, so
             // build_lora_mm runs f32 x f32.  (The experts, by contrast, take
             // the Q8_1-quantised activation.)
-            k_router_top4<<<1, 64, 0, st>>>(e.h, P32(e, l.router), P32(e, l.rbias),
+            k_router_top4<<<1, 512, 0, st>>>(e.h, P32(e, l.router), P32(e, l.rbias),
                                             e.d_idx, e.d_w);
             // Phase 4: ONE launch per matrix for all 4 experts (grid.y = expert),
             // replacing 16 launches per MoE layer.  Weights stay on device, so the
