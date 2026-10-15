@@ -301,6 +301,26 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             k_gemv_q4_0<<<grid_for(LK_DENSE_INTER), 256, 0, st>>>(
                 PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0);
             k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter);
+            if (il == 0 && getenv("LK_DUMP_FFN")) {   // dense-FFN intermediates
+                const char * dp = getenv("LK_DUMP_FFN");
+                FILE * df = fopen(dp, "wb");
+                float th2[LK_HIDDEN], tg[LK_DENSE_INTER], ti[LK_DENSE_INTER], tx[LK_HIDDEN];
+                int8_t tq[64 * (int)sizeof(block_q8_1)];
+                CK(cudaStreamSynchronize(st));
+                CK(cudaMemcpy(th2, e.h, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                fwrite(th2, 4, LK_HIDDEN, df);        // h2 = ffn_norm output
+                CK(cudaMemcpy(tq, e.xq, sizeof tq, cudaMemcpyDeviceToHost));
+                fwrite(tq, 1, sizeof tq, df);         // its Q8_1 blocks
+                CK(cudaMemcpy(tg,  e.y, LK_DENSE_INTER * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(ti,  e.y + LK_DENSE_INTER, LK_DENSE_INTER * 4, cudaMemcpyDeviceToHost));
+                fwrite(ti, 4, LK_DENSE_INTER, df);   // up (before swiglu overwrote it)
+                CK(cudaMemcpy(ti,  e.inter, LK_DENSE_INTER * 4, cudaMemcpyDeviceToHost));
+                fwrite(tg, 4, LK_DENSE_INTER, df);   // gate
+                fwrite(ti, 4, LK_DENSE_INTER, df);   // swiglu intermediate
+                (void)tx;
+                fclose(df);
+                fprintf(stderr, "dumped layer-0 dense-FFN gate+up+inter\n");
+            }
             k_quantize_q8_1<<<LK_DENSE_INTER / 32, 32, 0, st>>>(e.inter, e.xq, LK_DENSE_INTER / 32);
             k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1);

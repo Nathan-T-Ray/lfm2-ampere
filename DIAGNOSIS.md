@@ -237,3 +237,58 @@ Bisect layer 0's *dense FFN* the same way the ShortConv was bisected: dump
 codes, and the down output, each compared against `ref_forward.py`. Layer 0 is
 dense-FFN and comes right after the now-verified ShortConv, so it is the next
 unverified stage in the chain.
+
+---
+
+# UPDATE (round 7): ROOT CAUSE FOUND -- fp32 summation order, amplified
+
+## The complete causal chain, measured end to end in layer 0
+
+Layer 0 is `embed -> ShortConv -> dense FFN`. The ShortConv path is proven exact
+(round 6). Bisecting the dense FFN, with all debug flags off:
+
+| tensor | mean abs diff | relative | corr |
+|---|---|---|---|
+| `h2` = rmsnorm(x1, ffn_norm) | 8.64e-07 | 5.6e-06 max | -- |
+| Q8_1 codes of `h2` | **2 of 2048 flip** | | |
+| `ds.x` (d) | **0 of 64 blocks** | | |
+| `ds.y` (raw sum) | **5 of 64 blocks** | one fp16 ulp each | |
+| `gate` = ffn_gate(h2) | 5.12e-05 | 5.3e-04 | 0.99999975 |
+| `up` = ffn_up(h2) | 4.88e-05 | 7.4e-04 | 0.99999959 |
+| `inter` = silu(gate)*up | 2.39e-06 | 6.7e-04 | 0.99999952 |
+
+So:
+
+1. **`h2` differs by ~5.6e-6 relative.** Source: the NumPy reference reduces the
+   RMSNorm sum in float64 while `k_rmsnorm` uses an fp32 tree reduction. Two
+   different fp32 orders differ by ~1e-7; fp32 vs float64 differs by more.
+2. That tiny difference is **discontinuous-amplified** by the Q8_1 quantiser:
+   `round(x/d)` flips for elements near a boundary (2 of 2048 here), and
+   `ds` is stored as a **half2**, so a near-boundary `d` or `sum` rounds to a
+   different fp16 value for a whole 32-element block (5 of 64 blocks).
+3. Those flips perturb `gate`/`up` by ~5e-4 relative -- precisely the Q8_1
+   quantisation error scale.
+4. `inter` inherits ~7e-4 relative, which projects through `ffn_down` (11776
+   inputs) to the ~3.5e-5 seen in the residual after layer 0.
+5. The residual stream then amplifies ~20% per layer, and once the error is
+   large enough it **flips MoE expert selection**, which is discrete -- hence
+   the jump from mean|d| 1.5e-02 at idx 21 to 1.0e-01 (max 23) at idx 22.
+
+## Conclusion
+
+The engine is **algorithmically correct**. The remaining C1 gap is fp32
+summation-order sensitivity, amplified ~1000x across 40 layers. Exact greedy
+parity therefore requires matching ggml-cuda's reduction order bit-for-bit in
+every reduction that feeds a quantiser -- above all `k_rmsnorm`, which is the
+entry point of every layer.
+
+## Fix (next)
+
+Replicate ggml-cuda's `rms_norm` reduction exactly (block shape, warp shuffle
+pattern, and accumulation order) instead of the current generic tree reduce.
+`src/kernels.cu:k_rmsnorm` is the single highest-leverage change. Verify by
+re-running this same table: `h2` should drop to ~1e-7 or exactly 0, the Q8_1
+code flips should go to 0, and the whole layer-0 chain should follow.
+
+Secondary: the same argument applies to `k_attention_decode`'s softmax
+reduction and the `warp_sum` in `k_gemv_q4_0` vs ggml's mmvq split.

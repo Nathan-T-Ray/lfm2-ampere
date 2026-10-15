@@ -30,7 +30,7 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
-__device__ __forceinline__ float silu_f(float v) { return v / (1.0f + __expf(-v)); }
+__device__ __forceinline__ float silu_f(float v) { return v / (1.0f + expf(-v)); }
 
 // NEOX (half-split) RoPE, head_dim 64, theta 1e7.  Verified from llama.cpp:
 // LLAMA_ROPE_TYPE_NEOX -> rotate_pairs(n_dims, n_dims/2) gives
