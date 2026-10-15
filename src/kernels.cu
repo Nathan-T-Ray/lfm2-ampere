@@ -33,8 +33,22 @@ __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __res
     const int tid = threadIdx.x;
 
     // ---- phase 1: EXACTLY the original k_rmsnorm order (256 threads, tree) --
+    // The summation order is untouched; only the loads are batched.  With one
+    // load in flight per thread a 256-thread block has 8 warps x 128 B = 1 KB
+    // outstanding, which at ~500 cycles of HBM latency is ~2.8 GB/s.  These
+    // norms run 81 times per token and measured ~5 us each (3.5 GB/s); issuing
+    // all eight loads before accumulating fills the memory pipeline without
+    // changing a single floating-point operation.
     float sq = 0.0f;
-    for (int i = tid; i < n; i += 256) { const float v = x[i]; sq += v * v; }
+    if (n == 2048) {
+        float v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = x[tid + j * 256];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sq += v[j] * v[j];
+    } else {
+        for (int i = tid; i < n; i += 256) { const float v = x[i]; sq += v * v; }
+    }
     s_sq[tid] = sq;
     __syncthreads();
     for (int o = 128; o > 0; o >>= 1) {
@@ -42,11 +56,25 @@ __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __res
         __syncthreads();
     }
     const float inv = rsqrtf(s_sq[0] / (float)n + eps);
-    for (int i = tid; i < n; i += 256) {
-        const float v = x[i] * inv * w[i];
-        if (y32) y32[i] = v;
-        if (y16) y16[i] = __float2half(v);
-        s_h[i] = v;
+    if (n == 2048) {                     // same arithmetic, both loads batched
+        float v[8], wv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { v[j] = x[tid + j * 256]; wv[j] = w[tid + j * 256]; }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int i = tid + j * 256;
+            const float t = v[j] * inv * wv[j];
+            if (y32) y32[i] = t;
+            if (y16) y16[i] = __float2half(t);
+            s_h[i] = t;
+        }
+    } else {
+        for (int i = tid; i < n; i += 256) {
+            const float v = x[i] * inv * w[i];
+            if (y32) y32[i] = v;
+            if (y16) y16[i] = __float2half(v);
+            s_h[i] = v;
+        }
     }
     __syncthreads();
 
@@ -109,11 +137,27 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= out_rows) return;
+    // 8 super-blocks per 2048-dim row.  The loop bound is a runtime argument,
+    // so nvcc cannot unroll it and the warp pays a full ~500-cycle HBM round
+    // trip per super-block -- 8 serialised stalls per row, which measured as
+    // 511 GB/s against a 956 GB/s achievable ceiling on a kernel that is 15% of
+    // all bytes moved.  Specialising the only value this model ever passes lets
+    // the eight independent loads issue together.  Unrolling does not reorder
+    // any addition, so the result is bit-identical.
     float acc = 0.0f;
-    for (int sb = 0; sb < sbpr; ++sb) {          // 8 super-blocks per 2048-dim row
-        const size_t blk = (size_t)warp * sbpr + sb;
-        acc += dot_q6_K_q8_1_warp(ql + blk * 128, qh + blk * 64, sc + blk * 16,
-                                  __half2float(d[blk]), xq + (size_t)sb * 8, lane);
+    if (sbpr == 8) {
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) {
+            const size_t blk = (size_t)warp * 8 + sb;
+            acc += dot_q6_K_q8_1_warp(ql + blk * 128, qh + blk * 64, sc + blk * 16,
+                                      __half2float(d[blk]), xq + (size_t)sb * 8, lane);
+        }
+    } else {
+        for (int sb = 0; sb < sbpr; ++sb) {
+            const size_t blk = (size_t)warp * sbpr + sb;
+            acc += dot_q6_K_q8_1_warp(ql + blk * 128, qh + blk * 64, sc + blk * 16,
+                                      __half2float(d[blk]), xq + (size_t)sb * 8, lane);
+        }
     }
     acc = warp_sum(acc);
     if (lane == 0) y[warp] = acc;
@@ -161,48 +205,85 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // (64 warps = 2048 threads), lanes striding the row, with a warp reduction.
 // The sigmoid/top-4 logic is unchanged and still runs on one thread, so the
 // result is identical.
-__global__ void k_router_top4(const float * __restrict__ h, const float * __restrict__ gate_inp,
+// The router's dot products, one warp per expert.
+//
+// This is the SAME arithmetic as the single-block version it replaces: lane L
+// accumulates i = L, L+32, ... in increasing order and is reduced by the same
+// shfl_xor butterfly, so all 64 logits come out bit-identical.  Only the
+// scheduling changes.  The original ran ONE 512-thread block, i.e. 16 warps of
+// memory-level parallelism for a 512 KB read; at ~500 cycles of HBM latency
+// that caps a block near 45 GB/s, and it measured 23.6 us per layer -- 20% of
+// the whole decode step, for 1.4% of the bytes.  Sixty-four single-warp blocks
+// put the same read on 64 different SMs, and batching the loads keeps several
+// in flight per warp.
+#define LK_ROUTER_UNROLL 8
+__global__ void __launch_bounds__(32) k_router_dot(
+        const float * __restrict__ h, const float * __restrict__ gate_inp,
+        float * __restrict__ logits) {
+    const int e = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float * row = gate_inp + (size_t)e * LK_HIDDEN;
+    float acc = 0.0f;
+    for (int base = 0; base < LK_HIDDEN; base += 32 * LK_ROUTER_UNROLL) {
+        float v[LK_ROUTER_UNROLL], hv[LK_ROUTER_UNROLL];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) v[j]  = row[base + j * 32 + lane];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) hv[j] = h[base + j * 32 + lane];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) acc += v[j] * hv[j];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) logits[e] = acc;
+}
+
+// The selection half: sigmoid + bias ranking, top-4, renormalised.  Byte for
+// byte the original body, except that the 64 logits now arrive from global
+// memory instead of a block-local array.
+__global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out) {
-    __shared__ float s_logit[LK_N_EXPERTS];
-    // 1024 threads = 32 warps; each warp covers 2 of the 64 experts.
-    // (2048 threads would exceed maxThreadsPerBlock.)
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int nwarp = blockDim.x >> 5;
-    for (int e = warp; e < LK_N_EXPERTS; e += nwarp) {
-        const float * row = gate_inp + (size_t)e * LK_HIDDEN;
-        float acc = 0.0f;
-        for (int i = lane; i < LK_HIDDEN; i += 32) acc += row[i] * h[i];
-        acc = warp_sum(acc);
-        if (lane == 0) s_logit[e] = acc;
+    __shared__ float s_sel[LK_N_EXPERTS];
+    __shared__ float s_sig[LK_N_EXPERTS];
+    const int t = threadIdx.x;
+    // Split the sigmoids across lanes.  Thread 0 computing all 64 of them made
+    // this kernel cost 15.3 us: a single active lane issues one instruction per
+    // cycle and stalls for the full latency of every dependent step inside
+    // expf, so 64 serial ~200-cycle chains is ~10 us of pure stall.  The values
+    // produced are identical (same expf, same inputs), so the ranking below is
+    // bit-for-bit the same decision.
+    if (t < LK_N_EXPERTS) {
+        const float g = 1.0f / (1.0f + expf(-logits[t]));
+        s_sig[t] = g;
+        s_sel[t] = g + bias[t];
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float sel[LK_N_EXPERTS];
-        for (int j = 0; j < LK_N_EXPERTS; ++j)
-            sel[j] = 1.0f / (1.0f + expf(-s_logit[j])) + bias[j];
-        float prob[LK_TOP_K];
-        int idx[LK_TOP_K];
-        for (int k = 0; k < LK_TOP_K; ++k) { idx[k] = -1; prob[k] = -1e30f; }
-        for (int j = 0; j < LK_N_EXPERTS; ++j) {
-            for (int k = 0; k < LK_TOP_K; ++k) {
-                if (sel[j] > prob[k]) {
-                    for (int m = LK_TOP_K - 1; m > k; --m) { prob[m] = prob[m-1]; idx[m] = idx[m-1]; }
-                    prob[k] = sel[j]; idx[k] = j;
-                    break;
-                }
-            }
-        }
-        float wsum = 0.0f;
-        float wv[LK_TOP_K];
-        for (int k = 0; k < LK_TOP_K; ++k) {
-            wv[k] = 1.0f / (1.0f + expf(-s_logit[idx[k]]));
-            wsum += wv[k];
-        }
-        if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
-        for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = idx[k]; w_out[k] = wv[k] / wsum; }
+    if (t != 0) return;
+    const float * sel = s_sel;
+    // Same insertion as the original nested loop, unrolled by hand.  With a
+    // variable inner trip count nvcc spills prob[]/idx[] to local memory and
+    // every shift becomes a dependent local load/store pair; in a single active
+    // lane that measured ~5 us per layer.  The explicit registers make the
+    // whole selection a handful of cycles.
+    static_assert(LK_TOP_K == 4, "unrolled selection assumes top-4");
+    float p0 = -1e30f, p1 = -1e30f, p2 = -1e30f, p3 = -1e30f;
+    int   i0 = -1,     i1 = -1,     i2 = -1,     i3 = -1;
+    for (int j = 0; j < LK_N_EXPERTS; ++j) {
+        const float v = sel[j];
+        if      (v > p0) { p3 = p2; i3 = i2; p2 = p1; i2 = i1; p1 = p0; i1 = i0; p0 = v; i0 = j; }
+        else if (v > p1) { p3 = p2; i3 = i2; p2 = p1; i2 = i1; p1 = v;  i1 = j; }
+        else if (v > p2) { p3 = p2; i3 = i2; p2 = v;  i2 = j; }
+        else if (v > p3) { p3 = v;  i3 = j; }
     }
+    const int idx[LK_TOP_K] = { i0, i1, i2, i3 };
+    float wsum = 0.0f;
+    float wv[LK_TOP_K];
+    for (int k = 0; k < LK_TOP_K; ++k) {
+        wv[k] = s_sig[idx[k]];      // unbiased sigmoid, already computed above
+        wsum += wv[k];
+    }
+    if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
+    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = idx[k]; w_out[k] = wv[k] / wsum; }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,23 +419,57 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
 }
 
 // ---------------------------------------------------------------------------
-__global__ void k_argmax(const float * __restrict__ v, int n,
-                         int * __restrict__ d_token, int * __restrict__ d_pos) {
-    __shared__ float s_v[256];
-    __shared__ int   s_i[256];
-    float best = -1e30f; int bi = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-        if (v[i] > best) { best = v[i]; bi = i; }
-    s_v[threadIdx.x] = best; s_i[threadIdx.x] = bi;
+// Two-stage argmax.
+//
+// The single-block scan kept exactly one load in flight per thread: 256 threads
+// is 8 warps is 1 KB outstanding, which at ~500 cycles of HBM latency works out
+// at ~2.8 GB/s -- and it measured 145 us to read 512 KB, 4% of the step for
+// 0.03% of the bytes.  Stage 1 spreads the read over 125 blocks; stage 2
+// reduces the 125 block winners.  Each thread owns a CONTIGUOUS run of
+// elements and every level of the reduction breaks ties toward the lower index,
+// so the answer is still the lowest index attaining the maximum.
+#define LK_ARGMAX_BLOCKS      125
+#define LK_ARGMAX_PER_THREAD  4
+
+__global__ void k_argmax_part(const float * __restrict__ v,
+                              float * __restrict__ pv, int * __restrict__ pi) {
+    const int tid  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int base = tid * LK_ARGMAX_PER_THREAD;
+    float best = -1e30f; int bi = base;
+#pragma unroll
+    for (int j = 0; j < LK_ARGMAX_PER_THREAD; ++j) {
+        const float t = v[base + j];
+        if (t > best) { best = t; bi = base + j; }
+    }
+    __shared__ float sv[256];
+    __shared__ int   si[256];
+    sv[threadIdx.x] = best; si[threadIdx.x] = bi;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if ((int)threadIdx.x < o && s_v[threadIdx.x + o] > s_v[threadIdx.x]) {
-            s_v[threadIdx.x] = s_v[threadIdx.x + o];
-            s_i[threadIdx.x] = s_i[threadIdx.x + o];
+        if ((int)threadIdx.x < o && sv[threadIdx.x + o] > sv[threadIdx.x]) {
+            sv[threadIdx.x] = sv[threadIdx.x + o];
+            si[threadIdx.x] = si[threadIdx.x + o];
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { *d_token = s_i[0]; atomicAdd(d_pos, 1); }
+    if (threadIdx.x == 0) { pv[blockIdx.x] = sv[0]; pi[blockIdx.x] = si[0]; }
+}
+
+__global__ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
+                               int n, int * __restrict__ d_token, int * __restrict__ d_pos) {
+    __shared__ float sv[256];
+    __shared__ int   si[256];
+    const int tid = threadIdx.x;
+    float best = -1e30f; int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x)
+        if (pv[i] > best) { best = pv[i]; bi = pi[i]; }
+    sv[tid] = best; si[tid] = bi;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o && sv[tid + o] > sv[tid]) { sv[tid] = sv[tid + o]; si[tid] = si[tid + o]; }
+        __syncthreads();
+    }
+    if (tid == 0) { *d_token = si[0]; atomicAdd(d_pos, 1); }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,110 @@
 // LK_DEBUG_STEPS=1 in the environment makes every stage synchronise and report,
 // which localises a fault to an exact kernel.  Off by default (it serialises).
 static int g_debug_steps = 0;
+
+// ---------------------------------------------------------------------------
+// Per-kernel GPU timing (LK_PROFILE=1).
+//
+// Every hypothesis I formed about where the remaining 2.3 ms goes was
+// falsified by a variant build, which means the bottleneck is something I have
+// not thought to vary.  Instrument instead of guessing: bracket each launch
+// with a pair of events in the same stream.  cudaEventElapsedTime between two
+// events already recorded on the stream is GPU execution time for whatever ran
+// between them, so this measures the kernel and not the launch overhead.
+//
+// The paired records do perturb the run (each is a small timestamp write on the
+// GPU timeline), so absolute totals run a little high; the distribution is the
+// point.  Reporting starts empty because the first records happen before any
+// kernel is resident.
+#define LK_PROF_MAX 2048
+static bool         g_prof_on = false;
+static int          g_prof_n  = 0;
+static cudaStream_t g_prof_st = nullptr;
+static cudaEvent_t  g_prof_ev[LK_PROF_MAX * 2];
+static const char * g_prof_tag[LK_PROF_MAX];
+
+static void lk_prof_init(cudaStream_t st) {
+    g_prof_st = st;
+    for (int i = 0; i < LK_PROF_MAX * 2; ++i)
+        CK(cudaEventCreateWithFlags(&g_prof_ev[i], cudaEventDefault));
+}
+
+static inline void lk_prof_begin(const char * tag) {
+    if (g_prof_n >= LK_PROF_MAX) return;
+    g_prof_tag[g_prof_n] = tag;
+    cudaEventRecord(g_prof_ev[g_prof_n * 2], g_prof_st);
+}
+static inline void lk_prof_end(void) {
+    if (g_prof_n >= LK_PROF_MAX) return;
+    cudaEventRecord(g_prof_ev[g_prof_n * 2 + 1], g_prof_st);
+    ++g_prof_n;
+}
+#define LKP_B(t) do { if (g_prof_on) lk_prof_begin(t); } while (0)
+#define LKP_E()  do { if (g_prof_on) lk_prof_end(); } while (0)
+
+// Bytes each kernel must pull from HBM per call, so the report can state the
+// achieved bandwidth next to the time.  A kernel that is at the roofline is
+// done; one that is far below it has a reason that is worth finding.
+static double lk_prof_bytes(const char * t) {
+    struct Row { const char * n; double b; };
+    static const Row T[] = {
+        {"embed",           1680.0}, {"norm_attn",     16384.0},
+        {"shortconv_in", 7077888.0}, {"shortconv_conv", 24576.0},
+        {"quant_conv",         0.0}, {"shortconv_out",2359296.0},
+        {"attn_q",       2359296.0}, {"attn_k",        589824.0},
+        {"attn_v",        589824.0}, {"qk_norm_rope",       0.0},
+        {"attention",          0.0}, {"quant_attn",         0.0},
+        {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
+        {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
+        {"dense_swiglu",       0.0}, {"quant_dense",        0.0},
+        {"dense_down",  13565952.0}, {"router_dot",    524288.0},
+        {"router_top4",        0.0},
+        {"moe_gate",     7077888.0}, {"moe_up",       7077888.0},
+        {"moe_swiglu",         0.0}, {"quant_moe",          0.0},
+        {"moe_down",     7077888.0}, {"moe_accum",          0.0},
+        {"norm_final",     16384.0}, {"lm_head",    215040000.0},
+        {"argmax_part",   512000.0}, {"argmax_final",       0.0},
+    };
+    for (const Row & r : T) if (!strcmp(r.n, t)) return r.b;
+    return 0.0;
+}
+
+static void lk_prof_report(int ctx) {
+    struct Agg { const char * tag; int calls; double ms; };
+    std::vector<Agg> ag;
+    double total = 0.0;
+    for (int i = 0; i < g_prof_n; ++i) {
+        float ms = 0.0f;
+        CK(cudaEventElapsedTime(&ms, g_prof_ev[i * 2], g_prof_ev[i * 2 + 1]));
+        total += ms;
+        int found = -1;
+        for (size_t j = 0; j < ag.size(); ++j)
+            if (!strcmp(ag[j].tag, g_prof_tag[i])) { found = (int) j; break; }
+        if (found < 0) { ag.push_back({g_prof_tag[i], 1, ms}); }
+        else           { ag[found].calls++; ag[found].ms += ms; }
+    }
+    std::sort(ag.begin(), ag.end(),
+              [](const Agg & a, const Agg & b) { return a.ms > b.ms; });
+
+    printf("\n=== per-kernel GPU time, one decode step at ctx=%d ===\n", ctx);
+    printf("%-16s %6s %10s %9s %10s %9s %7s\n",
+           "category", "calls", "total_ms", "avg_us", "MB", "GB/s", "%step");
+    double bytes = 0.0;
+    for (const Agg & a : ag) {
+        double b = lk_prof_bytes(a.tag) * a.calls;
+        if (!strcmp(a.tag, "attention")) b = (double) ctx * 2048.0 * a.calls;
+        bytes += b;
+        const double gbs = (a.ms > 0.0) ? b / (a.ms * 1e-3) / 1e9 : 0.0;
+        printf("%-16s %6d %10.3f %9.2f %10.2f %9.1f %6.1f%%\n",
+               a.tag, a.calls, a.ms, a.ms * 1000.0 / a.calls,
+               b / 1e6, gbs, 100.0 * a.ms / total);
+    }
+    printf("%-16s %6d %10.3f %9s %10.2f %9.1f %6s\n", "TOTAL", g_prof_n, total,
+           "", bytes / 1e6, bytes / (total * 1e-3) / 1e9, "100.0%");
+    printf("(sum of kernel times; excludes launch gaps)\n\n");
+    fflush(stdout);
+}
+
 #define LK_STEP(tag) do { if (g_debug_steps) { \
     cudaError_t e_ = cudaStreamSynchronize(st); \
     if (e_ != cudaSuccess) { fprintf(stderr, "FAULT at stage [%s] layer %d: %s\n", \
@@ -78,6 +182,9 @@ struct Engine {
     float *  moe_down4 = nullptr; // [TOPK * HIDDEN]
     float *  moe_gate = nullptr, * moe_up = nullptr, * moe_inter = nullptr;
     float *  moe_down = nullptr;
+    float *  d_gate = nullptr;   // [64]  router logits, one per expert
+    float *  d_apv = nullptr;    // [125] argmax stage-1 block winners
+    int *    d_api = nullptr;    // [125] their indices
     int *    d_idx = nullptr;
     float *  d_w = nullptr;
 };
@@ -185,6 +292,9 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->moe_up,   LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_inter, LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_down, LK_HIDDEN * 4));
+    CK(cudaMalloc(&e->d_gate, LK_N_EXPERTS * 4));
+    CK(cudaMalloc(&e->d_apv, LK_ARGMAX_BLOCKS * 4));
+    CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_idx, LK_TOP_K * 4));
     CK(cudaMalloc(&e->d_w, LK_TOP_K * 4));
     CK(cudaMemset(e->conv_hist, 0, (size_t)30 * LK_HIDDEN * 2 * 4));
@@ -199,10 +309,11 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
 // entire 40-layer step can be captured once into a cudaGraphExec_t and replayed
 // for every subsequent position.
 static void forward(Engine & e, cudaStream_t st) {
+    LKP_B("embed");
     k_embed_q6_K<<<LK_HIDDEN / 256, 256, 0, st>>>(
         (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
         (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-        e.d_token, e.x);
+        e.d_token, e.x); LKP_E();
     CK(cudaGetLastError());
 
     static FILE * dumpf = nullptr;
@@ -226,15 +337,17 @@ static void forward(Engine & e, cudaStream_t st) {
         }
 
         // ---- sequence mixer -------------------------------------------
-        k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS,
-                                              e.h, e.h16, e.xq);
+        LKP_B("norm_attn");
+    k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS,
+                                              e.h, e.h16, e.xq); LKP_E();
         LK_STEP("mixer-norm");
 
         if (!l.is_attn) {
             float * hist = e.conv_hist + (size_t)conv_i * LK_HIDDEN * 2;
             ++conv_i;
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(6144), 256, 0, st>>>(
-                PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0);
+            LKP_B("shortconv_in");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(6144), 256, 0, st>>>(
+                PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0")) {   // bisect layer 0 tensors
                 const char * dp = getenv("LK_DUMP_L0");
                 FILE * df = fopen(dp, "wb");
@@ -249,7 +362,8 @@ static void forward(Engine & e, cudaStream_t st) {
                 fclose(df);
                 fprintf(stderr, "dumped layer-0 h/xq/bcx to %s\n", dp);
             }
-            k_shortconv<<<8, 256, 0, st>>>(e.y, 0, P32(e, l.sc_conv), hist, e.tmp);
+            LKP_B("shortconv_conv");
+    k_shortconv<<<8, 256, 0, st>>>(e.y, 0, P32(e, l.sc_conv), hist, e.tmp); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0B")) {   // conv output before quantise
                 const char * dp = getenv("LK_DUMP_L0B");
                 FILE * df = fopen(dp, "wb");
@@ -258,7 +372,8 @@ static void forward(Engine & e, cudaStream_t st) {
                 fwrite(ty, 4, LK_HIDDEN, df);
                 fclose(df);
             }
-            k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
+            LKP_B("quant_conv");
+    k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0Q")) {   // q8 of the conv output
                 const char * dp = getenv("LK_DUMP_L0Q");
                 FILE * df = fopen(dp, "wb");
@@ -270,8 +385,9 @@ static void forward(Engine & e, cudaStream_t st) {
             // LK_NO_RESIDUAL forces add_residual=0 for layer 0's out_proj so the
             // raw projection can be compared in isolation (debug only).
             const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar);
+            LKP_B("shortconv_out");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0X")) {   // immediately after the GEMV
                 const char * dp = getenv("LK_DUMP_L0X");
                 FILE * df = fopen(dp, "wb");
@@ -284,36 +400,47 @@ static void forward(Engine & e, cudaStream_t st) {
             LK_STEP("shortconv");
         } else {
             const int al = attn_i++;
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.wq), PD(e, l.wq), e.xq, LK_HIDDEN, 64, e.qv, 0);
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
-                PQS(e, l.wk), PD(e, l.wk), e.xq, 512, 64, e.kv, 0);
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
-                PQS(e, l.wv), PD(e, l.wv), e.xq, 512, 64, e.vv, 0);
+            LKP_B("attn_q");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.wq), PD(e, l.wq), e.xq, LK_HIDDEN, 64, e.qv, 0); LKP_E();
+            LKP_B("attn_k");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
+                PQS(e, l.wk), PD(e, l.wk), e.xq, 512, 64, e.kv, 0); LKP_E();
+            LKP_B("attn_v");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
+                PQS(e, l.wv), PD(e, l.wv), e.xq, 512, 64, e.vv, 0); LKP_E();
             __half * kc = e.kcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             __half * vc = e.vcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
-            k_qk_norm_rope<<<LK_N_HEADS + LK_N_KV_HEADS, LK_HEAD_DIM, 0, st>>>(
+            LKP_B("qk_norm_rope");
+    k_qk_norm_rope<<<LK_N_HEADS + LK_N_KV_HEADS, LK_HEAD_DIM, 0, st>>>(
                 e.qv, e.kv, e.vv, P32(e, l.qnorm), P32(e, l.knorm),
-                e.d_pos, kc, vc);
-            k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
-                e.qv, kc, vc, e.d_pos, e.tmp);
-            k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1);
+                e.d_pos, kc, vc); LKP_E();
+            LKP_B("attention");
+    k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
+                e.qv, kc, vc, e.d_pos, e.tmp); LKP_E();
+            LKP_B("quant_attn");
+    k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32); LKP_E();
+            LKP_B("attn_out");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1); LKP_E();
             LK_STEP("attention");
         }
 
         // ---- channel mixer --------------------------------------------
-        k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS,
-                                              e.h, e.h16, e.xq);
+        LKP_B("norm_ffn");
+    k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS,
+                                              e.h, e.h16, e.xq); LKP_E();
         LK_STEP("ffn-norm");
 
         if (!l.is_moe) {
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
-                PQS(e, l.ffn_gate), PD(e, l.ffn_gate), e.xq, LK_DENSE_INTER, 64, e.y, 0);
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
-                PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0);
-            k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter);
+            LKP_B("dense_gate");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
+                PQS(e, l.ffn_gate), PD(e, l.ffn_gate), e.xq, LK_DENSE_INTER, 64, e.y, 0); LKP_E();
+            LKP_B("dense_up");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
+                PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0); LKP_E();
+            LKP_B("dense_swiglu");
+    k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter); LKP_E();
             if (il == 0 && getenv("LK_DUMP_FFN")) {   // dense-FFN intermediates
                 const char * dp = getenv("LK_DUMP_FFN");
                 FILE * df = fopen(dp, "wb");
@@ -334,34 +461,47 @@ static void forward(Engine & e, cudaStream_t st) {
                 fclose(df);
                 fprintf(stderr, "dumped layer-0 dense-FFN gate+up+inter\n");
             }
-            k_quantize_q8_1<<<LK_DENSE_INTER / 32, 32, 0, st>>>(e.inter, e.xq, LK_DENSE_INTER / 32);
-            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1);
+            LKP_B("quant_dense");
+    k_quantize_q8_1<<<LK_DENSE_INTER / 32, 32, 0, st>>>(e.inter, e.xq, LK_DENSE_INTER / 32); LKP_E();
+            LKP_B("dense_down");
+    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1); LKP_E();
             LK_STEP("dense-ffn");
         } else {
             // The router consumes the POST-ffn_norm hidden state in FP32:
             // llama.cpp's ggml_rms_norm emits f32 and ffn_gate_inp is F32, so
             // build_lora_mm runs f32 x f32.  (The experts, by contrast, take
             // the Q8_1-quantised activation.)
-            k_router_top4<<<1, 512, 0, st>>>(e.h, P32(e, l.router), P32(e, l.rbias),
-                                            e.d_idx, e.d_w);
+            LKP_B("router_dot");
+    k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate); LKP_E();
+            LKP_B("router_top4");
+    // one lane per expert: the sigmoids are computed cooperatively, so a
+    // 32-thread block would leave experts 32..63 uninitialised.
+    k_router_top4<<<1, LK_N_EXPERTS, 0, st>>>(e.d_gate, P32(e, l.rbias),
+                                    e.d_idx, e.d_w); LKP_E();
             // Phase 4: ONE launch per matrix for all 4 experts (grid.y = expert),
             // replacing 16 launches per MoE layer.  Weights stay on device, so the
             // per-layer cudaStreamSynchronize host round-trip is gone too.
             const int GU = LK_TOP_K * LK_MOE_INTER;
-            k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
+            LKP_B("moe_gate");
+    k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
                 PQS(e, l.eg), PD(e, l.eg), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu);
-            k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
+                e.d_idx, e.moe_gu); LKP_E();
+            LKP_B("moe_up");
+    k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
                 PQS(e, l.eu), PD(e, l.eu), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu + GU);
-            k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, e.moe_inter4);
-            k_quantize_q8_1<<<GU / 32, 32, 0, st>>>(e.moe_inter4, e.xq2, GU / 32);
+                e.d_idx, e.moe_gu + GU); LKP_E();
+            LKP_B("moe_swiglu");
+    k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, e.moe_inter4); LKP_E();
+            LKP_B("quant_moe");
+    k_quantize_q8_1<<<GU / 32, 32, 0, st>>>(e.moe_inter4, e.xq2, GU / 32); LKP_E();
             // down: each expert consumes its OWN 48-block activation slice
-            k_gemv_q4_0_exp<<<dim3(grid_for(LK_HIDDEN), LK_TOP_K), 256, 0, st>>>(
+            LKP_B("moe_down");
+    k_gemv_q4_0_exp<<<dim3(grid_for(LK_HIDDEN), LK_TOP_K), 256, 0, st>>>(
                 PQS(e, l.ed), PD(e, l.ed), e.xq2, LK_HIDDEN, 48, LK_HIDDEN, 48,
-                e.d_idx, e.moe_down4);
-            k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN);
+                e.d_idx, e.moe_down4); LKP_E();
+            LKP_B("moe_accum");
+    k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN); LKP_E();
         }
     }
 
@@ -374,13 +514,19 @@ static void forward(Engine & e, cudaStream_t st) {
     }
 
     // ---- final norm + tied Q6_K lm_head + argmax ----------------------
+    LKP_B("norm_final");
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, e.out_norm), LK_HIDDEN, LK_EPS,
-                                          e.h, e.h16, e.xq);
+                                          e.h, e.h16, e.xq); LKP_E();
+    LKP_B("lm_head");
     k_gemv_q6_K<<<grid_for(LK_VOCAB), 256, 0, st>>>(
         (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
         (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-        e.xq, LK_VOCAB, 8, e.logits);
-    k_argmax<<<1, 256, 0, st>>>(e.logits, LK_VOCAB, e.d_token, e.d_pos);
+        e.xq, LK_VOCAB, 8, e.logits); LKP_E();
+    LKP_B("argmax_part");
+    k_argmax_part<<<LK_ARGMAX_BLOCKS, 256, 0, st>>>(e.logits, e.d_apv, e.d_api); LKP_E();
+    LKP_B("argmax_final");
+    k_argmax_final<<<1, 256, 0, st>>>(e.d_apv, e.d_api, LK_ARGMAX_BLOCKS,
+                                      e.d_token, e.d_pos); LKP_E();
     CK(cudaGetLastError());
 }
 
@@ -408,7 +554,11 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "captured CUDA graph: %zu nodes\n", nnode);
 
     auto feed = [&](int tok) { CK(cudaMemcpy(e->d_token, &tok, 4, cudaMemcpyHostToDevice)); };
-    auto run  = [&]() { CK(cudaGraphLaunch(gexec, st)); };
+    // LK_PROFILE swaps graph replay for a direct call so the per-launch
+    // events bracket real kernels; a graph replays as one opaque object.
+    const bool profile = getenv("LK_PROFILE") != nullptr;
+    auto run  = [&]() { if (profile) forward(*e, st);
+                        else CK(cudaGraphLaunch(gexec, st)); };
     auto take = [&]() { int t = 0; CK(cudaMemcpy(&t, e->d_token, 4, cudaMemcpyDeviceToHost)); return t; };
 
     if (strcmp(mode, "topk") == 0) {
@@ -418,6 +568,16 @@ int main(int argc, char ** argv) {
         CK(cudaStreamSynchronize(st));
         std::vector<float> lg(LK_VOCAB);
         CK(cudaMemcpy(lg.data(), e->logits, (size_t)LK_VOCAB * 4, cudaMemcpyDeviceToHost));
+        // C1a: dump the FULL 128k logit vector so it can be correlated against
+        // llama.cpp's, not merely against its top-10 (which would hide any
+        // distribution-wide drift that happens not to cross an argmax).
+        if (const char * ld = getenv("LK_LOGIT_DUMP")) {
+            FILE * lf = fopen(ld, "wb");
+            if (!lf) { perror(ld); return 1; }
+            if (fwrite(lg.data(), 4, LK_VOCAB, lf) != (size_t)LK_VOCAB) {
+                fprintf(stderr, "short write %s\n", ld); return 1; }
+            fclose(lf);
+        }
         std::vector<int> ord(LK_VOCAB);
         for (int i = 0; i < LK_VOCAB; ++i) ord[i] = i;
         std::partial_sort(ord.begin(), ord.begin() + 10, ord.end(),
@@ -472,6 +632,24 @@ int main(int argc, char ** argv) {
         const double ppl = exp(nll / cnt);
         printf("RESULT nll=%.6f tokens=%d ppl=%.6f top1_acc=%.4f\n",
                nll / cnt, cnt, ppl, (double)top1ok / cnt);
+        return 0;
+    }
+
+    if (strcmp(mode, "prof") == 0) {
+        std::vector<int> tk;
+        for (int i = 2; i < argc; ++i) tk.push_back(atoi(argv[i]));
+        if (tk.empty()) { fprintf(stderr, "usage: %s prof TOKEN_ID...\n", argv[0]); return 1; }
+        lk_prof_init(st);
+        for (size_t i = 0; i < tk.size(); ++i) { feed(tk[i]); run(); }
+        CK(cudaStreamSynchronize(st));
+        for (int i = 0; i < 3; ++i) { feed(tk.back()); forward(*e, st); }
+        CK(cudaStreamSynchronize(st));
+        g_prof_n = 0;
+        g_prof_on = true;
+        forward(*e, st);
+        CK(cudaStreamSynchronize(st));
+        g_prof_on = false;
+        lk_prof_report((int) tk.size());
         return 0;
     }
 

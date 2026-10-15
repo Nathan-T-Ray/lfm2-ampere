@@ -469,3 +469,109 @@ work/parallelism:
   with ctx 558 being slower. **Prime suspect.**
 * `k_rmsnorm_q8_1` -- 120 launches of 256 threads for 2048 elements each.
 * `k_swiglu`, `k_shortconv`, `k_moe_accum4` -- moderate.
+
+---
+
+# Phase 4l: per-kernel timing, and the real bottleneck
+
+## Why measurement replaced guessing
+
+Seven consecutive hypotheses about the remaining ~2.4 ms had each been killed by
+a one-variant experiment: instruction issue, occupancy, launch overhead, HBM
+re-read of the Q8_1 activations, serial dependency chains, `LK_GEMV_ROWS`
+tiling. The bottleneck was therefore something none of those experiments had
+varied. So instrument instead: `LK_PROFILE=1` brackets *every* kernel launch in
+its own pair of stream events and aggregates GPU time by category.
+
+## Calibrating the instrument first (tests/bench_launch.cu)
+
+An event bracket is itself measurable work. Before reading any number out of the
+profile, price the floor:
+
+| measurement | result |
+| --- | --- |
+| empty kernel, 550 launches back to back | 1.229 us/launch |
+| empty kernel, each launch event-bracketed | 2.718 us/launch |
+| same 550 launches replayed from a CUDA graph | **0.606 us/node** |
+
+So ~2.1 us of every bracketed reading is the instrument, and the engine's real
+per-launch cost is 0.6 us because it replays a graph. Every kernel measured at
+"3.1-3.6 us" is doing *nothing* -- that is the floor, not a cost.
+
+This calibration is the single most important step: without it the profile
+appears to show 200 kernels each costing 3 us, and the obvious (wrong)
+conclusion is "launch overhead dominates".
+
+## The result, corrected
+
+Totals below subtract the 3.2 us floor and convert the byte column to achieved
+bandwidth, which is what identifies waste:
+
+| category | calls | corrected total | achieved | verdict |
+| --- | --- | --- | --- | --- |
+| MoE gate/up/down | 114 | 0.91 ms | 896 GB/s | at roofline |
+| **lm_head Q6_K** | 1 | **0.42 ms** | **511 GB/s** | 47% of roofline |
+| **rmsnorm x3 kinds** | 81 | **0.23 ms** | 3.5 GB/s | latency-bound |
+| shortconv in/out | 60 | 0.32 ms | 813-907 GB/s | near roofline |
+| **router** | 76 | **0.24 ms** | 22 GB/s | 1.4% of bytes, 8% of time |
+| attention + q/k/v | 40 | 0.11 ms | 813 GB/s | fine at short ctx |
+| dense FFN | 6 | 0.09 ms | 906 GB/s | at roofline |
+
+## The unified root cause: memory-level parallelism
+
+Three unrelated-looking kernels were all limited by the same thing -- the number
+of *outstanding* loads, not bytes and not instructions:
+
+| kernel | shape | outstanding | predicted | measured |
+| --- | --- | --- | --- | --- |
+| `k_argmax` | 1 block x 256 thr | 8 warps x 128 B = 1 KB | 183 us | 145 us |
+| `k_rmsnorm_q8_1` | 1 block x 256 thr | 1 KB | 5.7 us | 5.1 us |
+| `k_router_top4` | 1 block x 512 thr | 2 KB | 11 us | 23.6 us |
+
+At ~500 cycles of HBM latency, 1 KB in flight is ~2.8 GB/s. A single block --
+however many threads it has -- cannot go faster, because each warp only keeps
+one load outstanding unless the compiler is given independent loads to batch.
+
+This explains the seven dead hypotheses at once: none of them changed the number
+of outstanding requests.
+
+## What was changed
+
+1. **Router split in two.** `k_router_dot` (64 blocks x 32 threads, one warp per
+   expert) writes 64 logits; `k_router_top4` selects. The dot keeps the original
+   stride-32 accumulation order and the same `shfl_xor` butterfly, so all 64
+   logits are bit-identical -- only the SM count changes (1 -> 64).
+   **25.7 us -> 4.5 us.**
+2. **Router selection in registers.** The nested-loop insertion sort has runtime
+   trip counts, so `prob[]`/`idx[]` spilled to local memory; each shift became a
+   dependent local load/store pair in a single active lane. Hand-unrolling into
+   an `if/else if` chain with explicit registers is the same insertion, with the
+   same tie-breaking. **15.3 us -> 2.2 us.**
+3. **Two-stage argmax.** 1 block -> 125 blocks x 256 threads with each thread
+   owning 4 *contiguous* elements (contiguity preserves "lowest index wins" at
+   every reduction level), plus a 1-block final. **145 us -> 6 us.**
+4. **Batched loads in the norm.** Same summation order, same tree; the eight
+   loads are just issued before accumulating instead of one at a time.
+5. **`lm_head`: unrolled the superblock loop** (no effect -- see below).
+
+## Result
+
+| | Phase 4k | Phase 4l |
+| --- | --- | --- |
+| decode | 266.57 tok/s | **346.36 tok/s** |
+| % of 1008 GB/s peak | 38.8% | **50.4%** |
+| vs llama.cpp (227.07) | 1.17x | **1.53x** |
+| factual greedy parity | 66/66 | **66/66** |
+| full-suite greedy parity | 180/825 | **180/825** |
+
+## The lesson
+
+**A kernel with one block cannot be fast, no matter how many threads it has.**
+Parallelism in the *grid* dimension is what converts latency into throughput;
+threads within a block do not, unless the source gives the compiler independent
+loads to batch. Three of the engine's most expensive kernels were single-block
+reductions, and each had been "optimised" earlier by adding threads -- which
+could never have worked.
+
+Corollary: **price the instrument before reading it.** A profiler that adds a
+fixed 2 us to every one of 589 launches manufactures a fake 1.2 ms bottleneck.

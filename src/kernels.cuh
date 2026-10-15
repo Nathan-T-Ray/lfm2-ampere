@@ -117,7 +117,10 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // MoE router: sigmoid gate, top-4 selected by (sigmoid + bias), weights taken
 // from the UNBIASED sigmoid and renormalised.  Exactly llama.cpp's
 // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID path.
-__global__ void k_router_top4(const float * __restrict__ h, const float * __restrict__ gate_inp,
+__global__ void __launch_bounds__(32) k_router_dot(
+        const float * __restrict__ h, const float * __restrict__ gate_inp,
+        float * __restrict__ logits);
+__global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out);
 
@@ -149,8 +152,12 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
 
 // Writes the argmax into d_token and bumps d_pos, so a captured graph is
 // position-independent and the whole decode loop can stay on device.
-__global__ void k_argmax(const float * __restrict__ v, int n,
-                         int * __restrict__ d_token, int * __restrict__ d_pos);
+#define LK_ARGMAX_BLOCKS      125
+#define LK_ARGMAX_PER_THREAD  4
+__global__ void k_argmax_part(const float * __restrict__ v,
+                              float * __restrict__ pv, int * __restrict__ pi);
+__global__ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
+                               int n, int * __restrict__ d_token, int * __restrict__ d_pos);
 
 // ---- Phase 4: expert-batched MoE -----------------------------------------
 // One launch serves all 4 selected experts (grid.y = expert slot), so the MoE
