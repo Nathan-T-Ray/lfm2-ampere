@@ -32,7 +32,13 @@ devinfo: $(BUILD)/devinfo
 > @echo "--- device properties (CUDA_VISIBLE_DEVICES=$(LK_GPU)) ---"
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/devinfo
 
-all: devinfo
+$(BUILD)/test_quant: tests/test_quant.cu src/quant.cuh | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_quant.cu -o $@ $(LDFLAGS)
+
+test-quant: $(BUILD)/test_quant
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_quant $(LK_REF)/quant_fixture.bin
+
+all: devinfo test_quant
 
 clean:
 > rm -rf $(BUILD)

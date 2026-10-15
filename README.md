@@ -57,6 +57,9 @@ setenv.sh            portable env (host + container); resolves the CUDA 12.6 tre
 Makefile             nvcc-driven build (.RECIPEPREFIX set, no tab hazards)
 scripts/oracle.sh    start|stop|status the llama.cpp oracle (pinned to GPU 1)
 tools/devinfo.cu     GPU/L2 capability probe
+tests/make_quant_fixture.py  builds a fixture from REAL pack blocks + references
+tests/test_quant.cu  verifies the dot products (Gate G2)
+scripts/setup-toolchain.sh   installs CCCL headers into the assembled CUDA tree
 tools/oracle.py      oracle client (pure-greedy sampler config)
 tools/make_suite.py  freezes the C1 parity suite as raw token IDs
 tools/capture_ref.py captures oracle ground truth + baseline timings
@@ -77,7 +80,9 @@ python3 tools/capture_ref.py
 
 - [x] **G0** repo, toolchain, oracle on GPU 1, baseline `227.07 tok/s`, L2 limits, parity suite
 - [ ] **G1** repack, all 428 tensors bit-exact
-- [ ] **G2** kernels vs fp32 reference *and* ggml-cuda integer path
+- [x] **G1** repack, all 428 tensors bit-exact
+- [x] **G2 (core)** Q4_0/Q6_K x Q8_1 dp4a dots verified vs exact integer reference
+- [ ] **G2** remaining kernels (RMSNorm, RoPE, conv, router)
 - [ ] **G3** C1/C2 — greedy parity + perplexity within 0.1%
 - [ ] **G4** C3/C4 — ≥550 tok/s, ≥90% of roofline
 - [ ] **G4b** routing-skew measurement → Phase 5 decision
