@@ -61,6 +61,17 @@ __global__ void k_rmsnorm(const float * __restrict__ x, const float * __restrict
                           int n, float eps,
                           float * __restrict__ y32, __half * __restrict__ y16);
 
+// Fused RMSNorm + Q8_1 quantiser, BIT-IDENTICAL to running k_rmsnorm then
+// k_quantize_q8_1.  The norm half keeps the original 256-thread loop order and
+// the original shared-memory tree, so y32/y16 are bit-for-bit what they were;
+// the normalised values are then re-read from shared memory by a
+// warp-cooperative quantiser.  Saves one of the ~120 launches per token that
+// this pair costs, without reducing parallelism (the earlier attempt dropped to
+// 256 threads for both halves and lost 10%).
+__global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __restrict__ w,
+                               int n, float eps, float * __restrict__ y32,
+                               __half * __restrict__ y16, block_q8_1 * __restrict__ yq8);
+
 // Quantise n floats to Q8_1, one warp per 32-element block.  Kept separate from
 // k_rmsnorm so the quantiser is a single, independently tested primitive.
 __global__ void k_quantize_q8_1(const float * __restrict__ x,

@@ -25,6 +25,40 @@ __global__ void k_rmsnorm(const float * __restrict__ x, const float * __restrict
     }
 }
 
+__global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __restrict__ w,
+                               int n, float eps, float * __restrict__ y32,
+                               __half * __restrict__ y16, block_q8_1 * __restrict__ yq8) {
+    __shared__ float s_sq[256];
+    extern __shared__ float s_h[];          // n floats, normalised values
+    const int tid = threadIdx.x;
+
+    // ---- phase 1: EXACTLY the original k_rmsnorm order (256 threads, tree) --
+    float sq = 0.0f;
+    for (int i = tid; i < n; i += 256) { const float v = x[i]; sq += v * v; }
+    s_sq[tid] = sq;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int)tid < o) s_sq[tid] += s_sq[tid + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(s_sq[0] / (float)n + eps);
+    for (int i = tid; i < n; i += 256) {
+        const float v = x[i] * inv * w[i];
+        if (y32) y32[i] = v;
+        if (y16) y16[i] = __float2half(v);
+        s_h[i] = v;
+    }
+    __syncthreads();
+
+    // ---- phase 2: warp-cooperative Q8_1 over consecutive 32-element blocks --
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nwarp = blockDim.x >> 5;
+    for (int b = warp; b < n / 32; b += nwarp) {
+        quantize_q8_1_warp(s_h[b * 32 + lane], yq8 + b, lane);
+    }
+}
+
 __global__ void k_quantize_q8_1(const float * __restrict__ x,
                                 block_q8_1 * __restrict__ y, int nblocks) {
     const int b = blockIdx.x;

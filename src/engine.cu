@@ -226,8 +226,8 @@ static void forward(Engine & e, cudaStream_t st) {
         }
 
         // ---- sequence mixer -------------------------------------------
-        k_rmsnorm<<<1, 256, 256 * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS, e.h, e.h16);
-        k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.h, e.xq, LK_HIDDEN / 32);
+        k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS,
+                                              e.h, e.h16, e.xq);
         LK_STEP("mixer-norm");
 
         if (!l.is_attn) {
@@ -304,8 +304,8 @@ static void forward(Engine & e, cudaStream_t st) {
         }
 
         // ---- channel mixer --------------------------------------------
-        k_rmsnorm<<<1, 256, 256 * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS, e.h, e.h16);
-        k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.h, e.xq, LK_HIDDEN / 32);
+        k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS,
+                                              e.h, e.h16, e.xq);
         LK_STEP("ffn-norm");
 
         if (!l.is_moe) {
@@ -374,8 +374,8 @@ static void forward(Engine & e, cudaStream_t st) {
     }
 
     // ---- final norm + tied Q6_K lm_head + argmax ----------------------
-    k_rmsnorm<<<1, 256, 256 * 4, st>>>(e.x, P32(e, e.out_norm), LK_HIDDEN, LK_EPS, e.h, e.h16);
-    k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.h, e.xq, LK_HIDDEN / 32);
+    k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, e.out_norm), LK_HIDDEN, LK_EPS,
+                                          e.h, e.h16, e.xq);
     k_gemv_q6_K<<<grid_for(LK_VOCAB), 256, 0, st>>>(
         (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
         (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
