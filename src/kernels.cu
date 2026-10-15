@@ -622,6 +622,39 @@ __global__ void k_argmax_final(const float * __restrict__ pv, const int * __rest
 }
 
 // ---------------------------------------------------------------------------
+// Gate and up projections for all 4 experts, in ONE launch.
+//
+// They are the same kernel applied to two adjacent matrices (ffn_gate_exps and
+// ffn_up_exps) with the same shape, and each launch costs a whole graph node --
+// 0.6 us of dispatch, measured.  Folding them into grid.y = 2*LK_TOP_K removes
+// 38 nodes per token.  The per-expert arithmetic is untouched: blockIdx.y & 3
+// still selects the expert and the row/activation indexing is identical, so the
+// result is bit-for-bit what two launches produced.
+__global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half * __restrict__ d_a,
+                                 const uint4 * __restrict__ qs_b, const __half * __restrict__ d_b,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, int rows_per_expert,
+                                 int xq_stride,
+                                 const int * __restrict__ d_idx,
+                                 float * __restrict__ y_a, float * __restrict__ y_b) {
+    const int half = blockIdx.y >> 2;               // 0 = gate, 1 = up
+    const int k    = blockIdx.y & (LK_TOP_K - 1);   // which of the 4 experts
+    const uint4  * qs = half ? qs_b : qs_a;
+    const __half * d  = half ? d_b  : d_a;
+    float        * y  = half ? y_b  : y_a;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= out_rows) return;
+    const size_t base = (size_t) d_idx[k] * rows_per_expert * bpr;
+    const uint4  * qrow = qs + base + (size_t) warp * bpr;
+    const __half * drow = d  + base + (size_t) warp * bpr;
+    float acc = 0.0f;
+    const block_q8_1 * xq_k = xq + (size_t) k * xq_stride;
+    for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xq_k + j);
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t) k * out_rows + warp] = acc;
+}
+
 __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                                 const block_q8_1 * __restrict__ xq,
                                 int out_rows, int bpr, int rows_per_expert,

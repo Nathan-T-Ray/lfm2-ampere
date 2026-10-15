@@ -77,7 +77,7 @@ static double lk_prof_bytes(const char * t) {
         {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
         {"dense_swiglu",       0.0},         {"dense_down",  13565952.0}, {"router_dot",    524288.0},
         {"router_top4",        0.0}, {"route_log",          0.0},
-        {"moe_gate",     7077888.0}, {"moe_up",       7077888.0},
+        {"moe_gate_up", 14155776.0},
         {"moe_swiglu",         0.0},         {"moe_down",     7077888.0}, {"moe_accum",          0.0},
         {"norm_final",     16384.0}, {"lm_head",    215040000.0},
         {"argmax_part",   512000.0}, {"argmax_final",       0.0},
@@ -488,14 +488,11 @@ static void forward(Engine & e, cudaStream_t st) {
             // replacing 16 launches per MoE layer.  Weights stay on device, so the
             // per-layer cudaStreamSynchronize host round-trip is gone too.
             const int GU = LK_TOP_K * LK_MOE_INTER;
-            LKP_B("moe_gate");
-    k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
-                PQS(e, l.eg), PD(e, l.eg), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu); LKP_E();
-            LKP_B("moe_up");
-    k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
-                PQS(e, l.eu), PD(e, l.eu), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu + GU); LKP_E();
+            LKP_B("moe_gate_up");
+    k_gemv_q4_0_exp2<<<dim3(grid_for(LK_MOE_INTER), 2 * LK_TOP_K), 256, 0, st>>>(
+                PQS(e, l.eg), PD(e, l.eg), PQS(e, l.eu), PD(e, l.eu), e.xq,
+                LK_MOE_INTER, 64, LK_MOE_INTER, 0,
+                e.d_idx, e.moe_gu, e.moe_gu + GU); LKP_E();
             LKP_B("moe_swiglu");
     k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
             
