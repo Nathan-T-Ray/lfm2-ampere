@@ -24,9 +24,20 @@ case ":$PATH:" in *":$CUDA_HOME/bin:"*) ;; *) PATH="$CUDA_HOME/bin:$PATH" ;; esa
 export PATH
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# ---- project paths ------------------------------------------------------
+# ---- scratch + python ---------------------------------------------------
 export LK_SCRATCH="${LK_SCRATCH:-$HOME/local-agent-harnesses/model-scratch/lfm25}"
 if [ -d /model-scratch ]; then export LK_SCRATCH_CTR="/model-scratch/lfm25"; fi
+_lk_venv="${LK_VENV:-$HOME/local-agent-harnesses/model-scratch/venv}"
+if [ -x "$_lk_venv/bin/python" ]; then
+  export LK_PYTHON="$_lk_venv/bin/python"
+  case ":$PATH:" in *":$_lk_venv/bin:"*) ;; *) PATH="$_lk_venv/bin:$PATH" ;; esac
+  export PATH
+else
+  export LK_PYTHON="$(command -v python3)"
+fi
+unset _lk_venv
+
+# ---- project paths ------------------------------------------------------
 export LK_MODEL="${LK_MODEL:-$HOME/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf}"
 export LK_PACK="${LK_PACK:-$LK_SCRATCH/lfm25.pack}"
 export LK_MANIFEST="${LK_MANIFEST:-$LK_SCRATCH/lfm25.manifest.json}"
@@ -46,6 +57,7 @@ echo "liquid-kernel env:"
 echo "  LK_ROOT    = $LK_ROOT"
 echo "  CUDA_HOME  = $CUDA_HOME"
 echo "  LK_SCRATCH = $LK_SCRATCH"
+echo "  LK_PYTHON  = $LK_PYTHON"
 echo "  LK_MODEL   = $LK_MODEL"
 echo "  LK_ORACLE  = $LK_ORACLE (GPU $LK_ORACLE_GPU :$LK_ORACLE_PORT)"
 "$CUDA_HOME/bin/nvcc" --version | tail -2
