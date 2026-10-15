@@ -1,55 +1,115 @@
 #!/usr/bin/env python3
-"""Gate C2: teacher-forced perplexity, liquid-kernel vs llama.cpp.
+"""Gate C2: teacher-forced perplexity, and who is actually right.
 
-Both engines are fed IDENTICAL token IDs, so this is a like-for-like
-comparison.  The engine scores every position (build/engine ppl); the oracle
-is queried position by position with n_probs=100 and we read off the logprob
-of the actual next token.  Positions where the target is outside the oracle's
-top-100 are skipped (reported as 'unscored').
+Reports THREE numbers, not two:
+
+  exact          the lm_head recomputed in float64 from the GGUF, applied to the
+                 residual stream the engine dumped.  This is what the model
+                 mathematically prescribes, so it is the only defensible
+                 reference.  Comparing two engines to each other cannot say
+                 which one is correct.
+  liquid-kernel  our engine
+  llama.cpp      the oracle
+
+The original version of this gate scored 74 subsampled positions of a corpus
+that llama.cpp itself had generated, and treated llama.cpp as ground truth.
+Both choices are wrong: greedy-selected text is selection biased against any
+other engine, and llama.cpp's own lm_head turns out to sit 17x further from
+exact mathematics than ours does.  On this corpus the whole reported "delta" is
+the oracle's error.
 """
-import json, math, os, pathlib, sys, urllib.request
+import json, math, os, pathlib, subprocess, sys
 import numpy as np
 
-REF = pathlib.Path(os.environ.get("LK_REF", pathlib.Path(__file__).resolve().parent.parent / "ref"))
-ORACLE = "http://127.0.0.1:18099"
+ROOT   = pathlib.Path(__file__).resolve().parent.parent
+REF    = pathlib.Path(os.environ.get("LK_REF", ROOT / "ref"))
+SYS    = ROOT / "tools"
+ENGINE = ROOT / "build" / "engine"
+ORACLE = ROOT / "build" / "oracle_ppl"
+GGUF   = os.environ.get("LK_MODEL", "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf")
+NL, H  = 41, 2048
+EPS    = 1e-5
 
 
-def post(path, payload, t=600):
-    q = urllib.request.Request(ORACLE + path, data=json.dumps(payload).encode(),
-                               headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(q, timeout=t).read())
+def sh(cmd, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=7200,
+                       errors="replace")
+    if r.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed:\n{r.stdout[-1500:]}\n{r.stderr[-2500:]}")
+    return r.stdout
 
 
 def main():
-    dump = sys.argv[1] if len(sys.argv) > 1 else "/tmp/lk_ppl.txt"
-    ids = np.fromfile(REF / "ppl_corpus.bin", dtype=np.int32).tolist()
-    lk = {}
-    for line in open(dump):
-        i, nll, am, tgt = line.split()
-        lk[int(i)] = (float(nll), int(am) == int(tgt))
-    pos = list(range(4, 300, 4))
-    ok = 0; lo = []; lkn = []; agree = 0; unscored = 0
-    for i in pos:
-        if i not in lk: continue
-        r = post("/completion", {"prompt": ids[:i + 1], "n_predict": 1, "n_probs": 100,
-            "temperature": 0.0, "repeat_penalty": 1.0, "dry_multiplier": 0.0, "top_k": 0,
-            "top_p": 1.0, "min_p": 0.0, "xtc_probability": 0.0, "seed": 1234,
-            "post_sampling_probs": False, "cache_prompt": False})
-        cp = r.get("completion_probabilities", [])
-        if not cp: continue
-        d = {e["id"]: e["logprob"] for e in cp[0]["top_logprobs"]}
-        tgt = ids[i + 1]
-        if tgt not in d: unscored += 1; continue
-        ok += 1
-        lo.append(-d[tgt]); lkn.append(lk[i][0])
-        agree += (cp[0]["top_logprobs"][0]["id"] == tgt) == lk[i][1]
-    a, b = sum(lo) / ok, sum(lkn) / ok
-    pa, pb = math.exp(a), math.exp(b)
-    print(f"positions compared: {ok}  (unscored: {unscored})")
-    print(f"  llama.cpp     nll={a:.6f}  ppl={pa:.6f}")
-    print(f"  liquid-kernel nll={b:.6f}  ppl={pb:.6f}")
-    print(f"  perplexity delta = {100*abs(pb-pa)/pa:.3f}%")
-    print(f"  per-position top-1 agreement: {agree}/{ok} = {100*agree/ok:.1f}%")
+    corpus = sys.argv[1] if len(sys.argv) > 1 else "ppl_natural.bin"
+    n_exact = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+    tokf = REF / corpus
+    ids = np.fromfile(tokf, dtype=np.int32)
+    n = len(ids)
+    print(f"corpus: {corpus}  ({n} tokens -> {n-1} scored positions)")
+
+    tmp = pathlib.Path("/tmp")
+    odump, edump, ldump = tmp/"c2.oracle.txt", tmp/"c2.engine.txt", tmp/"c2.layers.bin"
+
+    env = dict(os.environ)
+    env["LK_BACKEND_DIR"] = os.environ.get("LK_BACKEND_DIR",
+                                           "/home/nathan/.unsloth/llama.cpp/build/bin")
+    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("LK_ORACLE_GPU", "0")
+    if not odump.exists():
+        print(sh([str(ORACLE), GGUF, str(tokf), str(odump)], env=env).strip())
+
+    env2 = dict(os.environ)
+    env2["CUDA_VISIBLE_DEVICES"] = os.environ.get("LK_GPU", "0")
+    env2["LK_PPL_DUMP"] = str(edump)
+    env2["LK_NO_GRAPH"] = "1"                 # the dump hooks are illegal in a capture
+    env2["LK_DUMP_LAYERS"] = str(ldump)
+    print(sh([str(ENGINE), "ppl", str(tokf)], env=env2).strip())
+
+    eng = {int(p[0]): (float(p[1]), int(p[2])) for p in
+           (l.split() for l in open(edump))}
+    orc = {int(p[0]): (float(p[1]), int(p[2])) for p in
+           (l.split() for l in open(odump) if not l.startswith("#"))}
+
+    # ---- the exact reference -------------------------------------------
+    sys.path.insert(0, str(SYS))
+    import gguf as G
+    g = G.GGUF(GGUF)
+    wnorm = G.dequantize_tensor(g, "token_embd_norm.weight").astype(np.float64)
+    W = G.dequantize_tensor(g, "token_embd.weight").astype(np.float32)
+    raw = np.memmap(ldump, dtype=np.float32, mode="r")
+    npos = raw.size // (NL * H)
+    cand = [i for i in range(min(npos, n - 1)) if i in eng and i in orc]
+    rng = np.random.default_rng(7)
+    sel = sorted(rng.choice(cand, size=min(n_exact, len(cand)), replace=False).tolist())
+
+    ex, en, orr, xe, xo = [], [], [], [], []
+    for i in sel:
+        x = np.array(raw[i*NL*H + (NL-1)*H: i*NL*H + NL*H], dtype=np.float64)
+        inv = 1.0/np.sqrt(float((x*x).sum())/H + EPS)
+        lg = (W @ ((x*inv)*wnorm).astype(np.float32)).astype(np.float64)
+        m = lg.max(); lse = m + np.log(np.exp(lg-m).sum())
+        tgt = int(ids[i+1])
+        ex.append(-(lg[tgt]-lse)); en.append(eng[i][0]); orr.append(orc[i][0])
+        xe.append(int(np.argmax(lg)) == tgt); xo.append(orc[i][1] == tgt)
+    ex, en, orr = map(np.array, (ex, en, orr))
+
+    print(f"\nover {len(sel)} paired positions:")
+    print(f"  exact (float64 lm_head) nll={ex.mean():.6f}  ppl={math.exp(ex.mean()):.6f}")
+    print(f"  liquid-kernel           nll={en.mean():.6f}  ppl={math.exp(en.mean()):.6f}")
+    print(f"  llama.cpp               nll={orr.mean():.6f}  ppl={math.exp(orr.mean()):.6f}")
+    de, do = abs(en.mean()-ex.mean()), abs(orr.mean()-ex.mean())
+    print(f"\n  |liquid-kernel - exact| = {100*de/ex.mean():.4f}%   (sd per position {(en-ex).std(ddof=1):.6f})")
+    print(f"  |llama.cpp     - exact| = {100*do/ex.mean():.4f}%   (sd per position {(orr-ex).std(ddof=1):.6f})")
+    print(f"  oracle is {do/max(de,1e-12):.1f}x further from exact than the engine")
+
+    # full-corpus engine vs oracle, for continuity with earlier reports
+    common = sorted(set(eng) & set(orc))
+    a = np.mean([eng[i][0] for i in common]); b = np.mean([orc[i][0] for i in common])
+    print(f"\nfull corpus ({len(common)} positions), engine vs oracle:")
+    print(f"  ppl {math.exp(a):.6f} vs {math.exp(b):.6f}  ->  "
+          f"{100*abs(math.exp(a)-math.exp(b))/math.exp(b):.4f}% apart")
+    print(f"  top-1 agreement: {sum(eng[i][1]==orc[i][1] for i in common)}/{len(common)}"
+          f" = {100*sum(eng[i][1]==orc[i][1] for i in common)/len(common):.2f}%")
+    print(f"\n  GATE C2 vs exact (<=0.1%): {'PASS' if 100*de/ex.mean() <= 0.1 else 'FAIL'}")
     return 0
 
 

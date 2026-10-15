@@ -154,6 +154,9 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
 // position-independent and the whole decode loop can stay on device.
 #define LK_ARGMAX_BLOCKS      125
 #define LK_ARGMAX_PER_THREAD  4
+__global__ void k_route_log(const int * __restrict__ idx, const int * __restrict__ d_pos,
+                            int il, int * __restrict__ log);
+
 __global__ void k_argmax_part(const float * __restrict__ v,
                               float * __restrict__ pv, int * __restrict__ pi);
 __global__ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,

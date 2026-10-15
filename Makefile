@@ -52,7 +52,49 @@ $(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h | $(BUILD) 
 
 engine: $(BUILD)/engine
 
-all: devinfo test_quant test_kernels engine
+# --- oracle tools -----------------------------------------------------------
+# These link libllama directly.  The HTTP API only exposes top-k logprobs, so
+# full-vocabulary logits and a whole-corpus teacher-forced pass both require
+# calling into the library.  LLAMA_DIR only has to point at a llama.cpp build
+# that produced versioned .so files.
+LLAMA_DIR ?= $(HOME)/.unsloth/llama.cpp
+LLAMA_BIN := $(LLAMA_DIR)/build/bin
+
+$(BUILD)/oracle_logits: tools/oracle_logits.cpp | $(BUILD)
+> g++ -O2 -std=c++17 $< -o $@ -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include \
+>   $(LLAMA_BIN)/libllama.so.0 $(LLAMA_BIN)/libggml.so.0 $(LLAMA_BIN)/libggml-base.so.0 \
+>   -Wl,-rpath,$(LLAMA_BIN)
+
+$(BUILD)/oracle_ppl: tools/oracle_ppl.cpp | $(BUILD)
+> g++ -O2 -std=c++17 $< -o $@ -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include \
+>   $(LLAMA_BIN)/libllama.so.0 $(LLAMA_BIN)/libggml.so.0 $(LLAMA_BIN)/libggml-base.so.0 \
+>   -Wl,-rpath,$(LLAMA_BIN) -lm
+
+oracle-tools: $(BUILD)/oracle_logits $(BUILD)/oracle_ppl
+
+$(BUILD)/bench_launch: tests/bench_launch.cu | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
+
+# Gate G3: launch cost, event-bracket cost and graph-replay cost.  Run this
+# before believing any per-kernel profile.
+bench-launch: $(BUILD)/bench_launch
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_launch
+
+# --- gates ------------------------------------------------------------------
+# C1  greedy parity vs llama.cpp
+# C1a step-1 top-1 agreement + full-vocabulary correlation
+# C2  teacher-forced perplexity vs exact float64 mathematics
+# G4b routing skew, which gates Phase 5 speculative decoding
+gate-c1: engine
+> @python3 tools/parity.py
+
+gate-c1a: engine oracle-tools
+> @python3 tools/c1a.py
+
+gate-c2: engine oracle-tools
+> @python3 tools/perplexity.py ppl_natural.bin 200
+
+all: devinfo test_quant test_kernels engine oracle-tools
 
 # Gate G2: every kernel primitive verified against an independent reference.
 test-all: test-quant test-kernels

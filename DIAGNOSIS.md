@@ -575,3 +575,100 @@ could never have worked.
 
 Corollary: **price the instrument before reading it.** A profiler that adds a
 fixed 2 us to every one of 589 launches manufactures a fake 1.2 ms bottleneck.
+
+---
+
+# Phase 4m: three gates measured, and one of them inverts the story
+
+## G4b: routing skew -- the Phase 5 gate returns a clear NO
+
+Speculative decoding only pays if verifying K tokens in one pass reads each
+expert's weights once and applies them to several tokens. That is entirely a
+property of how skewed the routing is, so `LK_ROUTE_LOG` records the actual
+top-4 choices, in-graph, over 519 consecutive positions.
+
+| K | E[U_K] | 4K | reuse | MB/token at 100% accept | break-even accepted |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 4.00 | 4 | 1.00x | 1448 | 0.99 |
+| 2 | 6.73 | 8 | 1.19x | 1107 | 1.51 |
+| 4 | 11.22 | 16 | 1.43x | 888 | 2.42 |
+| 8 | 17.91 | 32 | 1.79x | 720 | 3.93 |
+
+The routing is almost perfectly uniform: entropy 4.142 of a maximum 4.159 nats,
+no expert unused, the most-used expert only 1.5x uniform, top-8 share 17%
+(uniform is 12.5%). So consecutive tokens barely share experts.
+
+Meanwhile the byte model contains a term that grows *with* K: lm_head must
+produce logits at every verified position, so it costs K x 215 MB per pass
+regardless of reuse. At K=4 a pass must be accepted 2.42 tokens' worth just to
+break even; at K=8, 3.93.
+
+**Phase 5 would have been a net loss.** The gate did its job: it cost one
+afternoon of instrumentation instead of a week building a drafter, a batched
+verify path and a ring-buffer KV rollback.
+
+## C1a: fails as specified, because the reference is not what it was assumed to be
+
+C1a asked for 128k-logit Pearson >= 0.9999 against llama.cpp. Measured over all
+7 suite prompts: top-1 agreement 6/7, Pearson 0.9748-0.9925. The failure is real
+and reproducible -- and present even for a **single-token prompt**, so it is not
+a prefill-vs-decode artifact.
+
+The obvious suspects were checked and cleared:
+
+* `quantize_q8_1_warp` is line-for-line ggml's `quantize_q8_1`: same
+  `d = amax/127`, same `roundf`, same shfl_xor butterfly, same `half2(d, sum)`.
+* The Q6_K bit mapping was already verified bit-exact against gguf-py.
+
+So instead of guessing, compute the **exact float64 answer** from the GGUF
+weights and the residual stream the engine dumps, and see who is near it:
+
+| | max abs dev @top-64 | mean abs dev |
+| --- | --- | --- |
+| liquid-kernel | **0.0235** | **0.0083** |
+| llama.cpp | 0.6496 | 0.1880 |
+
+And simulating Q8_1 quantisation in numpy reproduces the engine's numbers to
+five decimals (0.023530 / 0.008262). **The engine's lm_head is exactly what its
+own quantisation predicts.** llama.cpp sits 23x further from exact mathematics.
+
+Consequence: C1a's Pearson threshold cannot be met by any implementation that
+quantises the activation independently, because the disagreement being measured
+is the *oracle's* error, not the engine's. The gate is mis-specified, not failed.
+
+## C2: re-measured against exact mathematics instead of against llama.cpp
+
+Two methodology faults in the old harness, both of which flattered the oracle:
+
+1. it scored `ppl_corpus.bin` -- text **llama.cpp itself generated** greedily, so
+   every near-tie was already resolved in the oracle's favour (selection bias);
+2. it scored 74 subsampled positions (`range(4, 300, 4)`) out of ~557, and drove
+   llama-server over HTTP one position at a time, which is what forced the
+   subsampling in the first place.
+
+`tools/oracle_ppl` decodes the corpus directly and returns the full 128k logit
+vector for every position, so nothing is dropped. `tools/perplexity.py` now
+reports a third column -- the lm_head recomputed in float64 from the GGUF -- so
+the gap can be *attributed* rather than merely reported.
+
+On 200 paired positions of natural text:
+
+| | nll | vs exact | sd per position |
+| --- | --- | --- | --- |
+| exact (float64 lm_head) | 1.804137 | -- | -- |
+| **liquid-kernel** | 1.803412 | **0.0402%** | 0.0061 |
+| llama.cpp | 1.791696 | 0.6896% | 0.1775 |
+
+**The engine is 17x closer to the exact model than llama.cpp.** Against the only
+defensible reference the gate passes with 2.5x margin; the 1.38% two-engine
+figure is the oracle's error, not ours.
+
+## The lesson
+
+**A two-implementation comparison cannot tell you which implementation is
+right.** Every gate that names another engine as ground truth inherits that
+engine's error as if it were truth. Compute the exact answer from the weights --
+here it costs one float64 GEMM -- and the disagreement becomes attributable.
+
+Corollary, and the same shape as the G4b result: **measure the gate before
+building what it gates.** G4b cost an afternoon and cancelled a week of work.

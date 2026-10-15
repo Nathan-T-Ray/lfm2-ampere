@@ -1,0 +1,101 @@
+{
+  "gate": "C1a",
+  "passed": false,
+  "n_cases": 7,
+  "top1_agree": 6,
+  "min_pearson": 0.9748352092760341,
+  "mean_pearson": 0.9813379950441744,
+  "cases": [
+    {
+      "name": "factual",
+      "n": 16,
+      "pearson": 0.9822663206671524,
+      "top1_ok": true,
+      "oracle_top1": 207,
+      "engine_top1": 207,
+      "top5": 3,
+      "top10_ord": 4,
+      "maxabs_top64": 1.4397239685058594,
+      "kl": 0.04477412346015425,
+      "tv": 0.11043710456126725
+    },
+    {
+      "name": "math",
+      "n": 33,
+      "pearson": 0.9786794443121731,
+      "top1_ok": true,
+      "oracle_top1": 2083,
+      "engine_top1": 2083,
+      "top5": 4,
+      "top10_ord": 3,
+      "maxabs_top64": 2.696436882019043,
+      "kl": 0.01052182179911345,
+      "tv": 0.024980505636432792
+    },
+    {
+      "name": "code",
+      "n": 29,
+      "pearson": 0.9767726201021695,
+      "top1_ok": true,
+      "oracle_top1": 2083,
+      "engine_top1": 2083,
+      "top5": 5,
+      "top10_ord": 5,
+      "maxabs_top64": 1.6028938293457031,
+      "kl": 0.07411259863039395,
+      "tv": 0.15821648498070423
+    },
+    {
+      "name": "agentic",
+      "n": 23,
+      "pearson": 0.9857751166353966,
+      "top1_ok": true,
+      "oracle_top1": 597,
+      "engine_top1": 597,
+      "top5": 5,
+      "top10_ord": 5,
+      "maxabs_top64": 1.5674781799316406,
+      "kl": 0.006986021166041579,
+      "tv": 0.02205968049274486
+    },
+    {
+      "name": "reasoning",
+      "n": 38,
+      "pearson": 0.9748352092760341,
+      "top1_ok": true,
+      "oracle_top1": 2083,
+      "engine_top1": 2083,
+      "top5": 4,
+      "top10_ord": 6,
+      "maxabs_top64": 2.5691614151000977,
+      "kl": 0.10554669630642426,
+      "tv": 0.2141015257605233
+    },
+    {
+      "name": "prose",
+      "n": 17,
+      "pearson": 0.9785851603858127,
+      "top1_ok": false,
+      "oracle_top1": 597,
+      "engine_top1": 207,
+      "top5": 5,
+      "top10_ord": 6,
+      "maxabs_top64": 2.157604217529297,
+      "kl": 0.05474375278985072,
+      "tv": 0.09884893996118421
+    },
+    {
+      "name": "longctx",
+      "n": 430,
+      "pearson": 0.992452093930482,
+      "top1_ok": true,
+      "oracle_top1": 2083,
+      "engine_top1": 2083,
+      "top5": 5,
+      "top10_ord": 5,
+      "maxabs_top64": 0.9503402709960938,
+      "kl": 0.001048087988765667,
+      "tv": 0.007821938578509501
+    }
+  ]
+}

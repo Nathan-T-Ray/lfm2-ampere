@@ -79,7 +79,7 @@ static double lk_prof_bytes(const char * t) {
         {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
         {"dense_swiglu",       0.0}, {"quant_dense",        0.0},
         {"dense_down",  13565952.0}, {"router_dot",    524288.0},
-        {"router_top4",        0.0},
+        {"router_top4",        0.0}, {"route_log",          0.0},
         {"moe_gate",     7077888.0}, {"moe_up",       7077888.0},
         {"moe_swiglu",         0.0}, {"quant_moe",          0.0},
         {"moe_down",     7077888.0}, {"moe_accum",          0.0},
@@ -185,6 +185,7 @@ struct Engine {
     float *  d_gate = nullptr;   // [64]  router logits, one per expert
     float *  d_apv = nullptr;    // [125] argmax stage-1 block winners
     int *    d_api = nullptr;    // [125] their indices
+    int *    d_routelog = nullptr; // [max_seq][LK_N_LAYERS][LK_TOP_K], G4b only
     int *    d_idx = nullptr;
     float *  d_w = nullptr;
 };
@@ -292,6 +293,8 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->moe_up,   LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_inter, LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_down, LK_HIDDEN * 4));
+    if (getenv("LK_ROUTE_LOG"))
+        CK(cudaMalloc(&e->d_routelog, (size_t) e->max_seq * LK_N_LAYERS * LK_TOP_K * 4));
     CK(cudaMalloc(&e->d_gate, LK_N_EXPERTS * 4));
     CK(cudaMalloc(&e->d_apv, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
@@ -479,6 +482,10 @@ static void forward(Engine & e, cudaStream_t st) {
     // 32-thread block would leave experts 32..63 uninitialised.
     k_router_top4<<<1, LK_N_EXPERTS, 0, st>>>(e.d_gate, P32(e, l.rbias),
                                     e.d_idx, e.d_w); LKP_E();
+            if (e.d_routelog) {          // G4b instrumentation (off unless asked)
+                LKP_B("route_log");
+    k_route_log<<<1, 32, 0, st>>>(e.d_idx, e.d_pos, il, e.d_routelog); LKP_E();
+            }
             // Phase 4: ONE launch per matrix for all 4 experts (grid.y = expert),
             // replacing 16 launches per MoE layer.  Weights stay on device, so the
             // per-layer cudaStreamSynchronize host round-trip is gone too.
@@ -544,20 +551,27 @@ int main(int argc, char ** argv) {
     cudaStream_t st; CK(cudaStreamCreate(&st));
 
     // --- capture the whole position-independent decode step once ---------
-    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-    forward(*e, st);
-    cudaGraph_t graph = nullptr;
-    CK(cudaStreamEndCapture(st, &graph));
+    // LK_NO_GRAPH replays the step directly instead of through a graph.  The
+    // dump hooks below use cudaMemcpy/cudaStreamSynchronize, neither of which is
+    // legal inside a capture, so graph capture has to be skipped to use them --
+    // previously those hooks silently failed at capture time.
+    const bool no_graph = getenv("LK_NO_GRAPH") != nullptr;
     cudaGraphExec_t gexec = nullptr;
-    CK(cudaGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
-    size_t nnode = 0; cudaGraphGetNodes(graph, nullptr, &nnode);
-    fprintf(stderr, "captured CUDA graph: %zu nodes\n", nnode);
+    if (!no_graph) {
+        CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        forward(*e, st);
+        cudaGraph_t graph = nullptr;
+        CK(cudaStreamEndCapture(st, &graph));
+        CK(cudaGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
+        size_t nnode = 0; cudaGraphGetNodes(graph, nullptr, &nnode);
+        fprintf(stderr, "captured CUDA graph: %zu nodes\n", nnode);
+    }
 
     auto feed = [&](int tok) { CK(cudaMemcpy(e->d_token, &tok, 4, cudaMemcpyHostToDevice)); };
     // LK_PROFILE swaps graph replay for a direct call so the per-launch
     // events bracket real kernels; a graph replays as one opaque object.
     const bool profile = getenv("LK_PROFILE") != nullptr;
-    auto run  = [&]() { if (profile) forward(*e, st);
+    auto run  = [&]() { if (profile || no_graph) forward(*e, st);
                         else CK(cudaGraphLaunch(gexec, st)); };
     auto take = [&]() { int t = 0; CK(cudaMemcpy(&t, e->d_token, 4, cudaMemcpyDeviceToHost)); return t; };
 
@@ -681,6 +695,19 @@ int main(int argc, char ** argv) {
     }
     auto t1 = std::chrono::steady_clock::now();
     if (!bench) printf("\n");
+    if (e->d_routelog) {           // G4b: [positions][LK_N_LAYERS][LK_TOP_K] int32
+        int endpos = 0;
+        CK(cudaMemcpy(&endpos, e->d_pos, 4, cudaMemcpyDeviceToHost));
+        const size_t cnt = (size_t) endpos * LK_N_LAYERS * LK_TOP_K;
+        std::vector<int> buf(cnt);
+        CK(cudaMemcpy(buf.data(), e->d_routelog, cnt * 4, cudaMemcpyDeviceToHost));
+        FILE * rf = fopen(getenv("LK_ROUTE_LOG"), "wb");
+        if (!rf) { perror(getenv("LK_ROUTE_LOG")); return 1; }
+        fwrite(buf.data(), 4, cnt, rf);
+        fclose(rf);
+        fprintf(stderr, "route log: %d positions x %d layers x %d experts\n",
+                endpos, LK_N_LAYERS, LK_TOP_K);
+    }
     const double sec = std::chrono::duration<double>(t1 - t0).count();
     const double tps = done / sec;
     const double BYTES_PER_TOKEN = 1466751488.0;

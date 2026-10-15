@@ -431,6 +431,23 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
 #define LK_ARGMAX_BLOCKS      125
 #define LK_ARGMAX_PER_THREAD  4
 
+// Gate G4b: record which experts the router actually chose.
+//
+// Phase 5 speculative decoding is only worth building if verifying K tokens in
+// one pass touches far fewer than 4K experts per layer -- the whole win is
+// reading each expert's weights once and applying them to several tokens.  That
+// depends entirely on how skewed the routing is in practice, which cannot be
+// argued from the architecture and has to be measured.
+//
+// Written from inside the CUDA graph, indexed by the device-side position, so
+// the capture stays position-independent like everything else in the step.
+__global__ void k_route_log(const int * __restrict__ idx, const int * __restrict__ d_pos,
+                            int il, int * __restrict__ log) {
+    if (threadIdx.x >= LK_TOP_K) return;
+    const size_t p = (size_t) (*d_pos);
+    log[(p * LK_N_LAYERS + il) * LK_TOP_K + threadIdx.x] = idx[threadIdx.x];
+}
+
 __global__ void k_argmax_part(const float * __restrict__ v,
                               float * __restrict__ pv, int * __restrict__ pi) {
     const int tid  = blockIdx.x * blockDim.x + threadIdx.x;
