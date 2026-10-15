@@ -433,6 +433,48 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    if (strcmp(mode, "ppl") == 0) {
+        // Teacher-forced perplexity.  Feed token i, the graph leaves the logits
+        // that predict token i+1 in e.logits, so we can score the actual next
+        // token without any sampling.  Identical token IDs are fed to the
+        // oracle, so the two perplexities are directly comparable.
+        const char * tf = (argc > 2) ? argv[2] : nullptr;
+        if (!tf) { fprintf(stderr, "usage: %s ppl TOKENS.bin [N]\n", argv[0]); return 1; }
+        FILE * f = fopen(tf, "rb");
+        if (!f) { perror("tokens"); return 1; }
+        fseek(f, 0, SEEK_END); const long nb = ftell(f); fseek(f, 0, SEEK_SET);
+        std::vector<int> ids(nb / 4);
+        if (fread(ids.data(), 4, ids.size(), f) != ids.size()) { fprintf(stderr, "short read\n"); return 1; }
+        fclose(f);
+        int N = (int)ids.size();
+        if (argc > 3) N = std::min(N, atoi(argv[3]));
+        if (N < 2) { fprintf(stderr, "need >= 2 tokens\n"); return 1; }
+        std::vector<float> lg(LK_VOCAB);
+        const char * dump = getenv("LK_PPL_DUMP");
+        FILE * df = dump ? fopen(dump, "w") : nullptr;
+        double nll = 0.0; int cnt = 0; int top1ok = 0;
+        for (int i = 0; i + 1 < N; ++i) {
+            feed(ids[i]); run();
+            CK(cudaStreamSynchronize(st));
+            CK(cudaMemcpy(lg.data(), e->logits, (size_t)LK_VOCAB * 4, cudaMemcpyDeviceToHost));
+            double m = -1e30; int am = 0;
+            for (int v = 0; v < LK_VOCAB; ++v) if (lg[v] > m) { m = lg[v]; am = v; }
+            double z = 0.0;
+            for (int v = 0; v < LK_VOCAB; ++v) z += exp((double)lg[v] - m);
+            const double lse = m + log(z);
+            const double this_nll = -((double)lg[ids[i+1]] - lse);
+            if (df) fprintf(df, "%d %.8f %d %d\n", i, this_nll, am, ids[i+1]);
+            nll += this_nll;
+            top1ok += (am == ids[i+1]);
+            ++cnt;
+        }
+        if (df) fclose(df);
+        const double ppl = exp(nll / cnt);
+        printf("RESULT nll=%.6f tokens=%d ppl=%.6f top1_acc=%.4f\n",
+               nll / cnt, cnt, ppl, (double)top1ok / cnt);
+        return 0;
+    }
+
     if (strcmp(mode, "gen") != 0) { fprintf(stderr, "unknown mode %s\n", mode); return 1; }
     std::vector<int> toks;
     for (int i = 2; i < argc; ++i) toks.push_back(atoi(argv[i]));
