@@ -29,56 +29,78 @@ __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __res
                                int n, float eps, float * __restrict__ y32,
                                __half * __restrict__ y16, block_q8_1 * __restrict__ yq8) {
     __shared__ float s_sq[256];
-    extern __shared__ float s_h[];          // n floats, normalised values
+    extern __shared__ float s_h[];          // generic path only
     const int tid = threadIdx.x;
 
-    // ---- phase 1: EXACTLY the original k_rmsnorm order (256 threads, tree) --
-    // The summation order is untouched; only the loads are batched.  With one
-    // load in flight per thread a 256-thread block has 8 warps x 128 B = 1 KB
-    // outstanding, which at ~500 cycles of HBM latency is ~2.8 GB/s.  These
-    // norms run 81 times per token and measured ~5 us each (3.5 GB/s); issuing
-    // all eight loads before accumulating fills the memory pipeline without
-    // changing a single floating-point operation.
-    float sq = 0.0f;
     if (n == 2048) {
-        float v[8];
+        // Every caller passes LK_HIDDEN, so the shape is a compile-time constant.
+        //
+        // x and w are each loaded ONCE and held in registers.  The reduction
+        // forces a barrier between the sum of squares and the normalise, and the
+        // previous version re-issued all sixteen loads across that barrier --
+        // a second HBM round trip for data already in flight.  The summation
+        // order is untouched: the same eight strided terms per thread, then the
+        // same tree.
+        float xv[8], wv[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) v[j] = x[tid + j * 256];
+        for (int j = 0; j < 8; ++j) { xv[j] = x[tid + j * 256]; wv[j] = w[tid + j * 256]; }
+        float sq = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) sq += v[j] * v[j];
-    } else {
-        for (int i = tid; i < n; i += 256) { const float v = x[i]; sq += v * v; }
-    }
-    s_sq[tid] = sq;
-    __syncthreads();
-    for (int o = 128; o > 0; o >>= 1) {
-        if ((int)tid < o) s_sq[tid] += s_sq[tid + o];
+        for (int j = 0; j < 8; ++j) sq += xv[j] * xv[j];
+        s_sq[tid] = sq;
         __syncthreads();
-    }
-    const float inv = rsqrtf(s_sq[0] / (float)n + eps);
-    if (n == 2048) {                     // same arithmetic, both loads batched
-        float v[8], wv[8];
+        // Tree levels with stride >= 32 pair threads in different warps and need
+        // shared memory.  The remaining five (16, 8, 4, 2, 1) pair lanes inside
+        // warp 0 and are exactly a shfl_xor butterfly producing the same value
+        // in lane 0 by the same pairings -- five fewer barriers.
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { v[j] = x[tid + j * 256]; wv[j] = w[tid + j * 256]; }
+        for (int o = 128; o > 16; o >>= 1) {   // o = 128, 64, 32
+            if ((int) tid < o) s_sq[tid] += s_sq[tid + o];
+            __syncthreads();
+        }
+        if (tid < 32) {
+            float v = s_sq[tid];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (tid == 0) s_sq[0] = v;
+        }
+        __syncthreads();
+        const float inv = rsqrtf(s_sq[0] / 2048.0f + eps);
+
+        // Normalise AND quantise in one pass.  Warp `w` owns elements
+        // 32w + 256j .. +31, which is exactly Q8_1 block 8j + w, so the
+        // quantisation needs no shared staging at all -- the old version wrote
+        // 8 KB to shared, synchronised, and read it straight back.
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int i = tid + j * 256;
-            const float t = v[j] * inv * wv[j];
+            const float t = xv[j] * inv * wv[j];
             if (y32) y32[i] = t;
             if (y16) y16[i] = __float2half(t);
-            s_h[i] = t;
+            if (yq8) quantize_q8_1_warp(t, yq8 + warp + 8 * j, lane);
         }
-    } else {
-        for (int i = tid; i < n; i += 256) {
-            const float v = x[i] * inv * w[i];
-            if (y32) y32[i] = v;
-            if (y16) y16[i] = __float2half(v);
-            s_h[i] = v;
-        }
+        return;
+    }
+
+    // ---- generic fallback, unchanged ---------------------------------------
+    float sq = 0.0f;
+    for (int i = tid; i < n; i += 256) { const float v = x[i]; sq += v * v; }
+    s_sq[tid] = sq;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int) tid < o) s_sq[tid] += s_sq[tid + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(s_sq[0] / (float) n + eps);
+    for (int i = tid; i < n; i += 256) {
+        const float v = x[i] * inv * w[i];
+        if (y32) y32[i] = v;
+        if (y16) y16[i] = __float2half(v);
+        s_h[i] = v;
     }
     __syncthreads();
-
-    // ---- phase 2: warp-cooperative Q8_1 over consecutive 32-element blocks --
     const int warp = tid >> 5;
     const int lane = tid & 31;
     const int nwarp = blockDim.x >> 5;
@@ -307,7 +329,7 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // the whole decode step, for 1.4% of the bytes.  Sixty-four single-warp blocks
 // put the same read on 64 different SMs, and batching the loads keeps several
 // in flight per warp.
-#define LK_ROUTER_UNROLL 8
+#define LK_ROUTER_UNROLL 16
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
         float * __restrict__ logits) {

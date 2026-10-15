@@ -44,15 +44,18 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
 // element per lane.  Mirrors ggml-cuda's quantize_q8_1 exactly.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void quantize_q8_1_warp(const float xi, block_q8_1 * y, int lane) {
-    float amax = fabsf(xi);
-    float sum  = xi;
+    // A maximum is exact and independent of reduction order, so the hardware
+    // reduction gives a bit-identical answer.  For non-negative floats the IEEE
+    // bit pattern orders the same way unsigned integers do, so comparing the
+    // reinterpreted bits is the same comparison.  This shortens the dependency
+    // chain from ten sequential shuffles to six, which matters here because a
+    // single block runs 8 warps with nothing to hide the latency behind.
+    const unsigned am = __reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(xi)));
+    float sum = xi;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    }
-    const float d = amax / 127.0f;
-    const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)roundf(xi / d);
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = __uint_as_float(am) / 127.0f;
+    const int8_t q = (am == 0u) ? (int8_t)0 : (int8_t)roundf(xi / d);
     y->qs[lane] = q;
     if (lane == 0) y->ds = __floats2half2_rn(d, sum);
 }

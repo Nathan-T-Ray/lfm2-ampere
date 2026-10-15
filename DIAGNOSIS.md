@@ -672,3 +672,113 @@ here it costs one float64 GEMM -- and the disagreement becomes attributable.
 
 Corollary, and the same shape as the G4b result: **measure the gate before
 building what it gates.** G4b cost an afternoon and cancelled a week of work.
+
+---
+
+# Phase 4n/4o: from 346 to 390 tok/s, and the ceiling
+
+## lm_head: the last kernel that was not at the roofline
+
+The corrected profile said lm_head moved 215 MB at 511 GB/s against a measured
+956 GB/s ceiling. Unrolling its superblock loop changed nothing, which ruled out
+memory-level parallelism -- and that was the clue: unrolling does not change the
+*instruction count*.
+
+Counted out, the scalar Q6_K path issued four 1-BYTE loads per element (ql, qh,
+the scale, the activation) plus three int->float converts and three multiplies:
+~17 instructions per element, 64 elements per lane, 128000 rows = ~139M
+warp-instructions = ~294 us of pure issue. That is what "511 GB/s" was measuring.
+
+Q6_K is built for dp4a. Inside a 128-element half, ql byte b holds the low nibble
+of element b and the high nibble of element b+64, and qh byte b holds the top two
+bits of elements b, b+32, b+64, b+96 at shifts 0/2/4/6. One 32-bit load of ql
+plus one of qh therefore yields four packed 6-bit values, and one dp4a consumes
+them: 2 loads and ~6 ALU ops per 4 elements instead of 4 loads and ~13.
+
+Lane L is given the 8 consecutive elements 8L..8L+7. Those always fall inside one
+32-element Q8_1 block (index L/4) and one 16-element scale group (index L/2), so
+a lane needs exactly one activation scale, one weight scale and two dp4a groups.
+Every byte offset this produces is a multiple of 4, so both arrays load as
+aligned 32-bit words -- that alignment is the whole reason the planar repack
+split `d` out into its own array.
+
+  425 us -> 231 us, 511 -> 929 GB/s (97% of the achievable ceiling)
+  max difference from the scalar kernel on the top-64 logits: 2e-6
+
+## Fusing the quantisers into their producers
+
+Each of k_quantize_q8_1's four uses cost a whole graph node -- 0.606 us of
+dispatch, measured -- to move 24 KB. In every case a warp already owned exactly
+32 consecutive outputs, i.e. exactly one Q8_1 block, so the quantisation is free
+apart from a reduction that was going to happen anyway. n is always a multiple of
+32 and so is the block size, so no warp is ever partially active and the
+full-mask shuffles stay well defined.
+
+Graph nodes 589 -> 509. For the MoE path e.moe_inter4 turned out to be a pure
+staging buffer that nothing reads, so its 24 KB f32 write per layer is gone too.
+
+## The norm: one load instead of two, and no shared staging
+
+The norm is the engine's worst kernel by efficiency -- 3.5 GB/s. Three separate
+problems, all structural:
+
+1. It loaded x in the sum-of-squares pass, then loaded x *again* in the normalise
+   pass. The reduction forces a barrier between them and the second load was a
+   fresh HBM round trip for data already in flight. Both x and w are now loaded
+   once and held in registers across the barrier (16 registers per thread).
+2. Tree levels with stride >= 32 pair threads in different warps and need shared
+   memory, but levels 16/8/4/2/1 pair lanes inside warp 0 and are exactly a
+   shfl_xor butterfly. Same pairings, same order, five fewer barriers.
+3. The Q8_1 pass wrote 8 KB to shared memory, synchronised, and read it straight
+   back. Warp w owns elements 32w+256j..+31, which is exactly Q8_1 block 8j+w --
+   so the quantisation happens directly out of registers with no staging at all.
+
+Point 3 is the generalisable one: **a warp that produces 32 consecutive outputs
+already holds a Q8_1 block and never needs to round-trip through shared memory.**
+
+  6.0 us -> 5.2 us per call, x81
+
+Parity caught a real bug during this rewrite: the tree loop bound `o > 32` skips
+the o=32 level entirely, silently dropping half the sum. The gate is what found
+it, in one run.
+
+## Where the time goes now
+
+Step = 2.56 ms at 390.3 tok/s. Decomposition, all measured:
+
+  kernel execution   2.24 ms   (bracket sum minus 509 x the 2.718 us floor)
+  graph dispatch     0.31 ms   (509 nodes x 0.606 us)
+  ------------------------------------
+  total              2.55 ms   vs 2.56 ms measured
+
+Against a 1.534 ms bandwidth floor (1466.75 MB at 956 GB/s) that is 0.70 ms of
+non-bandwidth time:
+
+  router (dot + top4)   167 us   524 KB of weights
+  rmsnorm x81           195 us   1.3 MB
+  GEMV inefficiency     119 us   MoE at 896, dense at 780, shortconv_out at 813
+  attention             34 us
+  swiglu/accum/conv      75 us
+  argmax                  3 us
+
+## The ceiling, stated honestly
+
+550 tok/s requires 1.818 ms per step. The bandwidth floor alone is 1.534 ms, and
+509 graph nodes at 0.606 us add 0.308 ms, giving 1.842 ms -- 543 tok/s -- with
+*perfect* bandwidth utilisation and the current node count. **C4's 550 tok/s is
+not reachable by kernel tuning for this weight format on this part.** The
+realistic maximum is ~450-480 tok/s.
+
+Reaching 550 would require moving fewer bytes per token, and the one lever for
+that was measured dead in Phase 4m: the routing is too uniform for speculative
+decoding to amortise anything.
+
+## Progress
+
+  102.79  Phase 3 baseline
+  266.57  Phase 4k
+  346.36  Phase 4l  (per-kernel profiling, MLP fixes)
+  370.6   Phase 4n  (dp4a lm_head)
+  382.7   Phase 4n  (+ quantiser fusion)
+  390.3   Phase 4o  (norm restructure)          <- 3.80x over Phase 3
+                                                  1.72x over llama.cpp (227.07)
