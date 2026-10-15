@@ -71,18 +71,14 @@ static double lk_prof_bytes(const char * t) {
     static const Row T[] = {
         {"embed",           1680.0}, {"norm_attn",     16384.0},
         {"shortconv_in", 7077888.0}, {"shortconv_conv", 24576.0},
-        {"quant_conv",         0.0}, {"shortconv_out",2359296.0},
-        {"attn_q",       2359296.0}, {"attn_k",        589824.0},
+                {"attn_q",       2359296.0}, {"attn_k",        589824.0},
         {"attn_v",        589824.0}, {"qk_norm_rope",       0.0},
-        {"attention",          0.0}, {"quant_attn",         0.0},
-        {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
+        {"attention",          0.0},         {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
         {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
-        {"dense_swiglu",       0.0}, {"quant_dense",        0.0},
-        {"dense_down",  13565952.0}, {"router_dot",    524288.0},
+        {"dense_swiglu",       0.0},         {"dense_down",  13565952.0}, {"router_dot",    524288.0},
         {"router_top4",        0.0}, {"route_log",          0.0},
         {"moe_gate",     7077888.0}, {"moe_up",       7077888.0},
-        {"moe_swiglu",         0.0}, {"quant_moe",          0.0},
-        {"moe_down",     7077888.0}, {"moe_accum",          0.0},
+        {"moe_swiglu",         0.0},         {"moe_down",     7077888.0}, {"moe_accum",          0.0},
         {"norm_final",     16384.0}, {"lm_head",    215040000.0},
         {"argmax_part",   512000.0}, {"argmax_final",       0.0},
     };
@@ -341,8 +337,11 @@ static void forward(Engine & e, cudaStream_t st) {
 
         // ---- sequence mixer -------------------------------------------
         LKP_B("norm_attn");
+    // dead outputs: nothing reads the f32 or fp16 form of the PRE-mixer norm
+    // (the router consumes the POST-ffn_norm one), so skip 12 KB of stores per
+    // call.  The kernel already branches on null.
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS,
-                                              e.h, e.h16, e.xq); LKP_E();
+                                              nullptr, nullptr, e.xq); LKP_E();
         LK_STEP("mixer-norm");
 
         if (!l.is_attn) {
@@ -366,7 +365,7 @@ static void forward(Engine & e, cudaStream_t st) {
                 fprintf(stderr, "dumped layer-0 h/xq/bcx to %s\n", dp);
             }
             LKP_B("shortconv_conv");
-    k_shortconv<<<8, 256, 0, st>>>(e.y, 0, P32(e, l.sc_conv), hist, e.tmp); LKP_E();
+    k_shortconv<<<8, 256, 0, st>>>(e.y, 0, P32(e, l.sc_conv), hist, e.tmp, e.xq); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0B")) {   // conv output before quantise
                 const char * dp = getenv("LK_DUMP_L0B");
                 FILE * df = fopen(dp, "wb");
@@ -375,8 +374,7 @@ static void forward(Engine & e, cudaStream_t st) {
                 fwrite(ty, 4, LK_HIDDEN, df);
                 fclose(df);
             }
-            LKP_B("quant_conv");
-    k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32); LKP_E();
+            
             if (il == 0 && getenv("LK_DUMP_L0Q")) {   // q8 of the conv output
                 const char * dp = getenv("LK_DUMP_L0Q");
                 FILE * df = fopen(dp, "wb");
@@ -420,9 +418,8 @@ static void forward(Engine & e, cudaStream_t st) {
                 e.d_pos, kc, vc); LKP_E();
             LKP_B("attention");
     k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
-                e.qv, kc, vc, e.d_pos, e.tmp); LKP_E();
-            LKP_B("quant_attn");
-    k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32); LKP_E();
+                e.qv, kc, vc, e.d_pos, e.tmp, e.xq); LKP_E();
+            
             LKP_B("attn_out");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1); LKP_E();
@@ -431,8 +428,10 @@ static void forward(Engine & e, cudaStream_t st) {
 
         // ---- channel mixer --------------------------------------------
         LKP_B("norm_ffn");
+    // the f32 form is the router's input and exists only in MoE layers; the
+    // fp16 form is never read anywhere in the engine.
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS,
-                                              e.h, e.h16, e.xq); LKP_E();
+                                              l.is_moe ? e.h : nullptr, nullptr, e.xq); LKP_E();
         LK_STEP("ffn-norm");
 
         if (!l.is_moe) {
@@ -443,7 +442,7 @@ static void forward(Engine & e, cudaStream_t st) {
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
                 PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0); LKP_E();
             LKP_B("dense_swiglu");
-    k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter); LKP_E();
+    k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter, e.xq); LKP_E();
             if (il == 0 && getenv("LK_DUMP_FFN")) {   // dense-FFN intermediates
                 const char * dp = getenv("LK_DUMP_FFN");
                 FILE * df = fopen(dp, "wb");
@@ -464,8 +463,7 @@ static void forward(Engine & e, cudaStream_t st) {
                 fclose(df);
                 fprintf(stderr, "dumped layer-0 dense-FFN gate+up+inter\n");
             }
-            LKP_B("quant_dense");
-    k_quantize_q8_1<<<LK_DENSE_INTER / 32, 32, 0, st>>>(e.inter, e.xq, LK_DENSE_INTER / 32); LKP_E();
+            
             LKP_B("dense_down");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1); LKP_E();
@@ -499,9 +497,8 @@ static void forward(Engine & e, cudaStream_t st) {
                 PQS(e, l.eu), PD(e, l.eu), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
                 e.d_idx, e.moe_gu + GU); LKP_E();
             LKP_B("moe_swiglu");
-    k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, e.moe_inter4); LKP_E();
-            LKP_B("quant_moe");
-    k_quantize_q8_1<<<GU / 32, 32, 0, st>>>(e.moe_inter4, e.xq2, GU / 32); LKP_E();
+    k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
+            
             // down: each expert consumes its OWN 48-block activation slice
             LKP_B("moe_down");
     k_gemv_q4_0_exp<<<dim3(grid_for(LK_HIDDEN), LK_TOP_K), 256, 0, st>>>(
@@ -523,12 +520,21 @@ static void forward(Engine & e, cudaStream_t st) {
     // ---- final norm + tied Q6_K lm_head + argmax ----------------------
     LKP_B("norm_final");
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, e.out_norm), LK_HIDDEN, LK_EPS,
-                                          e.h, e.h16, e.xq); LKP_E();
+                                          nullptr, nullptr, e.xq); LKP_E();
     LKP_B("lm_head");
-    k_gemv_q6_K<<<grid_for(LK_VOCAB), 256, 0, st>>>(
-        (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
-        (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-        e.xq, LK_VOCAB, 8, e.logits); LKP_E();
+    // LK_Q6K_SCALAR keeps the original scalar kernel reachable so the two can be
+    // compared on real weights without a rebuild.
+    if (getenv("LK_Q6K_SCALAR"))
+        k_gemv_q6_K<<<grid_for(LK_VOCAB), 256, 0, st>>>(
+            (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
+            (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
+            e.xq, LK_VOCAB, 8, e.logits);
+    else
+        k_gemv_q6_K_dp4a<<<grid_for(LK_VOCAB), 256, 0, st>>>(
+            (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
+            (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
+            e.xq, LK_VOCAB, 8, e.logits);
+    LKP_E();
     LKP_B("argmax_part");
     k_argmax_part<<<LK_ARGMAX_BLOCKS, 256, 0, st>>>(e.logits, e.d_apv, e.d_api); LKP_E();
     LKP_B("argmax_final");

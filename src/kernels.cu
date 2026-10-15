@@ -164,16 +164,105 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Q6_K lm_head, dp4a path.
+//
+// The scalar version issues FOUR 1-BYTE loads per element (ql, qh, the scale and
+// the activation) plus three int->float converts and three multiplies, ~17
+// instructions per element.  At 128000 rows x 64 elements per lane that is
+// ~139M warp-instructions, i.e. ~294 us of pure issue on this part -- which is
+// what the 511 GB/s (versus a 956 GB/s ceiling) actually measures.  Unrolling
+// the superblock loop changed nothing precisely because it does not change the
+// instruction count.
+//
+// Q6_K is built for this.  Within a 128-element half, ql byte b holds the low
+// nibble of element b and the high nibble of element b+64, and qh byte b holds
+// the top two bits of elements b, b+32, b+64 and b+96 at shifts 0, 2, 4, 6.
+// So one 32-bit load of ql plus one of qh yields four packed 6-bit values, and
+// one dp4a consumes them.  That is 2 loads and ~6 ALU ops per 4 elements instead
+// of 4 loads and ~13.
+//
+// Lane assignment: lane L owns the 8 CONSECUTIVE elements 8L..8L+7 of the
+// superblock.  Those always fall inside one 32-element Q8_1 block (index L/4)
+// and one 16-element scale group (index L/2), so each lane needs exactly one
+// activation scale, one weight scale, and two dp4a groups.  Every byte offset
+// this produces is a multiple of 4, so both arrays load as aligned 32-bit words.
+//
+// The reduction ORDER differs from the scalar kernel, so the result is not
+// bit-identical -- it is closer to exact, since the integer accumulation is
+// exact and only one float multiply per 8 elements rounds.
+__global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql1, const uint8_t * __restrict__ qh1,
+                                 const int8_t * __restrict__ sc1, const __half * __restrict__ d1,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int sbpr, float * __restrict__ y) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= out_rows) return;
+
+    // ---- per-lane geometry: constant across all superblocks -----------------
+    const int s        = 8 * (lane & 15);   // element offset inside the 128-half
+    const int hi_nib   = (s >= 64);         // high or low nibble of ql
+    const int k        = s >> 5;            // 0..3 -> qh bit pair
+    const int ql_idx   = ((lane >= 16) ? 64 : 0) + (hi_nib ? s - 64 : s);
+    const int qh_idx   = ((lane >= 16) ? 32 : 0) + s - 32 * k;
+    const int qh_sh    = 2 * k;
+    const int u_off    = 8 * (lane & 3);    // byte offset inside the Q8_1 block
+    const int blk      = lane >> 2;         // which of the 8 Q8_1 blocks
+    const int sci      = lane >> 1;         // which of the 16 scales
+
+    float acc = 0.0f;
+    for (int sb = 0; sb < sbpr; ++sb) {
+        const size_t sblk = (size_t) warp * sbpr + sb;
+        const uint8_t * QL = ql1 + sblk * 128;
+        const uint8_t * QH = qh1 + sblk * 64;
+        const block_q8_1 * X = xq + (size_t) sb * 8 + blk;
+
+        const int   scv = (int) sc1[sblk * 16 + sci];
+        const float d8  = __low2float(X->ds);
+        const uint32_t ql0 = *(const uint32_t *) (QL + ql_idx);
+        const uint32_t ql4 = *(const uint32_t *) (QL + ql_idx + 4);
+        const uint32_t qh0 = *(const uint32_t *) (QH + qh_idx);
+        const uint32_t qh4 = *(const uint32_t *) (QH + qh_idx + 4);
+
+        int a = 0;
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const uint32_t qw = t ? ql4 : ql0;
+            const uint32_t hw = t ? qh4 : qh0;
+            const uint32_t vil = hi_nib ? ((qw >> 4) & 0x0F0F0F0Fu) : (qw & 0x0F0F0F0Fu);
+            const uint32_t vih = ((hw >> qh_sh) & 0x03030303u) << 4;
+            const int vi = __vsubss4((int) (vil | vih), 0x20202020);
+            const int u  = *(const int32_t *) (X->qs + u_off + t * 4);
+            a = __dp4a(vi, u, a);
+        }
+        acc += __half2float(d1[sblk]) * (d8 * (float) (a * scv));
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[warp] = acc;
+}
+
+// Produces the SwiGLU activation and, optionally, its Q8_1 form.
+//
+// Every caller feeds the result straight into k_quantize_q8_1, which costs a
+// whole graph node (0.6 us of pure dispatch, measured) to move 24 KB.  Here a
+// warp already owns 32 consecutive outputs, which is exactly one Q8_1 block, so
+// the quantisation is free apart from the reduction.  n is always a multiple of
+// 32 and the block size is too, so no warp is ever partially active and the
+// full-mask shuffles inside quantize_q8_1_warp stay well defined.
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
-                         int n, float * __restrict__ out) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        out[i] = silu_f(gate[i]) * up[i];
+                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float v = silu_f(gate[i]) * up[i];
+        if (out) out[i] = v;
+        if (yq8) quantize_q8_1_warp(v, yq8 + (i >> 5), threadIdx.x & 31);
+    }
 }
 
 // ---------------------------------------------------------------------------
 __global__ void k_shortconv(const float * __restrict__ bcx, int t,
                             const float * __restrict__ conv_w, float * __restrict__ hist,
-                            float * __restrict__ y) {
+                            float * __restrict__ y, block_q8_1 * __restrict__ yq8) {
     // t selects which token of the bcx buffer we are processing
     const float * B = bcx;
     const float * C = bcx + LK_HIDDEN;
@@ -189,7 +278,9 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
         const float conv = h0 * cw0 + h1 * cw1 + bx * cw2;
         h[0] = h1;
         h[1] = bx;
-        y[ch] = C[ch] * conv;
+        const float v = C[ch] * conv;
+        if (y) y[ch] = v;
+        if (yq8) quantize_q8_1_warp(v, yq8 + (ch >> 5), threadIdx.x & 31);
     }
     (void)t;
 }
@@ -268,6 +359,7 @@ __global__ void k_router_top4(const float * __restrict__ logits,
     static_assert(LK_TOP_K == 4, "unrolled selection assumes top-4");
     float p0 = -1e30f, p1 = -1e30f, p2 = -1e30f, p3 = -1e30f;
     int   i0 = -1,     i1 = -1,     i2 = -1,     i3 = -1;
+#pragma unroll
     for (int j = 0; j < LK_N_EXPERTS; ++j) {
         const float v = sel[j];
         if      (v > p0) { p3 = p2; i3 = i2; p2 = p1; i2 = i1; p1 = p0; i1 = i0; p0 = v; i0 = j; }
@@ -290,7 +382,8 @@ __global__ void k_router_top4(const float * __restrict__ logits,
 __global__ void k_attention_decode(const float * __restrict__ q,
                                    const __half * __restrict__ kc,
                                    const __half * __restrict__ vc,
-                                   const int * __restrict__ d_pos, float * __restrict__ out) {
+                                   const int * __restrict__ d_pos, float * __restrict__ out,
+                                   block_q8_1 * __restrict__ yq8) {
     const int seq_len = *d_pos + 1;
     const int head = blockIdx.x;
     const int kv_head = head / (LK_N_HEADS / LK_N_KV_HEADS);
@@ -346,7 +439,11 @@ __global__ void k_attention_decode(const float * __restrict__ q,
             const __half * v = vc + ((size_t)t * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
             acc += s_score[t] * __half2float(v[d]);
         }
-        out[head * LK_HEAD_DIM + d] = acc * inv_l;
+        const float o = acc * inv_l;
+        if (out) out[head * LK_HEAD_DIM + d] = o;
+        // LK_HEAD_DIM is 64, so threads 0..31 and 32..63 of each block hold the
+        // two Q8_1 blocks belonging to this head.  Both warps are fully active.
+        if (yq8) quantize_q8_1_warp(o, yq8 + 2 * head + (threadIdx.x >> 5), threadIdx.x & 31);
     }
 }
 

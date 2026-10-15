@@ -100,10 +100,14 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
                             const int8_t * __restrict__ sc, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
                             int out_rows, int sbpr, float * __restrict__ y);
+__global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                                 const int8_t * __restrict__ sc, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int sbpr, float * __restrict__ y);
 
 // SwiGLU: out[i] = silu(gate[i]) * up[i]
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
-                         int n, float * __restrict__ out);
+                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8);
 
 // ShortConv one-token step.  semantics (verified against llama.cpp lfm2.cpp):
 //   [B|C|x] = in_proj(h);  bx = B*x;
@@ -112,7 +116,7 @@ __global__ void k_swiglu(const float * __restrict__ gate, const float * __restri
 // hist is [2048][2] per layer: hist[ch*2+0] = older, hist[ch*2+1] = newer.
 __global__ void k_shortconv(const float * __restrict__ bcx, int t,
                             const float * __restrict__ conv_w, float * __restrict__ hist,
-                            float * __restrict__ y);
+                            float * __restrict__ y, block_q8_1 * __restrict__ yq8);
 
 // MoE router: sigmoid gate, top-4 selected by (sigmoid + bias), weights taken
 // from the UNBIASED sigmoid and renormalised.  Exactly llama.cpp's
@@ -128,7 +132,8 @@ __global__ void k_router_top4(const float * __restrict__ logits,
 __global__ void k_attention_decode(const float * __restrict__ q,     // [32*64]
                                    const __half * __restrict__ kc,   // [max_seq, 8, 64]
                                    const __half * __restrict__ vc,   // [max_seq, 8, 64]
-                                   const int * __restrict__ d_pos, float * __restrict__ out);
+                                   const int * __restrict__ d_pos, float * __restrict__ out,
+                                   block_q8_1 * __restrict__ yq8);
 
 // ---- additional forward kernels (Phase 3) ---------------------------------
 // Q6_K embedding-row lookup: dequantise row `token` into x[2048].
