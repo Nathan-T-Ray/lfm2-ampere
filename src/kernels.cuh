@@ -81,6 +81,13 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 // host asserts seq_len <= this; a proper Split-K online softmax lands in
 // Phase 4 to lift the limit to the full 131072 context.
 #define LK_ATTN_MAX_SEQ 8192
+// k_attention_decode runs ONE block per query head, and every one of its loops
+// is limited by outstanding memory requests rather than by bandwidth or issue
+// slots: the score loop gives each thread all 64 dims of a single token, so a
+// warp holds exactly one cache line in flight and the block stalls near
+// 2.4 GB/s per SM -- which is the 3.7 GB/s the profile actually showed at 8k
+// context.  Outstanding requests scale with the WARP count, so the block is
+// widened well beyond the 64 lanes the output loop needs.
 
 // Rows computed per warp by the general Q4_0 GEMV.  Four rows in flight gives
 // 4x the memory-level parallelism per lane and amortises each shared xq block
@@ -129,6 +136,13 @@ __global__ void k_router_top4(const float * __restrict__ logits,
                               int * __restrict__ idx_out, float * __restrict__ w_out);
 
 // Single-query decode attention over an fp16 KV cache.
+// The block width was tried at 1024 (with launch bounds) and measured NEUTRAL:
+// attention at 8k context was 466 us per layer against 476 at 256 threads, and
+// short context got slightly worse.  Widening the block does not help because
+// the two hot loops want opposite things -- the score loop is coalesced at
+// token-major and the V loop needs a token split -- so the remaining lever is
+// split-K, not more warps.  Kept at 256 so the reduction order is unchanged.
+#define LK_ATTN_BLOCK   256
 __global__ void k_attention_decode(const float * __restrict__ q,     // [32*64]
                                    const __half * __restrict__ kc,   // [max_seq, 8, 64]
                                    const __half * __restrict__ vc,   // [max_seq, 8, 64]

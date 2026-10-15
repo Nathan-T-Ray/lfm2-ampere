@@ -443,7 +443,9 @@ __global__ void k_attention_decode(const float * __restrict__ q,
         m = fmaxf(m, acc);
     }
     // block max
-    __shared__ float s_m[256];
+    // Sized by the block, which is deliberately much wider than LK_HEAD_DIM:
+    // see LK_ATTN_BLOCK.
+    __shared__ float s_m[LK_ATTN_BLOCK];
     s_m[threadIdx.x] = m;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {

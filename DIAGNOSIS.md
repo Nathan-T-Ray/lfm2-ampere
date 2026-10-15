@@ -782,3 +782,7 @@ decoding to amortise anything.
   382.7   Phase 4n  (+ quantiser fusion)
   390.3   Phase 4o  (norm restructure)          <- 3.80x over Phase 3
                                                   1.72x over llama.cpp (227.07)
+
+---
+
+# Phase 4r is folded into the commit above; see git log.

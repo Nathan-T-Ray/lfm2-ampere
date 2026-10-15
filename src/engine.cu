@@ -417,7 +417,7 @@ static void forward(Engine & e, cudaStream_t st) {
                 e.qv, e.kv, e.vv, P32(e, l.qnorm), P32(e, l.knorm),
                 e.d_pos, kc, vc); LKP_E();
             LKP_B("attention");
-    k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
+    k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK, 0, st>>>(
                 e.qv, kc, vc, e.d_pos, e.tmp, e.xq); LKP_E();
             
             LKP_B("attn_out");
@@ -545,7 +545,11 @@ int main(int argc, char ** argv) {
     const char * pack = getenv("LK_PACK");
     const char * mode = (argc > 1) ? argv[1] : "gen";
     if (!pack) { fprintf(stderr, "LK_PACK not set\n"); return 1; }
-    const int max_seq = 2048;
+    // The objective is single-stream decode at up to 8k context and
+    // LK_ATTN_MAX_SEQ (the shared-memory bound in k_attention_decode) is already
+    // 8192, but the KV cache was sized for 2048 -- anything longer addressed
+    // past the end of the allocation.  Overridable for experiments.
+    const int max_seq = getenv("LK_MAX_SEQ") ? atoi(getenv("LK_MAX_SEQ")) : 8192;
 
     g_debug_steps = getenv("LK_DEBUG_STEPS") ? atoi(getenv("LK_DEBUG_STEPS")) : 0;
     Engine * e = engine_create(pack, max_seq);
