@@ -75,12 +75,20 @@ __device__ __forceinline__ float dot_q4_0_q8_1(const uint4 * __restrict__ qs,
     const uint32_t * qw = reinterpret_cast<const uint32_t *>(&q);
 
     int sumi = 0;
+#ifndef LK_LOADONLY
+    // LK_LOADONLY builds a diagnostic variant that issues the same memory
+    // traffic but skips the arithmetic.  Comparing the two isolates whether a
+    // kernel is bound by instructions or by bandwidth.  Results are wrong; this
+    // exists only to answer that question.
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
         const uint32_t v = qw[w];
         sumi = dp4a((int)(v & 0x0F0F0F0Fu),        xq[w],     sumi);  // elements 4w..4w+3
         sumi = dp4a((int)((v >> 4) & 0x0F0F0F0Fu), xq[4 + w], sumi);  // elements 16+4w..
     }
+#else
+    sumi = (int)(qw[0] & 0xFF) + (int)(qw[3] & 0xFF);
+#endif
     const float d8  = __low2float(x->ds);
     const float sum = __high2float(x->ds);
     return d4 * (d8 * (float)sumi - 8.0f * sum);
