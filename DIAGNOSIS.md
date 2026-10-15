@@ -179,3 +179,61 @@ buffer/aliasing problem. If they agree, compare that buffer against NumPy, which
 would instead implicate the weight plane pointers. Also worth dumping
 `PQS(e,l.sc_out)[0..3]` and `PD(e,l.sc_out)[0..3]` from the device and checking
 them against the manifest offsets.
+
+---
+
+# UPDATE (round 6): the GEMV is PROVEN exact; round 5's conclusion was a harness artifact
+
+## Correction to round 5
+
+Round 5 concluded that `k_gemv_q4_0`'s out_proj path was broken. **That was
+wrong, and the error was mine.** `LK_NO_RESIDUAL` disabled only the *ShortConv*
+residual, not the FFN's; layer 0 then still ran its dense FFN, so the dumped
+`e.x` was `proj + ffn_out`, and I compared it against a reference `proj`. The
+"38% per-row error with correct rms and 0.87 correlation" is exactly what
+`proj + ffn_out` vs `proj` looks like.
+
+Lesson applied from here on: verify a value at the point it is produced, with
+the mutation flags off, before drawing conclusions from a diff.
+
+## What is now PROVEN (not inferred)
+
+`tests/test_gemv.cu` is a standalone isolation harness: it loads the real
+`blk.0.shortconv.out_proj.weight` planes from the pack, quantises a fixed
+activation, runs `k_gemv_q4_0`, and dumps the output. No engine, no layer loop.
+
+    standalone vs NumPy : max|d| = 1.49e-08   corr = 1.00000000
+    row 1572 = 0.0163759  (reference 0.0163759)
+
+and inside the engine, dumped *immediately* after the same GEMV with a stream
+sync (`LK_DUMP_L0X`):
+
+    engine vs standalone : max|d| = 3.73e-07   corr = 1.00000000
+    row 1572 = 0.0163761
+
+So `k_gemv_q4_0`, the Q8_1 quantiser, the planar weight planes and the
+ShortConv path are all correct **end to end within layer 0**. That eliminates a
+large part of the search space and is a permanent regression tool.
+
+## Where the divergence actually is
+
+The clean per-layer table (no debug flags) is unchanged from round 3, so the
+real divergence remains:
+
+    idx 1  (after layer 0)  ~1e-4
+    idx 21                 1.5e-02   max 5.8e-01
+    idx 22                 1.0e-01   max 2.3e+01   rms 1.4387 vs ref 0.5824
+    idx 40 (final)         1.1e-01   max 4.2e+00   rms 0.3608 vs ref 0.2505
+
+The CUDA residual *explodes* to rms 1.44 at layer 22 (60x the embedding rms)
+where the reference reaches only 0.58. Since layer 0's ShortConv path is now
+proven exact, the fault is in the **channel mixer (dense FFN / MoE)** or the
+**attention** path -- layer 22 is an attention layer (il%4==2).
+
+## Next
+
+Bisect layer 0's *dense FFN* the same way the ShortConv was bisected: dump
+`ffn_norm` output, its Q8_1 codes, gate/up, the SwiGLU intermediate, its Q8_1
+codes, and the down output, each compared against `ref_forward.py`. Layer 0 is
+dense-FFN and comes right after the now-verified ShortConv, so it is the next
+unverified stage in the chain.

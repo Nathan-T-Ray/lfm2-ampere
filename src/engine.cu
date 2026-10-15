@@ -204,6 +204,10 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
         const Layer & l = e.L[il];
         if (dumpf) {   // residual stream BEFORE layer il
             float buf[LK_HIDDEN];
+            // cudaMemcpy is only ordered against the DEFAULT stream; our kernels
+            // run on `st`. Without this sync the copy can race with in-flight
+            // work and capture a partially-written e.x.
+            CK(cudaStreamSynchronize(st));
             CK(cudaMemcpy(buf, e.x, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
             fwrite(buf, 4, LK_HIDDEN, dumpf);
         }
@@ -222,7 +226,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
                 const char * dp = getenv("LK_DUMP_L0");
                 FILE * df = fopen(dp, "wb");
                 float th[LK_HIDDEN]; int8_t tq[64 * sizeof(block_q8_1)]; float tb[6144], tc[LK_HIDDEN];
-                CK(cudaMemcpy(th, e.h, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                CK(cudaStreamSynchronize(st)); CK(cudaMemcpy(th, e.h, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(tq, e.xq, 64 * (int)sizeof(block_q8_1), cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(tb, e.y, 6144 * 4, cudaMemcpyDeviceToHost));
                 fwrite(th, 4, LK_HIDDEN, df);
@@ -237,7 +241,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
                 const char * dp = getenv("LK_DUMP_L0B");
                 FILE * df = fopen(dp, "wb");
                 float ty[LK_HIDDEN];
-                CK(cudaMemcpy(ty, e.tmp, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                CK(cudaStreamSynchronize(st)); CK(cudaMemcpy(ty, e.tmp, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
                 fwrite(ty, 4, LK_HIDDEN, df);
                 fclose(df);
             }
@@ -246,7 +250,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
                 const char * dp = getenv("LK_DUMP_L0Q");
                 FILE * df = fopen(dp, "wb");
                 int8_t tq[64 * (int)sizeof(block_q8_1)];
-                CK(cudaMemcpy(tq, e.xq, sizeof tq, cudaMemcpyDeviceToHost));
+                CK(cudaStreamSynchronize(st)); CK(cudaMemcpy(tq, e.xq, sizeof tq, cudaMemcpyDeviceToHost));
                 fwrite(tq, 1, sizeof tq, df);
                 fclose(df);
             }
@@ -255,6 +259,15 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
             k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar);
+            if (il == 0 && getenv("LK_DUMP_L0X")) {   // immediately after the GEMV
+                const char * dp = getenv("LK_DUMP_L0X");
+                FILE * df = fopen(dp, "wb");
+                float tx[LK_HIDDEN];
+                CK(cudaStreamSynchronize(st));
+                CK(cudaMemcpy(tx, e.x, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                fwrite(tx, 4, LK_HIDDEN, df);
+                fclose(df);
+            }
             LK_STEP("shortconv");
         } else {
             const int al = attn_i++;
@@ -335,6 +348,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
 
     if (dumpf) {       // residual stream AFTER the last layer
         float buf[LK_HIDDEN];
+        CK(cudaStreamSynchronize(st));
         CK(cudaMemcpy(buf, e.x, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
         fwrite(buf, 4, LK_HIDDEN, dumpf);
         fflush(dumpf);
