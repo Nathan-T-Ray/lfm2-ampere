@@ -106,7 +106,7 @@ __global__ void k_router_top4(const float * __restrict__ h, const float * __rest
         const float * row = gate_inp + (size_t)j * LK_HIDDEN;
         for (int i = 0; i < LK_HIDDEN; ++i) acc += row[i] * h[i];
         s_logit[j] = acc;
-        s_sel[j] = 1.0f / (1.0f + expf(-acc)) + bias[j];
+        s_sel[j] = 1.0f / (1.0f + __expf(-acc)) + bias[j];
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -126,7 +126,7 @@ __global__ void k_router_top4(const float * __restrict__ h, const float * __rest
         float wsum = 0.0f;
         float wv[LK_TOP_K];
         for (int k = 0; k < LK_TOP_K; ++k) {
-            wv[k] = 1.0f / (1.0f + expf(-s_logit[idx[k]]));
+            wv[k] = 1.0f / (1.0f + __expf(-s_logit[idx[k]]));
             wsum += wv[k];
         }
         if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
@@ -174,7 +174,7 @@ __global__ void k_attention_decode(const float * __restrict__ q,
 
     float lsum = 0.0f;
     for (int t = threadIdx.x; t < lim; t += blockDim.x) {
-        const float p = expf(s_score[t] - mglobal);
+        const float p = __expf(s_score[t] - mglobal);
         s_score[t] = p;
         lsum += p;
     }

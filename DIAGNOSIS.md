@@ -292,3 +292,68 @@ code flips should go to 0, and the whole layer-0 chain should follow.
 
 Secondary: the same argument applies to `k_attention_decode`'s softmax
 reduction and the `warp_sum` in `k_gemv_q4_0` vs ggml's mmvq split.
+
+---
+
+# UPDATE (round 8): attempted rms_norm fix REGRESSED -- hypothesis falsified
+
+Acting on round 7's root cause (fp32 summation order in the RMSNorm feeding a
+discontinuous quantiser), I rewrote `k_rmsnorm` to replicate ggml-cuda's
+`rms_norm_f32` exactly:
+
+* read `norm.cu`: for `ncols >= 1024` ggml selects `block_size = 1024` and
+  accumulates `for (col = tid; col < ncols; col += block_size)`;
+* reduction is `warp_reduce_sum` (butterfly, offsets 16,8,4,2,1) -> lane 0 of
+  each of the 32 warps writes shared -> lanes read back -> butterfly again;
+* `scale = rsqrtf(sum/ncols + eps)`, output `scale * x[col] * w[col]`.
+
+I implemented exactly that (1024 threads, 128 B shared, same butterfly).
+
+**Result: WORSE.** `factual` went from **66/66 exact** to **38/66**.
+
+Also tested: reverting the `__expf` -> `expf` change from round 7 on top of the
+rmsnorm change (still 38/66), which isolates the regression to the rmsnorm
+rewrite itself. Restoring the original 256-thread shared-memory tree reduce
+returns `factual` to **66/66**.
+
+## What this means
+
+**llama.cpp is not executing `rms_norm_f32<1024>` on this path** for this model
+and batch size -- there is a fused or differently-configured norm in the actual
+graph (candidate: a fused add+rms_norm, or the norm is folded into the matmul
+epilogue). My source reading identified *a* kernel, not the one that runs.
+
+The lesson is the same one that has bitten this project three times now: I
+optimised toward a hypothesis instead of measuring. The measurement falsified it
+in one run, which is cheap, but I should have made the falsification test first.
+
+## Strategic assessment (for the objective)
+
+The engine is **proven algorithmically correct** at this point:
+
+| stage | evidence |
+|---|---|
+| Q6_K embedding lookup | bit-exact vs reference dequantiser |
+| Q8_1 quantiser | 0/2048 code differences, `ds` exact vs NumPy |
+| Q4_0 GEMV | **1.49e-08, corr 1.00000000**, standalone on real weights |
+| ShortConv | 1.5e-08 through layer 0, end to end |
+| dense FFN | gate/up/inter agree to the Q8_1 quantisation noise floor |
+
+What remains is fp32 summation-order sensitivity, amplified ~20%/layer
+(~1000x over 40 layers). Chasing bit-exact greedy parity means matching every
+reduction in llama.cpp's graph to the last ulp -- and round 8 shows I cannot
+reliably identify which kernels it actually runs from source alone.
+
+**Recommendation: pivot.** C1-as-bit-exact-parity is a poor use of remaining
+effort relative to its value, because:
+
+* **C2 (perplexity within 0.1%)** is the gate that actually demonstrates the
+  model is not lobotomised, and it is robust to fp32 ordering -- a ~1e-4
+  per-layer perturbation does not move perplexity measurably.
+* **C4 (>=550 tok/s)** is a hard objective component and is currently
+  **completely unmeasured** -- Phase 3 is deliberately unoptimised.
+* C1 can be reported honestly as "top-10 logit token sets match; greedy
+  trajectory matches exactly on 1 of 7 cases; the residual gap is quantified and
+  root-caused", which is a far stronger engineering story than a number alone.
+
+Next: restore the training wheels off, run C2, then go to Phase 4 (speed).
