@@ -324,9 +324,16 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < LK_VOCAB; ++i) ord[i] = i;
         std::partial_sort(ord.begin(), ord.begin() + 10, ord.end(),
                           [&](int a, int b) { return lg[a] > lg[b]; });
+        // Normalise to log-probabilities so these are directly comparable with
+        // llama-server n_probs output.
+        double m = -1e30;
+        for (int i = 0; i < LK_VOCAB; ++i) m = std::max(m, (double)lg[i]);
+        double z = 0.0;
+        for (int i = 0; i < LK_VOCAB; ++i) z += exp((double)lg[i] - m);
+        const double lse = m + log(z);
         printf("topk:");
-        for (int i = 0; i < 10; ++i) printf(" %d:%.4f", ord[i], lg[ord[i]]);
-        printf("\n");
+        for (int i = 0; i < 20; ++i) printf(" %d:%.4f", ord[i], lg[ord[i]] - lse);
+        printf("\n  logsumexp=%.4f  top1_logit=%.4f\n", lse, lg[ord[0]]);
         return 0;
     }
 
