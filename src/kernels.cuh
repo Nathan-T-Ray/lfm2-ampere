@@ -143,6 +143,13 @@ __global__ void k_router_top4(const float * __restrict__ logits,
 // token-major and the V loop needs a token split -- so the remaining lever is
 // split-K, not more warps.  Kept at 256 so the reduction order is unchanged.
 #define LK_ATTN_BLOCK   256
+#define LK_ATTN_SPLIT  8
+#define LK_ATTN_PARTW  (2 + LK_HEAD_DIM)
+__global__ void k_attn_split(const float * __restrict__ q,
+                             const __half * __restrict__ kc, const __half * __restrict__ vc,
+                             const int * __restrict__ d_pos, float * __restrict__ part);
+__global__ void k_attn_combine(const float * __restrict__ part, float * __restrict__ out,
+                               block_q8_1 * __restrict__ yq8);
 __global__ void k_attention_decode(const float * __restrict__ q,     // [32*64]
                                    const __half * __restrict__ kc,   // [max_seq, 8, 64]
                                    const __half * __restrict__ vc,   // [max_seq, 8, 64]

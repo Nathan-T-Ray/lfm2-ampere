@@ -6,25 +6,62 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 144 | **390.3 tok/s** (3 repeats, deterministic) |
-| decode, ctx 628 | ~350 tok/s |
-| effective bandwidth | 573 GB/s = **56.9% of the 1008 GB/s spec** |
+| decode, ctx 144 | **410.4 tok/s** (3 repeats, deterministic) |
+| effective bandwidth | 602 GB/s = **59.7% of the 1008 GB/s spec** |
 | llama.cpp, same GGUF/GPU | 227.07 tok/s |
-| speedup vs llama.cpp | **1.72x** |
-| speedup vs this engine's own Phase-3 baseline | **3.80x** (102.79 tok/s) |
+| speedup vs llama.cpp | **1.81x** |
+| speedup vs this engine's own Phase-3 baseline | **3.99x** (102.79 tok/s) |
 | traffic | 1466.75 MB/token, so the bandwidth floor is 1.534 ms = **652 tok/s** |
 
 ## Correctness
 
 Three gates, all measured against references that can actually adjudicate.
 
-**C1 — greedy parity vs llama.cpp.** `factual` is **bit-identical for 66/66
-tokens** and has stayed bit-identical through every optimisation in this repo.
-The full 7-case suite matches 180/825; multi-step greedy identity is chaotic (a
-1e-7 perturbation anywhere is amplified ~20%/layer across 40 layers), so the
-suite number is reported as a diagnostic, not a gate.
+**C1 — greedy parity vs llama.cpp.** `factual` is **bit-identical for 39/66
+tokens**; the full 7-case suite matches 179/825. Multi-step greedy identity is
+chaotic and this is now *demonstrated*, not asserted -- see "How fragile greedy
+parity is" below. `LK_ATTN_SERIAL=1` restores 66/66 by reverting attention to its
+order-preserving form, at the cost of the long-context speed in the table below.
 
-**C2 — teacher-forced perplexity.** 0.0402% from the exact model on 200 paired
+## Context scaling
+
+| ctx | split-K | serial | gain |
+|---|---|---|---|
+| 164 | 415.3 | 410.9 | +1% |
+| 1064 | 382.4 | 335.4 | +14% |
+| 2064 | 351.2 | 280.8 | +25% |
+| 4064 | 307.0 | 213.5 | +44% |
+| 8064 | **243.2** | 143.7 | **+69%** |
+
+At 8k context attention was 4.76 ms of an 8.14 ms step -- 58%, at 34 GB/s against
+a 956 GB/s ceiling -- because one block per query head leaves 32 blocks on 84 SMs
+and each scans the whole context twice. Split-K (32 heads x 8 context slices,
+deterministic two-stage combine) fixes it, and costs nothing at short context
+because empty slices retire immediately.
+
+Three cheaper fixes were tried and falsified first: batching the V loads (no
+effect), transposing the KV cache (worse -- token-major was already coalesced),
+and widening the block to 1024 threads (neutral). Ablations put the score loop at
+33.7 ns per context token and the V loop at 24.9, so both halves needed the
+parallelism, not just the suspected one.
+
+## How fragile greedy parity is
+
+The split-K combine originally used `acc / l` where the serial kernel used
+`acc * (1/l)`. That is a single rounding difference of order 1e-8.
+
+At a one-token prompt the two kernels are **bit-identical**. At two tokens the
+top-64 logits already differ by **0.276**, and at sixteen by **0.724** -- enough
+to change a greedy token at position 39.
+
+This is a clean, reproducible demonstration of why multi-step greedy identity is
+not a usable correctness gate for this model, and why C1a (step-1 top-1 agreement
+plus full-vocabulary correlation) replaced it. It also means the metric is
+*scale-dependent*: a perturbation injected into the residual stream at every
+layer is amplified by all 40 of them, while a perturbation in the final lm_head
+is not amplified at all.
+
+**C2 — teacher-forced perplexity.** 0.022% from the exact model on 200 paired
 positions of natural text, against a 0.1% target. **PASS.**
 
 The reference matters here, and it is not llama.cpp. `tools/perplexity.py`
@@ -34,11 +71,14 @@ numbers, because comparing two engines cannot say which one is right:
 | | nll | vs exact | sd per position |
 |---|---|---|---|
 | exact (float64 lm_head) | 1.804137 | -- | -- |
-| **liquid-kernel** | 1.803412 | **0.0402%** | 0.0061 |
-| llama.cpp | 1.791696 | 0.6896% | 0.1775 |
+| **liquid-kernel** | -- | **0.022%** | -- |
+| llama.cpp | -- | 2.0192% | 0.315 |
 
-The engine is **17x closer to the exact model than llama.cpp is**, and the whole
-two-engine "delta" is the oracle's error.
+The engine is **91x closer to the exact model than llama.cpp is**, and the whole
+two-engine "delta" is the oracle's error.  (The exact reference is recomputed
+from the engine's own dumped residual stream, so this validates the final norm +
+lm_head stage against float64 mathematics; the single-token comparison below
+isolates the same effect with no upstream involvement.)
 
 The same effect shows up at the single-token level. Feeding one prompt token to
 each engine and recomputing the lm_head in float64:

@@ -73,7 +73,8 @@ static double lk_prof_bytes(const char * t) {
         {"shortconv_in", 7077888.0}, {"shortconv_conv", 24576.0},
                 {"attn_q",       2359296.0}, {"attn_k",        589824.0},
         {"attn_v",        589824.0}, {"qk_norm_rope",       0.0},
-        {"attention",          0.0},         {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
+        {"attention",          0.0}, {"attn_split",         0.0},
+        {"attn_combine",       0.0},         {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
         {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
         {"dense_swiglu",       0.0},         {"dense_down",  13565952.0}, {"router_dot",    524288.0},
         {"router_top4",        0.0}, {"route_log",          0.0},
@@ -109,7 +110,8 @@ static void lk_prof_report(int ctx) {
     double bytes = 0.0;
     for (const Agg & a : ag) {
         double b = lk_prof_bytes(a.tag) * a.calls;
-        if (!strcmp(a.tag, "attention")) b = (double) ctx * 2048.0 * a.calls;
+        if (!strcmp(a.tag, "attention") || !strcmp(a.tag, "attn_split"))
+            b = (double) ctx * 2048.0 * a.calls;
         bytes += b;
         const double gbs = (a.ms > 0.0) ? b / (a.ms * 1e-3) / 1e9 : 0.0;
         printf("%-16s %6d %10.3f %9.2f %10.2f %9.1f %6.1f%%\n",
@@ -156,6 +158,7 @@ struct Engine {
     float *  h = nullptr;        // [2048] post-norm (fp32, for the router)
     __half * h16 = nullptr;      // [2048] post-norm (fp16, router input)
     block_q8_1 * xq = nullptr;   // [368] quantised hidden-state activations
+    float *  attn_part = nullptr; // [heads][SPLIT][2 + head_dim] split-K scratch
     block_q8_1 * xq2 = nullptr;  // [368] second scratch: the MoE expert loop needs
                                  //       the hidden-state activation to survive
                                  //       across all 4 experts while the expert
@@ -291,6 +294,8 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->moe_down, LK_HIDDEN * 4));
     if (getenv("LK_ROUTE_LOG"))
         CK(cudaMalloc(&e->d_routelog, (size_t) e->max_seq * LK_N_LAYERS * LK_TOP_K * 4));
+    CK(cudaMalloc(&e->attn_part,
+                  (size_t) LK_N_HEADS * LK_ATTN_SPLIT * LK_ATTN_PARTW * 4));
     CK(cudaMalloc(&e->d_gate, LK_N_EXPERTS * 4));
     CK(cudaMalloc(&e->d_apv, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
@@ -417,8 +422,17 @@ static void forward(Engine & e, cudaStream_t st) {
                 e.qv, e.kv, e.vv, P32(e, l.qnorm), P32(e, l.knorm),
                 e.d_pos, kc, vc); LKP_E();
             LKP_B("attention");
-    k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK, 0, st>>>(
-                e.qv, kc, vc, e.d_pos, e.tmp, e.xq); LKP_E();
+    // LK_ATTN_SERIAL keeps the original single-block kernel reachable for A/B.
+    if (getenv("LK_ATTN_SERIAL")) {
+        k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK, 0, st>>>(
+                    e.qv, kc, vc, e.d_pos, e.tmp, e.xq);
+    } else {
+        k_attn_split<<<dim3(LK_N_HEADS, LK_ATTN_SPLIT), 256, 0, st>>>(
+                    e.qv, kc, vc, e.d_pos, e.attn_part);
+        k_attn_combine<<<LK_N_HEADS, LK_HEAD_DIM, 0, st>>>(
+                    e.attn_part, e.tmp, e.xq);
+    }
+    LKP_E();
             
             LKP_B("attn_out");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(

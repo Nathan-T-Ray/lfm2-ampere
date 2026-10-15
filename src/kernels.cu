@@ -687,3 +687,116 @@ __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict_
         dst[i] += a;
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Split-K attention (FlashDecoding shape).
+//
+// One block per query head means 32 blocks on 84 SMs, and each block scans the
+// WHOLE context twice -- once for scores, once for the weighted V sum.  At 8k
+// context that measured 476 us per layer at 34 GB/s against a 956 GB/s ceiling,
+// 58% of the entire decode step.  Three cheaper fixes were tried and falsified:
+// batching the V loads, transposing the KV cache (worse -- the token-major
+// layout was already coalesced), and widening the block to 1024 threads
+// (neutral).  Ablations put the score loop at 33.7 ns per context token and the
+// V loop at 24.9, so both halves need the parallelism, not just one.
+//
+// So partition the context: 32 heads x LK_ATTN_SPLIT blocks, each owning one
+// contiguous slice, each producing a partial (max, denom, weighted-V vector).
+// A second kernel combines them in a fixed order.  Because the slices are
+// contiguous and the combine is ordered, the only difference from the serial
+// kernel is where the rounding happens -- which does change the result, and is
+// the reason this is measured against the parity gate rather than assumed.
+#define LK_ATTN_CHUNK ((LK_ATTN_MAX_SEQ + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT)
+
+__global__ void k_attn_split(const float * __restrict__ q,
+                             const __half * __restrict__ kc, const __half * __restrict__ vc,
+                             const int * __restrict__ d_pos, float * __restrict__ part) {
+    const int seq_len = *d_pos + 1;
+    const int head = blockIdx.x;
+    const int sp   = blockIdx.y;
+    const int kv_head = head / (LK_N_HEADS / LK_N_KV_HEADS);
+    __shared__ float s_q[LK_HEAD_DIM];
+    __shared__ float s_score[LK_ATTN_CHUNK];
+    __shared__ float s_m[256];
+    if (threadIdx.x < LK_HEAD_DIM) s_q[threadIdx.x] = q[head * LK_HEAD_DIM + threadIdx.x];
+    __syncthreads();
+
+    float * P = part + ((size_t) head * LK_ATTN_SPLIT + sp) * LK_ATTN_PARTW;
+    const int chunk = (seq_len + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT;
+    const int t0 = sp * chunk;
+    const int t1 = (t0 + chunk < seq_len) ? (t0 + chunk) : seq_len;
+    if (t0 >= t1) {                       // this slice owns no tokens
+        if (threadIdx.x == 0) { P[0] = -1e30f; P[1] = 0.0f; }
+        for (int d = threadIdx.x; d < LK_HEAD_DIM; d += blockDim.x) P[2 + d] = 0.0f;
+        return;
+    }
+    const int n = t1 - t0;
+    float m = -1e30f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const __half * k = kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
+        float acc = 0.0f;
+        for (int d = 0; d < LK_HEAD_DIM; ++d) acc += s_q[d] * __half2float(k[d]);
+        acc *= LK_ATTN_SCALE;
+        s_score[j] = acc;
+        m = fmaxf(m, acc);
+    }
+    s_m[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) s_m[threadIdx.x] = fmaxf(s_m[threadIdx.x], s_m[threadIdx.x + o]);
+        __syncthreads();
+    }
+    const float mglobal = s_m[0];
+    __syncthreads();
+
+    float lsum = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const float p = __expf(s_score[j] - mglobal);
+        s_score[j] = p;
+        lsum += p;
+    }
+    s_m[threadIdx.x] = lsum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) s_m[threadIdx.x] += s_m[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { P[0] = mglobal; P[1] = s_m[0]; }
+
+    for (int d = threadIdx.x; d < LK_HEAD_DIM; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < n; ++t) {
+            const __half * v = vc + ((size_t)(t0 + t) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
+            acc += s_score[t] * __half2float(v[d]);
+        }
+        P[2 + d] = acc;                   // unnormalised partial
+    }
+}
+
+__global__ void k_attn_combine(const float * __restrict__ part, float * __restrict__ out,
+                               block_q8_1 * __restrict__ yq8) {
+    const int head = blockIdx.x;
+    const int d = threadIdx.x;            // 64 threads, one per head dim
+    const float * P = part + (size_t) head * LK_ATTN_SPLIT * LK_ATTN_PARTW;
+    __shared__ float s_m[LK_ATTN_SPLIT];
+    __shared__ float s_l[LK_ATTN_SPLIT];
+    if (d < LK_ATTN_SPLIT) {
+        s_m[d] = P[d * LK_ATTN_PARTW + 0];
+        s_l[d] = P[d * LK_ATTN_PARTW + 1];
+    }
+    __syncthreads();
+    float mf = -1e30f;
+    for (int s = 0; s < LK_ATTN_SPLIT; ++s) mf = fmaxf(mf, s_m[s]);
+    float lf = 0.0f, acc = 0.0f;
+    for (int s = 0; s < LK_ATTN_SPLIT; ++s) {
+        const float w = __expf(s_m[s] - mf);
+        lf  += s_l[s] * w;
+        acc += P[s * LK_ATTN_PARTW + 2 + d] * w;
+    }
+    // DIAGNOSTIC: reproduce the serial kernel exactly by using
+    // acc * (1/l) rather than acc / l.
+    const float o = acc * (1.0f / lf);
+    if (out) out[head * LK_HEAD_DIM + d] = o;
+    if (yq8) quantize_q8_1_warp(o, yq8 + 2 * head + (d >> 5), d & 31);
+}
