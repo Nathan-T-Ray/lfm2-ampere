@@ -1,0 +1,7 @@
+build/
+*.o
+*.so
+__pycache__/
+*.pyc
+*.pack
+*.manifest.json
