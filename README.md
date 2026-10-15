@@ -59,6 +59,9 @@ scripts/oracle.sh    start|stop|status the llama.cpp oracle (pinned to GPU 1)
 tools/devinfo.cu     GPU/L2 capability probe
 tests/make_quant_fixture.py  builds a fixture from REAL pack blocks + references
 tests/test_quant.cu  verifies the dot products (Gate G2)
+tests/make_kernel_fixture.py  dumps the real F32 taps/router weights
+tests/test_kernels.cu  verifies RMSNorm/RoPE/ShortConv/router (Gate G2)
+src/kernels.cuh/.cu  forward-pass kernels (Phase 3, correctness-first)
 scripts/setup-toolchain.sh   installs CCCL headers into the assembled CUDA tree
 tools/oracle.py      oracle client (pure-greedy sampler config)
 tools/make_suite.py  freezes the C1 parity suite as raw token IDs
@@ -71,9 +74,11 @@ The engine is pinned to **GPU 0**; the oracle owns **GPU 1**.
 
 ```bash
 source ./setenv.sh
-make devinfo
-scripts/oracle.sh start
-python3 tools/capture_ref.py
+scripts/setup-toolchain.sh      # once: install CCCL into the assembled CUDA tree
+make devinfo                    # GPU/L2 capability probe
+scripts/oracle.sh start         # llama.cpp oracle on GPU 1
+python3 tools/capture_ref.py    # baseline + C1 reference
+make test-all                   # Gate G2: all kernel primitives
 ```
 
 ## Status
@@ -82,7 +87,7 @@ python3 tools/capture_ref.py
 - [ ] **G1** repack, all 428 tensors bit-exact
 - [x] **G1** repack, all 428 tensors bit-exact
 - [x] **G2 (core)** Q4_0/Q6_K x Q8_1 dp4a dots verified vs exact integer reference
-- [ ] **G2** remaining kernels (RMSNorm, RoPE, conv, router)
+- [x] **G2** all kernel primitives verified (dots + RMSNorm/RoPE/ShortConv/router)
 - [ ] **G3** C1/C2 — greedy parity + perplexity within 0.1%
 - [ ] **G4** C3/C4 — ≥550 tok/s, ≥90% of roofline
 - [ ] **G4b** routing-skew measurement → Phase 5 decision

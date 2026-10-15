@@ -10,7 +10,7 @@ NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextr
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
 BUILD     := build
 
-.PHONY: help all check-cuda devinfo clean
+.PHONY: help all check-cuda devinfo test-all clean
 
 help:
 > @echo "liquid-kernel targets:"
@@ -38,7 +38,21 @@ $(BUILD)/test_quant: tests/test_quant.cu src/quant.cuh | $(BUILD) check-cuda
 test-quant: $(BUILD)/test_quant
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_quant $(LK_REF)/quant_fixture.bin
 
-all: devinfo test_quant
+$(BUILD)/kernels.o: src/kernels.cu src/kernels.cuh src/quant.cuh | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -c src/kernels.cu -o $@
+
+$(BUILD)/test_kernels: tests/test_kernels.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_kernels.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+test-kernels: $(BUILD)/test_kernels
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_kernels $(LK_REF)/kernel_fixture.bin
+
+all: devinfo test_quant test_kernels
+
+# Gate G2: every kernel primitive verified against an independent reference.
+test-all: test-quant test-kernels
+> @echo ""
+> @echo "GATE G2: all kernel tests passed"
 
 clean:
 > rm -rf $(BUILD)
