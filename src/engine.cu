@@ -242,8 +242,19 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
                 fclose(df);
             }
             k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
+            if (il == 0 && getenv("LK_DUMP_L0Q")) {   // q8 of the conv output
+                const char * dp = getenv("LK_DUMP_L0Q");
+                FILE * df = fopen(dp, "wb");
+                int8_t tq[64 * (int)sizeof(block_q8_1)];
+                CK(cudaMemcpy(tq, e.xq, sizeof tq, cudaMemcpyDeviceToHost));
+                fwrite(tq, 1, sizeof tq, df);
+                fclose(df);
+            }
+            // LK_NO_RESIDUAL forces add_residual=0 for layer 0's out_proj so the
+            // raw projection can be compared in isolation (debug only).
+            const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
             k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, 1);
+                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar);
             LK_STEP("shortconv");
         } else {
             const int al = attn_i++;

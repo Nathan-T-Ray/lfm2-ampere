@@ -131,3 +131,51 @@ The model **amplifies perturbations ~20% per layer** (1e-4 at layer 1 grows to
 matching llama.cpp to ~1e-6 per layer; getting the algorithm right is not
 sufficient. This is why a single unfixed residual bug destroys parity
 everywhere.
+
+---
+
+# UPDATE (round 5): everything out_proj READS is verified; the output is still wrong
+
+I forced `add_residual=0` for layer 0's out_proj (`LK_NO_RESIDUAL=1`) so the raw
+projection could be compared in isolation against the NumPy reference.
+
+    rms(cuda) = 0.015783   rms(ref) = 0.015748   ratio = 1.0022   <- magnitude OK
+    max|d|    = 5.54e-02   mean|d|  = 6.0e-03    corr   = 0.8719   <- elements WRONG
+    rows with |d| > 1e-4 : 2026 / 2048           <- essentially ALL rows
+
+So the magnitude is right but the elements are not, uniformly across all rows.
+
+Per-row mean error is ~6e-3 against an output rms of 1.57e-2, i.e. ~38%
+relative. Yet the SAME kernel function is exact to 7.1e-08 for `in_proj` in the
+same layer, with the same bpr=64.
+
+## Everything the out_proj GEMV consumes is verified identical
+
+| input | check | result |
+|---|---|---|
+| weight planes | manifest geometry + generated tensor table | qs 2,097,152 B and d 262,144 B at contiguous offsets; bpr=64, rows=2048 correct |
+| Q8_1 codes of the conv output | CUDA `LK_DUMP_L0Q` vs NumPy | **0 / 2048 differ** |
+| `ds.x` (d) | same | **0.0** |
+| `ds.y` (raw sum) | same | 3.8e-06; **1 of 64 blocks**, one fp16 ulp (butterfly vs np.sum order) |
+| conv output `y` (GEMV input) | `LK_DUMP_L0B` | 1.49e-08 |
+
+## Where that leaves it
+
+Given identical operands, an identical dot function, and an exact result for
+`in_proj`, the difference must be in the *launch* or the *output buffer*, not the
+arithmetic. Remaining suspects, narrowly:
+
+1. `out_rows=2048` vs `6144`: both give an exact warp count
+   (grid_for(r) = (r+7)/8 blocks x 8 warps), so this should not matter -- but it
+   is the only other difference.
+2. The output buffer `e.x` specifically (in_proj writes `e.y`).
+3. Some other kernel in layer 0 touching `e.x` that I have not accounted for.
+
+## Next test (concrete, cheap)
+
+Launch the GEMV twice in layer 0 -- once with the out_proj weights into a fresh
+scratch buffer, once into `e.x` -- and compare the two. If they differ, it is a
+buffer/aliasing problem. If they agree, compare that buffer against NumPy, which
+would instead implicate the weight plane pointers. Also worth dumping
+`PQS(e,l.sc_out)[0..3]` and `PD(e,l.sc_out)[0..3]` from the device and checking
+them against the manifest offsets.
