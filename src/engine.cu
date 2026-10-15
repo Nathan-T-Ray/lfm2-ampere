@@ -218,7 +218,29 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             ++conv_i;
             k_gemv_q4_0<<<grid_for(6144), 256, 0, st>>>(
                 PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0);
+            if (il == 0 && getenv("LK_DUMP_L0")) {   // bisect layer 0 tensors
+                const char * dp = getenv("LK_DUMP_L0");
+                FILE * df = fopen(dp, "wb");
+                float th[LK_HIDDEN]; int8_t tq[64 * sizeof(block_q8_1)]; float tb[6144], tc[LK_HIDDEN];
+                CK(cudaMemcpy(th, e.h, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(tq, e.xq, 64 * (int)sizeof(block_q8_1), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(tb, e.y, 6144 * 4, cudaMemcpyDeviceToHost));
+                fwrite(th, 4, LK_HIDDEN, df);
+                fwrite(tq, 1, 64 * sizeof(block_q8_1), df);
+                fwrite(tb, 4, 6144, df);
+                CK(cudaMemcpy(tc, e.tmp, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));  // pre-conv scratch
+                fclose(df);
+                fprintf(stderr, "dumped layer-0 h/xq/bcx to %s\n", dp);
+            }
             k_shortconv<<<8, 256, 0, st>>>(e.y, 0, P32(e, l.sc_conv), hist, e.tmp);
+            if (il == 0 && getenv("LK_DUMP_L0B")) {   // conv output before quantise
+                const char * dp = getenv("LK_DUMP_L0B");
+                FILE * df = fopen(dp, "wb");
+                float ty[LK_HIDDEN];
+                CK(cudaMemcpy(ty, e.tmp, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+                fwrite(ty, 4, LK_HIDDEN, df);
+                fclose(df);
+            }
             k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
             k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, 1);

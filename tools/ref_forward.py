@@ -58,13 +58,22 @@ def q6(name):
 
 
 def q8_1(x):
-    """ggml-cuda convention, per 32-element block: ds = (amax/127, RAW sum)."""
+    """ggml-cuda convention, per 32-element block: ds = (amax/127, RAW sum).
+
+    CRITICAL: ggml stores ds as a half2 (make_half2(d, sum)), so BOTH d and the
+    raw sum are rounded to fp16 before use.  Using full fp32 here instead makes
+    the reference differ from the engine by ~1e-4 in every GEMV output, which
+    then amplifies through 40 layers and looks exactly like an engine bug.
+    Round to fp16 to stay comparable.
+    """
     xb = np.asarray(x, np.float32).reshape(-1, 32)
     amax = np.max(np.abs(xb), axis=1)
     d = (amax / 127.0).astype(np.float32)
     safe = np.where(d > 0, d, np.float32(1.0))
     q = np.where(d[:, None] > 0, np.round(xb / safe[:, None]), 0.0).astype(np.int8)
-    return q, d, np.sum(xb, axis=1).astype(np.float32)
+    d16 = d.astype(np.float16).astype(np.float32)
+    s16 = np.sum(xb, axis=1).astype(np.float32).astype(np.float16).astype(np.float32)
+    return q, d16, s16
 
 
 def q4_mv_q8(name, x, rows=None):

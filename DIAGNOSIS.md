@@ -72,3 +72,62 @@ divergence is in the norm, the quantiser, the GEMV, or the attention inputs.
 Caveats:
  * `topk` prints ranks 11-20 unsorted (`partial_sort` orders only the first 10).
  * `tools/ref_forward.py` scores attention as V, valid only for a 1-token prompt.
+
+---
+
+# UPDATE (round 4): bisected to layer 0's out_proj + residual step
+
+## What now matches EXACTLY (1-token prompt, token 597, layer 0)
+
+Dumped via `LK_DUMP_L0` / `LK_DUMP_L0B` and compared against `tools/ref_forward.py`:
+
+| tensor | max abs diff | note |
+|---|---|---|
+| `h` = rmsnorm(x, attn_norm) | 5.96e-08 | fp32 roundoff |
+| Q8_1 codes of `h` | **0 / 2048 differ** | quantiser is exact |
+| `ds.x` (d) and `ds.y` (sum) | **0.0** | fp16 rounding matches |
+| `bcx` = in_proj(h)  [6144] | 2.38e-07 (rel 7.1e-08) | GEMV faithful |
+| conv output `y` [2048] | 1.49e-08 | ShortConv faithful |
+| Q8_1 codes of `y` | **0 / 2048 differ** | |
+
+So the Q8_1 quantiser, the Q4_0 GEMV, the norm and the ShortConv are all
+correct. A previous apparent 1.3e-4 error in `bcx` was a bug in the *reference*
+(ggml stores `ds` as a **half2**, so both `d` and the raw sum are fp16-rounded;
+using fp32 in the reference manufactured the discrepancy).
+
+## Where it breaks
+
+The residual stream AFTER layer 0 (dumped as idx 1) disagrees badly:
+
+    rms(cuda) = 0.00723   rms(ref) = 0.01342   max|d| = 7.6e-02
+
+Inverting the residual add (`proj_cuda = cuda_x_after - x_before`) gives a
+projection whose rms is 0.02111 vs the reference 0.01575 -- **34% larger** --
+correlating only 0.9075 with the reference.
+
+Crucially, `y` (that GEMV's input) matches to 1.5e-8 and its Q8_1 codes are
+identical, so the dot product *should* agree to ~1e-7.
+
+The ONLY structural difference between this GEMV and the `in_proj` GEMV (which
+matched to 7e-8) is:
+
+    out_proj : out_rows=2048, bpr=64, add_residual=1, reads+writes e.x
+    in_proj  : out_rows=6144, bpr=64, add_residual=0, writes e.y
+
+=> **the fault is in the residual path of `k_gemv_q4_0`**, i.e.
+
+    if (lane == 0) y[warp] = add_residual ? (y[warp] + acc) : acc;
+
+which is the last unverified line in the decode step. Suspects, in order:
+  1. `y` is declared `__restrict__` while being both read and written.
+  2. Some other kernel in layer 0 touching `e.x` (none should).
+  3. Grid/row mapping differing between the two launches (both use
+     `grid_for(rows)` = (rows+7)/8 blocks of 256, 8 warps each).
+
+## Also established this round
+
+The model **amplifies perturbations ~20% per layer** (1e-4 at layer 1 grows to
+9.4e-2 / max 22 by layer 22, ~1000x over 40 layers). So exact C1 parity requires
+matching llama.cpp to ~1e-6 per layer; getting the algorithm right is not
+sufficient. This is why a single unfixed residual bug destroys parity
+everywhere.
