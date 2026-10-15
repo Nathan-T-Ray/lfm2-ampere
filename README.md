@@ -6,7 +6,7 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 144 | **410.4 tok/s** (3 repeats, deterministic) |
+| decode, ctx 144 | **409.8 tok/s** (3 repeats, deterministic) |
 | effective bandwidth | 602 GB/s = **59.7% of the 1008 GB/s spec** |
 | llama.cpp, same GGUF/GPU | 227.07 tok/s |
 | speedup vs llama.cpp | **1.81x** |
@@ -27,11 +27,14 @@ order-preserving form, at the cost of the long-context speed in the table below.
 
 | ctx | split-K | serial | gain |
 |---|---|---|---|
-| 164 | 415.3 | 410.9 | +1% |
-| 1064 | 382.4 | 335.4 | +14% |
-| 2064 | 351.2 | 280.8 | +25% |
-| 4064 | 307.0 | 213.5 | +44% |
-| 8064 | **243.2** | 143.7 | **+69%** |
+| 164 | 415.8 | 416.4 | neutral |
+| 1064 | 386.7 | 339.0 | +14% |
+| 2064 | 356.0 | 284.9 | +25% |
+| 4064 | 308.9 | 214.7 | +44% |
+| 8064 | **243.2** | 144.4 | **+69%** |
+
+Short context is neutral within measurement noise (a clean A/B at ctx 144 gives
+406.9 split-K against 410.2 serial, 0.8%; at ctx 164 it reverses by 0.1%).
 
 At 8k context attention was 4.76 ms of an 8.14 ms step -- 58%, at 34 GB/s against
 a 956 GB/s ceiling -- because one block per query head leaves 32 blocks on 84 SMs
@@ -61,7 +64,7 @@ plus full-vocabulary correlation) replaced it. It also means the metric is
 layer is amplified by all 40 of them, while a perturbation in the final lm_head
 is not amplified at all.
 
-**C2 — teacher-forced perplexity.** 0.022% from the exact model on 200 paired
+**C2 — teacher-forced perplexity.** 0.0222% from the exact model on 200 paired
 positions of natural text, against a 0.1% target. **PASS.**
 
 The reference matters here, and it is not llama.cpp. `tools/perplexity.py`
