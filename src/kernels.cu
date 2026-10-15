@@ -58,8 +58,11 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
     const int lane = threadIdx.x & 31;
     if (warp >= out_rows) return;
     float acc = 0.0f;
-    for (int k = lane; k < sbpr; k += 32)
-        acc += dot_q6_K_q8_1(ql, qh, sc, d, warp * sbpr + k, xq + (size_t)k * 8);
+    for (int sb = 0; sb < sbpr; ++sb) {          // 8 super-blocks per 2048-dim row
+        const size_t blk = (size_t)warp * sbpr + sb;
+        acc += dot_q6_K_q8_1_warp(ql + blk * 128, qh + blk * 64, sc + blk * 16,
+                                  __half2float(d[blk]), xq + (size_t)sb * 8, lane);
+    }
     acc = warp_sum(acc);
     if (lane == 0) y[warp] = acc;
 }
@@ -280,4 +283,36 @@ __global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__
         __syncthreads();
     }
     if (threadIdx.x == 0) *out = s_i[0];
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                const block_q8_1 * __restrict__ xq,
+                                int out_rows, int bpr, int rows_per_expert,
+                                int xq_stride,
+                                const int * __restrict__ d_idx,
+                                float * __restrict__ y) {
+    const int k = blockIdx.y;                       // which of the 4 experts
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= out_rows) return;
+    const size_t base = (size_t)d_idx[k] * rows_per_expert * bpr;
+    const uint4 * qrow = qs + base + (size_t)warp * bpr;
+    const __half * drow = d + base + (size_t)warp * bpr;
+    float acc = 0.0f;
+    const block_q8_1 * xq_k = xq + (size_t)k * xq_stride;
+    for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xq_k + j);
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t)k * out_rows + warp] = acc;
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict__ down4,
+                             const float * __restrict__ d_w, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < LK_TOP_K; ++k) a += d_w[k] * down4[(size_t)k * n + i];
+        dst[i] += a;
+    }
 }

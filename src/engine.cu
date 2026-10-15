@@ -72,6 +72,9 @@ struct Engine {
     float *  conv_hist = nullptr;// [30 * 2048 * 2]
     __half * kcache = nullptr;   // [10][max_seq][8][64]
     __half * vcache = nullptr;
+    float *  moe_gu = nullptr;    // [2 * TOPK * MOE_INTER] gate4 then up4
+    float *  moe_inter4 = nullptr;// [TOPK * MOE_INTER]
+    float *  moe_down4 = nullptr; // [TOPK * HIDDEN]
     float *  moe_gate = nullptr, * moe_up = nullptr, * moe_inter = nullptr;
     float *  moe_down = nullptr;
     int *    d_idx = nullptr;
@@ -172,6 +175,9 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->conv_hist, (size_t)30 * LK_HIDDEN * 2 * 4));
     CK(cudaMalloc(&e->kcache, KV * 2));
     CK(cudaMalloc(&e->vcache, KV * 2));
+    CK(cudaMalloc(&e->moe_gu, 2 * LK_TOP_K * LK_MOE_INTER * 4));
+    CK(cudaMalloc(&e->moe_inter4, LK_TOP_K * LK_MOE_INTER * 4));
+    CK(cudaMalloc(&e->moe_down4, LK_TOP_K * LK_HIDDEN * 4));
     CK(cudaMalloc(&e->moe_gate, LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_up,   LK_MOE_INTER * 4));
     CK(cudaMalloc(&e->moe_inter, LK_MOE_INTER * 4));
@@ -333,37 +339,23 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             // the Q8_1-quantised activation.)
             k_router_top4<<<1, 64, 0, st>>>(e.h, P32(e, l.router), P32(e, l.rbias),
                                             e.d_idx, e.d_w);
-            LK_STEP("router");
-            int idx[LK_TOP_K]; float wv[LK_TOP_K];
-            CK(cudaMemcpyAsync(idx, e.d_idx, sizeof idx, cudaMemcpyDeviceToHost, st));
-            CK(cudaMemcpyAsync(wv, e.d_w, sizeof wv, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            // NOTE: host round-trip per layer per token -- deliberate for Phase 3
-            // (simple + obviously correct); Phase 4 moves routing fully on-device.
-            CK(cudaMemsetAsync(e.moe_down, 0, LK_HIDDEN * 4, st));
-            for (int k = 0; k < LK_TOP_K; ++k) {
-                const int ex = idx[k];
-                k_gemv_q4_0<<<grid_for(LK_MOE_INTER), 256, 0, st>>>(
-                    PQS(e, l.eg) + (size_t)ex * LK_MOE_INTER * 64,
-                    PD(e, l.eg)  + (size_t)ex * LK_MOE_INTER * 64,
-                    e.xq, LK_MOE_INTER, 64, e.moe_gate, 0);
-                k_gemv_q4_0<<<grid_for(LK_MOE_INTER), 256, 0, st>>>(
-                    PQS(e, l.eu) + (size_t)ex * LK_MOE_INTER * 64,
-                    PD(e, l.eu)  + (size_t)ex * LK_MOE_INTER * 64,
-                    e.xq, LK_MOE_INTER, 64, e.moe_up, 0);
-                k_swiglu<<<16, 256, 0, st>>>(e.moe_gate, e.moe_up, LK_MOE_INTER, e.moe_inter);
-                // NOTE: write the expert intermediate into xq2, NOT xq.  Using
-                // xq here clobbered the hidden-state activation that the next
-                // expert's gate/up GEMVs still need (bug caught in review).
-                k_quantize_q8_1<<<LK_MOE_INTER / 32, 32, 0, st>>>(e.moe_inter, e.xq2, LK_MOE_INTER / 32);
-                k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
-                    PQS(e, l.ed) + (size_t)ex * LK_HIDDEN * 48,
-                    PD(e, l.ed)  + (size_t)ex * LK_HIDDEN * 48,
-                    e.xq2, LK_HIDDEN, 48, e.tmp, 0);
-                k_accum_scaled<<<8, 256, 0, st>>>(e.moe_down, e.tmp, wv[k], LK_HIDDEN);
-                LK_STEP("moe-expert");
-            }
-            k_accum_scaled<<<8, 256, 0, st>>>(e.x, e.moe_down, 1.0f, LK_HIDDEN);
+            // Phase 4: ONE launch per matrix for all 4 experts (grid.y = expert),
+            // replacing 16 launches per MoE layer.  Weights stay on device, so the
+            // per-layer cudaStreamSynchronize host round-trip is gone too.
+            const int GU = LK_TOP_K * LK_MOE_INTER;
+            k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
+                PQS(e, l.eg), PD(e, l.eg), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
+                e.d_idx, e.moe_gu);
+            k_gemv_q4_0_exp<<<dim3(grid_for(LK_MOE_INTER), LK_TOP_K), 256, 0, st>>>(
+                PQS(e, l.eu), PD(e, l.eu), e.xq, LK_MOE_INTER, 64, LK_MOE_INTER, 0,
+                e.d_idx, e.moe_gu + GU);
+            k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, e.moe_inter4);
+            k_quantize_q8_1<<<GU / 32, 32, 0, st>>>(e.moe_inter4, e.xq2, GU / 32);
+            // down: each expert consumes its OWN 48-block activation slice
+            k_gemv_q4_0_exp<<<dim3(grid_for(LK_HIDDEN), LK_TOP_K), 256, 0, st>>>(
+                PQS(e, l.ed), PD(e, l.ed), e.xq2, LK_HIDDEN, 48, LK_HIDDEN, 48,
+                e.d_idx, e.moe_down4);
+            k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN);
         }
     }
 

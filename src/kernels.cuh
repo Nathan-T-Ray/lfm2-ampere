@@ -130,3 +130,20 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
                                float w, int n);
 
 __global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__ out);
+
+// ---- Phase 4: expert-batched MoE -----------------------------------------
+// One launch serves all 4 selected experts (grid.y = expert slot), so the MoE
+// layer drops from 16 launches to 3. Expert k's weights start at row
+// (d_idx[k] * rows_per_expert) and its output lands at y + k*out_rows.
+__global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                const block_q8_1 * __restrict__ xq,
+                                int out_rows, int bpr, int rows_per_expert,
+                                int xq_stride,   // 0 = all experts share the same
+                                                 // activation; bpr = per-expert
+                                const int * __restrict__ d_idx,
+                                float * __restrict__ y);
+
+// dst[i] += sum_k w[k] * down4[k*n + i]  -- keeps the router weights on device,
+// which removes the per-MoE-layer cudaStreamSynchronize host round-trip.
+__global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict__ down4,
+                             const float * __restrict__ d_w, int n);

@@ -151,3 +151,29 @@ __device__ __forceinline__ float dot_q6_K_q8_1(const uint8_t * __restrict__ ql,
     }
     return dk * sumf;
 }
+
+// ---------------------------------------------------------------------------
+// Warp-cooperative Q6_K x Q8_1 dot for ONE 256-weight super-block.
+//
+// The scalar dot_q6_K_q8_1 above is correct but leaves 24 of 32 lanes idle when
+// a warp owns a whole row (sbpr = 8 superblocks).  Here all 32 lanes cooperate
+// on a single super-block: lane L handles elements L, L+32, ..., L+224, and the
+// 8 Q8_1 activation blocks line up exactly with those groups of 32.  Caller
+// reduces across the warp once, after accumulating over all super-blocks.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float dot_q6_K_q8_1_warp(const uint8_t * __restrict__ QL,
+                                                    const uint8_t * __restrict__ QH,
+                                                    const int8_t  * __restrict__ SC,
+                                                    float dk,
+                                                    const block_q8_1 * __restrict__ x,
+                                                    int lane) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {               // 8 groups of 32 = 256 elements
+        const int e = g * 32 + lane;
+        const float d8 = __low2float(x[g].ds);
+        const int q6 = q6_at(QL, QH, e);
+        acc += d8 * (float)SC[e >> 4] * (float)(q6 - 32) * (float)x[g].qs[lane];
+    }
+    return dk * acc;
+}
