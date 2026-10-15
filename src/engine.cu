@@ -227,7 +227,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
         if (!l.is_attn) {
             float * hist = e.conv_hist + (size_t)conv_i * LK_HIDDEN * 2;
             ++conv_i;
-            k_gemv_q4_0<<<grid_for(6144), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(6144), 256, 0, st>>>(
                 PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0);
             if (il == 0 && getenv("LK_DUMP_L0")) {   // bisect layer 0 tensors
                 const char * dp = getenv("LK_DUMP_L0");
@@ -264,7 +264,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             // LK_NO_RESIDUAL forces add_residual=0 for layer 0's out_proj so the
             // raw projection can be compared in isolation (debug only).
             const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
-            k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar);
             if (il == 0 && getenv("LK_DUMP_L0X")) {   // immediately after the GEMV
                 const char * dp = getenv("LK_DUMP_L0X");
@@ -278,11 +278,11 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             LK_STEP("shortconv");
         } else {
             const int al = attn_i++;
-            k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wq), PD(e, l.wq), e.xq, LK_HIDDEN, 64, e.qv, 0);
-            k_gemv_q4_0<<<grid_for(512), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
                 PQS(e, l.wk), PD(e, l.wk), e.xq, 512, 64, e.kv, 0);
-            k_gemv_q4_0<<<grid_for(512), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
                 PQS(e, l.wv), PD(e, l.wv), e.xq, 512, 64, e.vv, 0);
             __half * kc = e.kcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             __half * vc = e.vcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
@@ -292,7 +292,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
                 e.qv, kc, vc, pos + 1, e.tmp);
             k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
-            k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1);
             LK_STEP("attention");
         }
@@ -303,9 +303,9 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
         LK_STEP("ffn-norm");
 
         if (!l.is_moe) {
-            k_gemv_q4_0<<<grid_for(LK_DENSE_INTER), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
                 PQS(e, l.ffn_gate), PD(e, l.ffn_gate), e.xq, LK_DENSE_INTER, 64, e.y, 0);
-            k_gemv_q4_0<<<grid_for(LK_DENSE_INTER), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
                 PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0);
             k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter);
             if (il == 0 && getenv("LK_DUMP_FFN")) {   // dense-FFN intermediates
@@ -329,7 +329,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
                 fprintf(stderr, "dumped layer-0 dense-FFN gate+up+inter\n");
             }
             k_quantize_q8_1<<<LK_DENSE_INTER / 32, 32, 0, st>>>(e.inter, e.xq, LK_DENSE_INTER / 32);
-            k_gemv_q4_0<<<grid_for(LK_HIDDEN), 256, 0, st>>>(
+            k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1);
             LK_STEP("dense-ffn");
         } else {

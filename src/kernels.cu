@@ -39,14 +39,32 @@ __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __rest
                             int out_rows, int bpr, float * __restrict__ y, int add_residual) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
-    if (warp >= out_rows) return;
-    const uint4 * qrow = qs + (size_t)warp * bpr;
-    const __half * drow = d + (size_t)warp * bpr;
-    float acc = 0.0f;
-    for (int k = lane; k < bpr; k += 32)
-        acc += dot_q4_0_q8_1(qrow, drow, k, xq + k);
-    acc = warp_sum(acc);
-    if (lane == 0) y[warp] = add_residual ? (y[warp] + acc) : acc;
+    const int row0 = warp * LK_GEMV_ROWS;
+    if (row0 >= out_rows) return;
+
+    float acc[LK_GEMV_ROWS];
+#pragma unroll
+    for (int r = 0; r < LK_GEMV_ROWS; ++r) acc[r] = 0.0f;
+
+    for (int k = lane; k < bpr; k += 32) {
+        const block_q8_1 * xk = xq + k;
+#pragma unroll
+        for (int r = 0; r < LK_GEMV_ROWS; ++r) {
+            const int row = row0 + r;
+            if (row < out_rows) {
+                acc[r] += dot_q4_0_q8_1(qs + (size_t)row * bpr + k, d + (size_t)row * bpr + k, 0, xk);
+            }
+        }
+    }
+    // row0 is warp-uniform, so these reductions are reached by every lane
+#pragma unroll
+    for (int r = 0; r < LK_GEMV_ROWS; ++r) {
+        const int row = row0 + r;
+        if (row < out_rows) {
+            const float a = warp_sum(acc[r]);
+            if (lane == 0) y[row] = add_residual ? (y[row] + a) : a;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

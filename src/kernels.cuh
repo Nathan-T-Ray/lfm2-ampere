@@ -71,7 +71,14 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 // Phase 4 to lift the limit to the full 131072 context.
 #define LK_ATTN_MAX_SEQ 8192
 
-// Generic Q4_0 x Q8_1 GEMV: one warp per output row.
+// Rows computed per warp by the general Q4_0 GEMV.  Four rows in flight gives
+// 4x the memory-level parallelism per lane and amortises each shared xq block
+// read across four weight rows.
+#define LK_GEMV_ROWS 1
+// blocks of 256 threads (8 warps) needed to cover `rows` output rows
+#define LK_GEMV_BLOCKS(rows) ((((rows) / LK_GEMV_ROWS) + 7) / 8)
+
+// Generic Q4_0 x Q8_1 GEMV: LK_GEMV_ROWS output rows per warp.
 __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
                             int out_rows, int bpr, float * __restrict__ y, int add_residual);
