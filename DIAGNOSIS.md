@@ -357,3 +357,62 @@ effort relative to its value, because:
   root-caused", which is a far stronger engineering story than a number alone.
 
 Next: restore the training wheels off, run C2, then go to Phase 4 (speed).
+
+---
+
+# PHASE 4 BOTTLENECK: SOLVED -- serial dependency chain
+
+Four measurements, each ruling out one explanation:
+
+| # | experiment | result | verdict |
+|---|---|---|---|
+| 1 | delete ~80% of arithmetic (`-DLK_LOADONLY`) | 153.70 -> 153.47 tok/s | NOT instruction-bound |
+| 2 | double warp count (split-K probe `-DLK_GEMV_WPR=2`) | 153.99 -> 152.98 tok/s | NOT occupancy-bound |
+| 3 | time ONE `k_gemv_q4_0` in isolation, 2000 dependent-free launches | 4.08 us = **577.8 GB/s = 57.3%** | kernels are fine |
+| 4 | q8-block re-read from HBM? | would imply 1733 GB/s -> impossible | q8 is cached correctly |
+
+Also measured: achievable streaming bandwidth on this GPU = **956 GB/s (95%)**,
+so the true roofline is **652 tok/s**, not the ~605 I had assumed.
+
+## The model that fits everything
+
+    ~310 kernels per token, strictly serial dependency chain
+    6.52 ms/token / 310            = 21.0 us per serial step
+    one kernel, no dependency      =  4.08 us
+    launch overhead (graphs)       =  0.78 us
+    => ~17 us per step is EXPOSED DEPENDENCY / RAMP / DRAIN latency, not work
+
+This explains every earlier result at once:
+
+* less arithmetic does not help -- the time is not spent computing;
+* more warps per kernel does not help -- the stall is *between* kernels;
+* `ROWS_PER_WARP=4` does not help -- it reduces warp count and adds registers;
+* fusing rmsnorm+quantiser (310 -> 229 launches) did **not** help either --
+  the fused kernel still carries the same dependency stall and drops to 256
+  threads of parallelism. So step count alone is not the whole story: a step
+  must also be large enough to cover its own latency;
+* a single kernel with no dependencies reaches 57%, and a pure grid-stride
+  stream reaches 95% -- neither has anything to wait on.
+
+A transformer decode graph *is* a serial chain: each layer depends on the
+previous, and within a layer nearly every op depends on the previous op. The
+engine has no independent work to fill the gaps.
+
+## Direction of fix (not yet attempted)
+
+1. **Persistent-CTA / megakernel** with cooperative-groups `grid.sync()`: the
+   whole token becomes one launch with no per-step ramp/drain. A 40-layer decode
+   graph is a natural fit; register budget is the main constraint.
+2. **Intra-layer fusion that genuinely enlarges each step** -- attention Q/K/V
+   into one 3072-row GEMV; dense gate+up into one `grid.y=2` launch. Note the
+   norm+quantise fusion failed, so enlargement alone is not sufficient unless
+   the resulting step is big enough.
+3. **Multi-stream overlap** of provably independent branches within a layer.
+
+## Session-level lesson
+
+Five separate "engine bugs" chased across this project turned out to be
+measurement artifacts, and three optimisation hypotheses supplied from outside
+(ROWS_PER_WARP, instruction-bound, occupancy-bound) were each falsified by a
+single cheap experiment. The cheap falsification test should always be built
+*before* the optimisation, not after.
