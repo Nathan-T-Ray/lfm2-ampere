@@ -71,8 +71,7 @@ static double lk_prof_bytes(const char * t) {
     static const Row T[] = {
         {"embed",           1680.0}, {"norm_attn",     16384.0},
         {"shortconv_in", 7077888.0}, {"shortconv_conv", 24576.0},
-                {"attn_q",       2359296.0}, {"attn_k",        589824.0},
-        {"attn_v",        589824.0}, {"qk_norm_rope",       0.0},
+                {"attn_qkv",     3538944.0}, {"qk_norm_rope",       0.0},
         {"attention",          0.0}, {"attn_split",         0.0},
         {"attn_combine",       0.0},         {"attn_out",     2359296.0}, {"norm_ffn",      16384.0},
         {"dense_gate",  13565952.0}, {"dense_up",    13565952.0},
@@ -406,15 +405,12 @@ static void forward(Engine & e, cudaStream_t st) {
             LK_STEP("shortconv");
         } else {
             const int al = attn_i++;
-            LKP_B("attn_q");
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.wq), PD(e, l.wq), e.xq, LK_HIDDEN, 64, e.qv, 0); LKP_E();
-            LKP_B("attn_k");
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
-                PQS(e, l.wk), PD(e, l.wk), e.xq, 512, 64, e.kv, 0); LKP_E();
-            LKP_B("attn_v");
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(512), 256, 0, st>>>(
-                PQS(e, l.wv), PD(e, l.wv), e.xq, 512, 64, e.vv, 0); LKP_E();
+            LKP_B("attn_qkv");
+    k_gemv_q4_0_3<<<LK_GEMV_BLOCKS(LK_GEMV_ROWS * (LK_HIDDEN + 1024)), 256, 0, st>>>(
+                PQS(e, l.wq), PD(e, l.wq), LK_HIDDEN, e.qv,
+                PQS(e, l.wk), PD(e, l.wk), 512, e.kv,
+                PQS(e, l.wv), PD(e, l.wv), 512, e.vv,
+                e.xq, 64); LKP_E();
             __half * kc = e.kcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             __half * vc = e.vcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             LKP_B("qk_norm_rope");

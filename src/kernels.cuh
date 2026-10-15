@@ -192,6 +192,13 @@ __global__ void k_argmax_final(const float * __restrict__ pv, const int * __rest
 // One launch serves all 4 selected experts (grid.y = expert slot), so the MoE
 // layer drops from 16 launches to 3. Expert k's weights start at row
 // (d_idx[k] * rows_per_expert) and its output lands at y + k*out_rows.
+__global__ void k_gemv_q4_0_3(const uint4 * __restrict__ qs0, const __half * __restrict__ d0,
+                              int rows0, float * __restrict__ y0,
+                              const uint4 * __restrict__ qs1, const __half * __restrict__ d1,
+                              int rows1, float * __restrict__ y1,
+                              const uint4 * __restrict__ qs2, const __half * __restrict__ d2,
+                              int rows2, float * __restrict__ y2,
+                              const block_q8_1 * __restrict__ xq, int bpr);
 __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half * __restrict__ d_a,
                                  const uint4 * __restrict__ qs_b, const __half * __restrict__ d_b,
                                  const block_q8_1 * __restrict__ xq,

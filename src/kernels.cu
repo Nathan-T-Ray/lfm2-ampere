@@ -457,7 +457,19 @@ __global__ void k_attention_decode(const float * __restrict__ q,
     for (int t = threadIdx.x; t < lim; t += blockDim.x) {
         const __half * k = kc + ((size_t)t * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
         float acc = 0.0f;
-        for (int d = 0; d < LK_HEAD_DIM; ++d) acc += s_q[d] * __half2float(k[d]);
+        // One token's 64 dims are 128 contiguous bytes = one cache line; load it
+        // as 8 x uint4 rather than 64 x 2-byte loads.  Same dims, same order.
+#pragma unroll
+        for (int q = 0; q < LK_HEAD_DIM / 8; ++q) {
+            const uint4 w = ((const uint4 *) k)[q];
+            const __half2 * h2 = (const __half2 *) &w;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int d = q * 8 + i * 2;
+                acc += s_q[d]     * __half2float(__low2half(h2[i]));
+                acc += s_q[d + 1] * __half2float(__high2half(h2[i]));
+            }
+        }
         acc *= LK_ATTN_SCALE;
         s_score[t] = acc;
         m = fmaxf(m, acc);
@@ -652,6 +664,44 @@ __global__ void k_argmax_final(const float * __restrict__ pv, const int * __rest
 // 38 nodes per token.  The per-expert arithmetic is untouched: blockIdx.y & 3
 // still selects the expert and the row/activation indexing is identical, so the
 // result is bit-for-bit what two launches produced.
+// Three Q4_0 GEMVs in one launch, for q/k/v.
+//
+// GEMV efficiency tracks the number of WARPS in flight, not bytes per warp:
+// measured 512 warps -> 358 GB/s, 2048 -> ~720, 6144 -> 852, 128000 -> 939.
+// attn_k and attn_v are 512 rows each, so as separate launches they leave most
+// SMs with under one block and run at a third of the ceiling.  One flat grid
+// over all three matrices puts 3072 warps in flight at once and removes two
+// graph nodes per layer.
+//
+// blockIdx.x covers the concatenated row space; a warp is assigned to whichever
+// matrix its row falls in.  Each row's dot is computed exactly as
+// k_gemv_q4_0 computes it -- same j loop, same warp_sum -- so the result is
+// bit-identical.
+__global__ void k_gemv_q4_0_3(const uint4 * __restrict__ qs0, const __half * __restrict__ d0,
+                              int rows0, float * __restrict__ y0,
+                              const uint4 * __restrict__ qs1, const __half * __restrict__ d1,
+                              int rows1, float * __restrict__ y1,
+                              const uint4 * __restrict__ qs2, const __half * __restrict__ d2,
+                              int rows2, float * __restrict__ y2,
+                              const block_q8_1 * __restrict__ xq, int bpr) {
+    const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const uint4  * qs; const __half * d; float * y; int row;
+    if (gw < rows0) {
+        row = gw;            qs = qs0; d = d0; y = y0;
+    } else if (gw < rows0 + rows1) {
+        row = gw - rows0;    qs = qs1; d = d1; y = y1;
+    } else {
+        row = gw - rows0 - rows1; qs = qs2; d = d2; y = y2;
+    }
+    const uint4  * qrow = qs + (size_t) row * bpr;
+    const __half * drow = d  + (size_t) row * bpr;
+    float acc = 0.0f;
+    for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xq + j);
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
 __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half * __restrict__ d_a,
                                  const uint4 * __restrict__ qs_b, const __half * __restrict__ d_b,
                                  const block_q8_1 * __restrict__ xq,
@@ -756,7 +806,27 @@ __global__ void k_attn_split(const float * __restrict__ q,
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
         const __half * k = kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
         float acc = 0.0f;
-        for (int d = 0; d < LK_HEAD_DIM; ++d) acc += s_q[d] * __half2float(k[d]);
+        // The 64 dims of one token are 128 contiguous bytes -- exactly one cache
+        // line -- and the loop below used to fetch them with 64 separate 2-byte
+        // loads.  At a fixed dim the 32 lanes of a warp are on 32 different
+        // lines (one token each), so that is 32 lines touched per instruction,
+        // 64 times over: 2048 L1 accesses per warp per 32 tokens where 256 will
+        // do.  Loading the line as 8 x uint4 cuts the instruction count 8x.
+        //
+        // Dims are still accumulated d = 0,1,2,...,63 in that exact order, so
+        // the result is bit-identical.  k is 128-byte aligned (one token's row),
+        // so the uint4 loads are aligned.
+#pragma unroll
+        for (int q = 0; q < LK_HEAD_DIM / 8; ++q) {
+            const uint4 w = ((const uint4 *) k)[q];
+            const __half2 * h2 = (const __half2 *) &w;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int d = q * 8 + i * 2;
+                acc += s_q[d]     * __half2float(__low2half(h2[i]));
+                acc += s_q[d + 1] * __half2float(__high2half(h2[i]));
+            }
+        }
         acc *= LK_ATTN_SCALE;
         s_score[j] = acc;
         m = fmaxf(m, acc);
@@ -784,6 +854,12 @@ __global__ void k_attn_split(const float * __restrict__ q,
     }
     if (threadIdx.x == 0) { P[0] = mglobal; P[1] = s_m[0]; }
 
+    // NOTE: batching the V-scan loads was tried twice (8 and 32 tokens per
+    // thread) and is WORSE both times -- 334 -> 302 tok/s at 8k context.  The
+    // 64 threads do read each line cooperatively, so coalescing was never the
+    // problem, and the extra live registers cost more than the added overlap
+    // buys.  The score loop above is a different case: there each lane is on
+    // its OWN line, which is why 8 x uint4 helped and 64 x 2-byte loads did not.
     for (int d = threadIdx.x; d < LK_HEAD_DIM; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < n; ++t) {

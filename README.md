@@ -6,8 +6,8 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 144 | **409.8 tok/s** (3 repeats, deterministic) |
-| effective bandwidth | 602 GB/s = **59.7% of the 1008 GB/s spec** |
+| decode, ctx 144 | **417.2 tok/s** (3 repeats, deterministic) |
+| effective bandwidth | 612 GB/s = **60.7% of the 1008 GB/s spec** |
 | llama.cpp, same GGUF/GPU | 227.07 tok/s |
 | speedup vs llama.cpp | **1.81x** |
 | speedup vs this engine's own Phase-3 baseline | **3.99x** (102.79 tok/s) |
@@ -23,18 +23,40 @@ chaotic and this is now *demonstrated*, not asserted -- see "How fragile greedy
 parity is" below. `LK_ATTN_SERIAL=1` restores 66/66 by reverting attention to its
 order-preserving form, at the cost of the long-context speed in the table below.
 
-## Context scaling
+## Context scaling, against the oracle
 
-| ctx | split-K | serial | gain |
+llama.cpp was measured on the same GGUF, same GPU, over the same prompts. Its
+decode rate is FLAT across the whole range -- which is what exposed the bug
+below, because comparing our numbers only against our own short-context number
+cannot detect a context-dependent defect.
+
+| ctx | llama.cpp | liquid-kernel | ratio |
 |---|---|---|---|
-| 164 | 415.8 | 416.4 | neutral |
-| 1064 | 386.7 | 339.0 | +14% |
-| 2064 | 356.0 | 284.9 | +25% |
-| 4064 | 308.9 | 214.7 | +44% |
-| 8064 | **243.2** | 144.4 | **+69%** |
+| 164 | 241.6 | **426.3** | 1.76x |
+| 1064 | 251.8 | **408.7** | 1.62x |
+| 2064 | 246.1 | **400.5** | 1.63x |
+| 4064 | 247.2 | **375.9** | 1.52x |
+| 8064 | 240.6 | **333.8** | 1.39x |
 
-Short context is neutral within measurement noise (a clean A/B at ctx 144 gives
-406.9 split-K against 410.2 serial, 0.8%; at ctx 164 it reverses by 0.1%).
+The context slope fell from 216 ns per context token to 82.
+
+### The bug that flat llama.cpp exposed
+
+The attention score loop fetched one token's 64 dims -- 128 contiguous bytes,
+exactly one cache line -- with **64 separate 2-byte loads**. At a fixed dim the
+32 lanes of a warp sit on 32 *different* tokens, i.e. 32 different lines, so
+that is 32 lines touched per instruction, 64 times over: 2048 L1 accesses per
+warp per 32 tokens where 256 will do.
+
+Loading the line as **8 x uint4** cuts the instruction count 8x. Dims are still
+accumulated d = 0,1,2,...,63 in that exact order, so the result is bit-identical
+(parity unchanged). 8k context went 243 -> 334 tok/s (+37%) and short context
+also improved, 410 -> 417.
+
+The same treatment does NOT work on the output scan: there each of the 64
+threads reads a different dim of the *same* line, so it is already perfectly
+coalesced, and batching its loads was measured worse **twice**. Two loops in one
+kernel with the same symptom and opposite fixes.
 
 At 8k context attention was 4.76 ms of an 8.14 ms step -- 58%, at 34 GB/s against
 a 956 GB/s ceiling -- because one block per query head leaves 32 blocks on 84 SMs
