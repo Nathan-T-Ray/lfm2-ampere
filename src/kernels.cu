@@ -359,45 +359,58 @@ __global__ void k_router_top4(const float * __restrict__ logits,
     __shared__ float s_sel[LK_N_EXPERTS];
     __shared__ float s_sig[LK_N_EXPERTS];
     const int t = threadIdx.x;
-    // Split the sigmoids across lanes.  Thread 0 computing all 64 of them made
-    // this kernel cost 15.3 us: a single active lane issues one instruction per
-    // cycle and stalls for the full latency of every dependent step inside
-    // expf, so 64 serial ~200-cycle chains is ~10 us of pure stall.  The values
-    // produced are identical (same expf, same inputs), so the ranking below is
-    // bit-for-bit the same decision.
+    // Sigmoids are computed one per lane.  A single lane computing all 64 made
+    // this kernel cost 15.3 us: one active lane issues one instruction per cycle
+    // and stalls for the full latency of every dependent step inside expf.
     if (t < LK_N_EXPERTS) {
         const float g = 1.0f / (1.0f + expf(-logits[t]));
         s_sig[t] = g;
         s_sel[t] = g + bias[t];
     }
     __syncthreads();
-    if (t != 0) return;
-    const float * sel = s_sel;
-    // Same insertion as the original nested loop, unrolled by hand.  With a
-    // variable inner trip count nvcc spills prob[]/idx[] to local memory and
-    // every shift becomes a dependent local load/store pair; in a single active
-    // lane that measured ~5 us per layer.  The explicit registers make the
-    // whole selection a handful of cycles.
-    static_assert(LK_TOP_K == 4, "unrolled selection assumes top-4");
-    float p0 = -1e30f, p1 = -1e30f, p2 = -1e30f, p3 = -1e30f;
-    int   i0 = -1,     i1 = -1,     i2 = -1,     i3 = -1;
+    if (t >= 32) return;
+
+    // Selection, one warp.
+    //
+    // Walking 64 experts through a register insertion in ONE lane is a 64-deep
+    // serial dependency: each iteration's p0..p3 depend on the previous one, so
+    // the chain cannot be pipelined and measured 2.78 us of pure latency per
+    // layer, 106 us per token, for zero bytes of memory traffic.
+    //
+    // Four rounds of "global argmax over what is left" is the same answer: the
+    // insertion maintains the list sorted descending, so round r recovers
+    // exactly p_r.  Ties go to the lower expert index.  Each round is five
+    // shfl_xor steps carrying a (value, index) pair.
+    static_assert(LK_TOP_K == 4, "four selection rounds assume top-4");
+    const int lane = t;
+    float v0 = s_sel[lane],      v1 = s_sel[lane + 32];
+    const int i0 = lane,         i1 = lane + 32;
+    int ord[LK_TOP_K];
 #pragma unroll
-    for (int j = 0; j < LK_N_EXPERTS; ++j) {
-        const float v = sel[j];
-        if      (v > p0) { p3 = p2; i3 = i2; p2 = p1; i2 = i1; p1 = p0; i1 = i0; p0 = v; i0 = j; }
-        else if (v > p1) { p3 = p2; i3 = i2; p2 = p1; i2 = i1; p1 = v;  i1 = j; }
-        else if (v > p2) { p3 = p2; i3 = i2; p2 = v;  i2 = j; }
-        else if (v > p3) { p3 = v;  i3 = j; }
+    for (int r = 0; r < LK_TOP_K; ++r) {
+        float mv = (v0 >= v1) ? v0 : v1;
+        int   mi = (v0 >= v1) ? i0 : i1;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+            const int   oi = __shfl_xor_sync(0xffffffffu, mi, o);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        ord[r] = mi;                       // the butterfly leaves all lanes equal
+        if (i0 == mi) { v0 = -1e30f; }
+        if (i1 == mi) { v1 = -1e30f; }
     }
-    const int idx[LK_TOP_K] = { i0, i1, i2, i3 };
+    if (lane != 0) return;
     float wsum = 0.0f;
     float wv[LK_TOP_K];
+#pragma unroll
     for (int k = 0; k < LK_TOP_K; ++k) {
-        wv[k] = s_sig[idx[k]];      // unbiased sigmoid, already computed above
+        wv[k] = s_sig[ord[k]];             // unbiased sigmoid, computed above
         wsum += wv[k];
     }
     if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
-    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = idx[k]; w_out[k] = wv[k] / wsum; }
+#pragma unroll
+    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = ord[k]; w_out[k] = wv[k] / wsum; }
 }
 
 // ---------------------------------------------------------------------------
