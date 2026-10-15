@@ -47,7 +47,12 @@ $(BUILD)/test_kernels: tests/test_kernels.cu $(BUILD)/kernels.o | $(BUILD) check
 test-kernels: $(BUILD)/test_kernels
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_kernels $(LK_REF)/kernel_fixture.bin
 
-all: devinfo test_quant test_kernels
+$(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+engine: $(BUILD)/engine
+
+all: devinfo test_quant test_kernels engine
 
 # Gate G2: every kernel primitive verified against an independent reference.
 test-all: test-quant test-kernels

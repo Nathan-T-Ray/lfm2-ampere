@@ -196,3 +196,88 @@ __global__ void k_attention_decode(const float * __restrict__ q,
         out[head * LK_HEAD_DIM + d] = acc * inv_l;
     }
 }
+
+// ---------------------------------------------------------------------------
+__global__ void k_embed_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                             const int8_t * __restrict__ sc, const __half * __restrict__ d,
+                             int token, float * __restrict__ x) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= LK_HIDDEN) return;
+    const int sb = tid / 256;              // super-block index within the row
+    const int e  = tid % 256;              // element within the super-block
+    const size_t blk = (size_t)token * 8 + sb;
+    const float dk = __half2float(d[blk]);
+    const int q6 = q6_at(ql + blk * 128, qh + blk * 64, e);
+    x[tid] = dk * (float)sc[blk * 16 + e / 16] * (float)(q6 - 32);
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_qk_norm_rope(float * __restrict__ qf, float * __restrict__ kf,
+                               const float * __restrict__ vf,
+                               const float * __restrict__ qn, const float * __restrict__ kn,
+                               float pos, __half * __restrict__ kc, __half * __restrict__ vc,
+                               int pos_idx) {
+    __shared__ float s_head[LK_HEAD_DIM];
+    __shared__ float s_red[LK_HEAD_DIM];
+    const int blk = blockIdx.x;
+    const int tid = threadIdx.x;
+    const bool is_q = (blk < LK_N_HEADS);
+    const int head = is_q ? blk : (blk - LK_N_HEADS);
+    float * dst = is_q ? (qf + (size_t)head * LK_HEAD_DIM)
+                       : (kf + (size_t)head * LK_HEAD_DIM);
+    const float * nw = is_q ? qn : kn;
+
+    const float v0 = dst[tid];
+    s_red[tid] = v0 * v0;
+    __syncthreads();
+    for (int o = LK_HEAD_DIM / 2; o > 0; o >>= 1) {
+        if (tid < o) s_red[tid] += s_red[tid + o];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(s_red[0] / (float)LK_HEAD_DIM + LK_EPS);
+    s_head[tid] = v0 * inv * nw[tid];
+    __syncthreads();
+
+    if (tid < LK_HEAD_DIM / 2) {           // NEOX half-split rotation
+        const float invf = powf(LK_ROPE_THETA, -2.0f * (float)tid / (float)LK_HEAD_DIM);
+        float c, s;
+        sincosf(pos * invf, &s, &c);
+        const float x0 = s_head[tid], x1 = s_head[tid + LK_HEAD_DIM / 2];
+        s_head[tid]                   = x0 * c - x1 * s;
+        s_head[tid + LK_HEAD_DIM / 2] = x0 * s + x1 * c;
+    }
+    __syncthreads();
+    dst[tid] = s_head[tid];
+
+    if (!is_q) {
+        const size_t off = ((size_t)pos_idx * LK_N_KV_HEADS + head) * LK_HEAD_DIM;
+        kc[off + tid] = __float2half(s_head[tid]);
+        vc[off + tid] = __float2half(vf[(size_t)head * LK_HEAD_DIM + tid]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_accum_scaled(float * __restrict__ dst, const float * __restrict__ src,
+                               float w, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        dst[i] += w * src[i];
+}
+
+// ---------------------------------------------------------------------------
+__global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__ out) {
+    __shared__ float s_v[256];
+    __shared__ int   s_i[256];
+    float best = -1e30f; int bi = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (v[i] > best) { best = v[i]; bi = i; }
+    s_v[threadIdx.x] = best; s_i[threadIdx.x] = bi;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if ((int)threadIdx.x < o && s_v[threadIdx.x + o] > s_v[threadIdx.x]) {
+            s_v[threadIdx.x] = s_v[threadIdx.x + o];
+            s_i[threadIdx.x] = s_i[threadIdx.x + o];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = s_i[0];
+}

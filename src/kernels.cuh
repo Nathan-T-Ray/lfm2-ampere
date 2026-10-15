@@ -108,3 +108,25 @@ __global__ void k_attention_decode(const float * __restrict__ q,     // [32*64]
                                    const __half * __restrict__ kc,   // [max_seq, 8, 64]
                                    const __half * __restrict__ vc,   // [max_seq, 8, 64]
                                    int seq_len, float * __restrict__ out);
+
+// ---- additional forward kernels (Phase 3) ---------------------------------
+// Q6_K embedding-row lookup: dequantise row `token` into x[2048].
+__global__ void k_embed_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
+                             const int8_t * __restrict__ sc, const __half * __restrict__ d,
+                             int token, float * __restrict__ x);
+
+// Per-head Q/K RMSNorm(64) followed by NEOX RoPE, then write K and V into the
+// fp16 KV cache at slot `pos_idx`.  grid = (32 Q heads + 8 KV heads),
+// block = 64 threads.  Q is normalised+rotated in place; K likewise and then
+// cached; V is cached unnormalised and unrotated (it gets neither).
+__global__ void k_qk_norm_rope(float * __restrict__ qf, float * __restrict__ kf,
+                               const float * __restrict__ vf,
+                               const float * __restrict__ qn, const float * __restrict__ kn,
+                               float pos, __half * __restrict__ kc, __half * __restrict__ vc,
+                               int pos_idx);
+
+// dst[i] += w * src[i]
+__global__ void k_accum_scaled(float * __restrict__ dst, const float * __restrict__ src,
+                               float w, int n);
+
+__global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__ out);
