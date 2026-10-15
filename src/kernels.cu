@@ -159,7 +159,8 @@ __global__ void k_router_top4(const float * __restrict__ h, const float * __rest
 __global__ void k_attention_decode(const float * __restrict__ q,
                                    const __half * __restrict__ kc,
                                    const __half * __restrict__ vc,
-                                   int seq_len, float * __restrict__ out) {
+                                   const int * __restrict__ d_pos, float * __restrict__ out) {
+    const int seq_len = *d_pos + 1;
     const int head = blockIdx.x;
     const int kv_head = head / (LK_N_HEADS / LK_N_KV_HEADS);
     __shared__ float s_q[LK_HEAD_DIM];
@@ -221,9 +222,10 @@ __global__ void k_attention_decode(const float * __restrict__ q,
 // ---------------------------------------------------------------------------
 __global__ void k_embed_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                              const int8_t * __restrict__ sc, const __half * __restrict__ d,
-                             int token, float * __restrict__ x) {
+                             const int * __restrict__ d_token, float * __restrict__ x) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= LK_HIDDEN) return;
+    const int token = *d_token;
     const int sb = tid / 256;              // super-block index within the row
     const int e  = tid % 256;              // element within the super-block
     const size_t blk = (size_t)token * 8 + sb;
@@ -236,8 +238,9 @@ __global__ void k_embed_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __
 __global__ void k_qk_norm_rope(float * __restrict__ qf, float * __restrict__ kf,
                                const float * __restrict__ vf,
                                const float * __restrict__ qn, const float * __restrict__ kn,
-                               float pos, __half * __restrict__ kc, __half * __restrict__ vc,
-                               int pos_idx) {
+                               const int * __restrict__ d_pos,
+                               __half * __restrict__ kc, __half * __restrict__ vc) {
+    const float pos = (float)(*d_pos);
     __shared__ float s_head[LK_HEAD_DIM];
     __shared__ float s_red[LK_HEAD_DIM];
     const int blk = blockIdx.x;
@@ -271,7 +274,7 @@ __global__ void k_qk_norm_rope(float * __restrict__ qf, float * __restrict__ kf,
     dst[tid] = s_head[tid];
 
     if (!is_q) {
-        const size_t off = ((size_t)pos_idx * LK_N_KV_HEADS + head) * LK_HEAD_DIM;
+        const size_t off = ((size_t)(*d_pos) * LK_N_KV_HEADS + head) * LK_HEAD_DIM;
         kc[off + tid] = __float2half(s_head[tid]);
         vc[off + tid] = __float2half(vf[(size_t)head * LK_HEAD_DIM + tid]);
     }
@@ -285,7 +288,8 @@ __global__ void k_accum_scaled(float * __restrict__ dst, const float * __restric
 }
 
 // ---------------------------------------------------------------------------
-__global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__ out) {
+__global__ void k_argmax(const float * __restrict__ v, int n,
+                         int * __restrict__ d_token, int * __restrict__ d_pos) {
     __shared__ float s_v[256];
     __shared__ int   s_i[256];
     float best = -1e30f; int bi = 0;
@@ -300,7 +304,7 @@ __global__ void k_argmax(const float * __restrict__ v, int n, int * __restrict__
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) *out = s_i[0];
+    if (threadIdx.x == 0) { *d_token = s_i[0]; atomicAdd(d_pos, 1); }
 }
 
 // ---------------------------------------------------------------------------

@@ -68,7 +68,8 @@ struct Engine {
     float *  kv = nullptr;       // [512]  K
     float *  vv = nullptr;       // [512]  V
     float *  logits = nullptr;   // [128000]
-    int *    d_next = nullptr;
+    int *    d_token = nullptr;   // current input token (= previous argmax)
+    int *    d_pos = nullptr;     // current sequence position
     float *  conv_hist = nullptr;// [30 * 2048 * 2]
     __half * kcache = nullptr;   // [10][max_seq][8][64]
     __half * vcache = nullptr;
@@ -171,7 +172,9 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->kv, 512 * 4));
     CK(cudaMalloc(&e->vv, 512 * 4));
     CK(cudaMalloc(&e->logits, (size_t)LK_VOCAB * 4));
-    CK(cudaMalloc(&e->d_next, 4));
+    CK(cudaMalloc(&e->d_token, 4));
+    CK(cudaMalloc(&e->d_pos, 4));
+    CK(cudaMemset(e->d_pos, 0, 4));
     CK(cudaMalloc(&e->conv_hist, (size_t)30 * LK_HIDDEN * 2 * 4));
     CK(cudaMalloc(&e->kcache, KV * 2));
     CK(cudaMalloc(&e->vcache, KV * 2));
@@ -192,11 +195,14 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
 
 // ---------------------------------------------------------------------------
 // One decode step: token -> next token.
-static void forward(Engine & e, int token, int pos, cudaStream_t st) {
+// Position-independent: `token` and `pos` live in device memory, so the
+// entire 40-layer step can be captured once into a cudaGraphExec_t and replayed
+// for every subsequent position.
+static void forward(Engine & e, cudaStream_t st) {
     k_embed_q6_K<<<LK_HIDDEN / 256, 256, 0, st>>>(
         (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
         (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-        token, e.x);
+        e.d_token, e.x);
     CK(cudaGetLastError());
 
     static FILE * dumpf = nullptr;
@@ -288,9 +294,9 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             __half * vc = e.vcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             k_qk_norm_rope<<<LK_N_HEADS + LK_N_KV_HEADS, LK_HEAD_DIM, 0, st>>>(
                 e.qv, e.kv, e.vv, P32(e, l.qnorm), P32(e, l.knorm),
-                (float)pos, kc, vc, pos);
+                e.d_pos, kc, vc);
             k_attention_decode<<<LK_N_HEADS, 256, 0, st>>>(
-                e.qv, kc, vc, pos + 1, e.tmp);
+                e.qv, kc, vc, e.d_pos, e.tmp);
             k_quantize_q8_1<<<LK_HIDDEN / 32, 32, 0, st>>>(e.tmp, e.xq, LK_HIDDEN / 32);
             k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1);
@@ -374,7 +380,7 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
         (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
         (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
         e.xq, LK_VOCAB, 8, e.logits);
-    k_argmax<<<1, 256, 0, st>>>(e.logits, LK_VOCAB, e.d_next);
+    k_argmax<<<1, 256, 0, st>>>(e.logits, LK_VOCAB, e.d_token, e.d_pos);
     CK(cudaGetLastError());
 }
 
@@ -389,13 +395,26 @@ int main(int argc, char ** argv) {
     Engine * e = engine_create(pack, max_seq);
     printf("liquid-kernel engine ready: 40 layers, max_seq=%d\n", max_seq);
 
+    cudaStream_t st; CK(cudaStreamCreate(&st));
+
+    // --- capture the whole position-independent decode step once ---------
+    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    forward(*e, st);
+    cudaGraph_t graph = nullptr;
+    CK(cudaStreamEndCapture(st, &graph));
+    cudaGraphExec_t gexec = nullptr;
+    CK(cudaGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
+    size_t nnode = 0; cudaGraphGetNodes(graph, nullptr, &nnode);
+    fprintf(stderr, "captured CUDA graph: %zu nodes\n", nnode);
+
+    auto feed = [&](int tok) { CK(cudaMemcpy(e->d_token, &tok, 4, cudaMemcpyHostToDevice)); };
+    auto run  = [&]() { CK(cudaGraphLaunch(gexec, st)); };
+    auto take = [&]() { int t = 0; CK(cudaMemcpy(&t, e->d_token, 4, cudaMemcpyDeviceToHost)); return t; };
+
     if (strcmp(mode, "topk") == 0) {
         std::vector<int> tk;
         for (int i = 2; i < argc; ++i) tk.push_back(atoi(argv[i]));
-        cudaStream_t st; CK(cudaStreamCreate(&st));
-        // Process ALL prompt tokens, including the last one, so the logits we
-        // dump are the prediction AFTER the full prompt (the oracle reference).
-        for (size_t i = 0; i < tk.size(); ++i) forward(*e, tk[i], (int)i, st);
+        for (size_t i = 0; i < tk.size(); ++i) { feed(tk[i]); run(); }
         CK(cudaStreamSynchronize(st));
         std::vector<float> lg(LK_VOCAB);
         CK(cudaMemcpy(lg.data(), e->logits, (size_t)LK_VOCAB * 4, cudaMemcpyDeviceToHost));
@@ -403,54 +422,50 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < LK_VOCAB; ++i) ord[i] = i;
         std::partial_sort(ord.begin(), ord.begin() + 10, ord.end(),
                           [&](int a, int b) { return lg[a] > lg[b]; });
-        // Normalise to log-probabilities so these are directly comparable with
-        // llama-server n_probs output.
         double m = -1e30;
         for (int i = 0; i < LK_VOCAB; ++i) m = std::max(m, (double)lg[i]);
         double z = 0.0;
         for (int i = 0; i < LK_VOCAB; ++i) z += exp((double)lg[i] - m);
         const double lse = m + log(z);
         printf("topk:");
-        for (int i = 0; i < 20; ++i) printf(" %d:%.4f", ord[i], lg[ord[i]] - lse);
+        for (int i = 0; i < 10; ++i) printf(" %d:%.4f", ord[i], lg[ord[i]] - lse);
         printf("\n  logsumexp=%.4f  top1_logit=%.4f\n", lse, lg[ord[0]]);
         return 0;
     }
 
     if (strcmp(mode, "gen") != 0) { fprintf(stderr, "unknown mode %s\n", mode); return 1; }
-
-    // prompt tokens come from argv[2..] (raw token IDs, no tokenizer)
     std::vector<int> toks;
     for (int i = 2; i < argc; ++i) toks.push_back(atoi(argv[i]));
     if (toks.empty()) { fprintf(stderr, "usage: %s gen TOKEN_ID...\n", argv[0]); return 1; }
     const int ngen = getenv("LK_NGEN") ? atoi(getenv("LK_NGEN")) : 32;
-
-    cudaStream_t st; CK(cudaStreamCreate(&st));
-    int next = 0;
-    for (size_t i = 0; i + 1 < toks.size(); ++i) forward(*e, toks[i], (int)i, st);
-    next = toks.back();
-    int pos = (int)toks.size() - 1;
-
     const bool bench = getenv("LK_BENCH") != nullptr;
+
+    // prefill: feed each prompt token; the graph advances d_pos itself
+    for (size_t i = 0; i < toks.size(); ++i) { feed(toks[i]); run(); }
+    CK(cudaStreamSynchronize(st));
+    int next = take();
+
     if (!bench) printf("out:");
     auto t0 = std::chrono::steady_clock::now();
-    int ngen_done = 0;
-    for (int i = 0; i < ngen; ++i) {
-        forward(*e, next, pos, st);
-        CK(cudaMemcpy(&next, e->d_next, 4, cudaMemcpyDeviceToHost));
+    int done = 0;
+    // emit the token produced by the prefill -- dropping it silently shifts the
+    // whole trajectory by one and makes parity comparisons meaningless
+    if (!bench) { printf(" %d", next); fflush(stdout); }
+    ++done;
+    for (int i = 1; i < ngen; ++i) {
+        run();
+        CK(cudaStreamSynchronize(st));
+        next = take();
         if (!bench) { printf(" %d", next); fflush(stdout); }
-        ++ngen_done;
-        ++pos;
-        if (pos + 1 >= max_seq) break;
+        ++done;
     }
-    CK(cudaStreamSynchronize(st));
     auto t1 = std::chrono::steady_clock::now();
     if (!bench) printf("\n");
     const double sec = std::chrono::duration<double>(t1 - t0).count();
-    const double tps = ngen_done / sec;
-    // Per-token weight traffic at batch-1, top-4-of-64 experts (bytes).
+    const double tps = done / sec;
     const double BYTES_PER_TOKEN = 1466751488.0;
     printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f\n",
-           pos + 1, ngen_done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
+           (int)toks.size() + done, done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
            100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0);
     return 0;
 }
