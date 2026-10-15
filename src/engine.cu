@@ -192,9 +192,21 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
         token, e.x);
     CK(cudaGetLastError());
 
+    static FILE * dumpf = nullptr;
+    static bool dump_init = false;
+    if (!dump_init) {
+        dump_init = true;
+        const char * dp = getenv("LK_DUMP_LAYERS");
+        if (dp) dumpf = fopen(dp, "wb");
+    }
     int conv_i = 0, attn_i = 0;
     for (int il = 0; il < LK_N_LAYERS; ++il) {
         const Layer & l = e.L[il];
+        if (dumpf) {   // residual stream BEFORE layer il
+            float buf[LK_HIDDEN];
+            CK(cudaMemcpy(buf, e.x, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+            fwrite(buf, 4, LK_HIDDEN, dumpf);
+        }
 
         // ---- sequence mixer -------------------------------------------
         k_rmsnorm<<<1, 256, 256 * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS, e.h, e.h16);
@@ -286,6 +298,13 @@ static void forward(Engine & e, int token, int pos, cudaStream_t st) {
             }
             k_accum_scaled<<<8, 256, 0, st>>>(e.x, e.moe_down, 1.0f, LK_HIDDEN);
         }
+    }
+
+    if (dumpf) {       // residual stream AFTER the last layer
+        float buf[LK_HIDDEN];
+        CK(cudaMemcpy(buf, e.x, LK_HIDDEN * 4, cudaMemcpyDeviceToHost));
+        fwrite(buf, 4, LK_HIDDEN, dumpf);
+        fflush(dumpf);
     }
 
     // ---- final norm + tied Q6_K lm_head + argmax ----------------------

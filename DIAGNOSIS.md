@@ -1,4 +1,4 @@
-# C1 parity diagnosis (state after Phase 3)
+# C1 parity diagnosis (Phase 3)
 
 ## Measured
 
@@ -6,65 +6,69 @@
 Per case: factual EXACT (66/66), prose 89/128, code 62/128, longctx 20/128,
 math 5/128, reasoning 0/128, agentic 0/119.
 
-The engine is *fundamentally* correct: `factual` matches llama.cpp bit-for-bit
-for its entire 66-token trajectory, and for every case the top-10 logit token
-SET matches the oracle, usually with only adjacent rank swaps. Divergences are
-argmax flips among tokens close in probability.
+Log-probability deltas vs the oracle are **0.02-0.9 nats** and are **flat in
+prompt length** (len 1..5: max |delta| 0.36 / 0.88 / 0.71 / 0.63 / 0.27), so the
+error does NOT accumulate through attention or the recurrent state. It is a
+per-layer numerical difference.
 
-## Where the error is NOT
-
-Ruled out by direct measurement, not assumption:
+## Ruled out by direct measurement
 
 | Suspect | Evidence |
 |---|---|
 | Hyperparameters | llama.cpp reports n_rot=64, f_norm_rms_eps=1e-5, rope type 2 (NEOX), freq_base=1e7, n_ff=11776, n_ff_exp=1536, expert_gating_func=sigmoid -- all match |
-| Q6_K embedding lookup | **bit-exact** (max abs diff 0.0) vs the reference dequantiser, 6 tokens x 2048 |
+| KV cache | llama.cpp uses **K/V f16** (80 MiB each) -- matches ours |
+| Recurrent state | llama.cpp RS buffer 1.88 MiB = 4 seqs x 30 layers x 4096 f32 -- matches our layout |
+| Q6_K embedding lookup | **bit-exact** (max abs diff 0.0) |
 | Q4_0 / Q6_K x Q8_1 dots | verified vs exact integer reference and vs true fp32 dot |
 | RMSNorm / NEOX RoPE / ShortConv / router | verified vs double-precision host references |
-| Attention | a 1-token prompt has trivial attention (softmax over one element = 1, output = v), yet we still differ |
-| Conv state | at token 0 the state is zero, so conv = bx*w[2]; we still differ |
+| Attention, conv state | a 1-token prompt has trivial attention and zero state, yet we still differ |
 
-## Where it IS
+## The key structural finding: the model AMPLIFIES perturbations
 
-Log-probability deltas vs the oracle, 1-token prompt [597]:
+`tools/ref_forward.py` is an independent NumPy forward pass over the same pack.
+Comparing it against the CUDA engine's residual stream (dumped with
+`LK_DUMP_LAYERS`), layer by layer, for a 1-token prompt:
 
-    token   ours      oracle    delta
-     25    -3.4099   -3.4338   +0.024
-     27    -4.2345   -4.2665   +0.032
-     26    -4.3895   -4.3035   -0.086
-    597    -4.6484   -4.2872   -0.361
-    785    -4.7223   -5.0601   +0.338
+    layer   mean|d|    max|d|    rms(cuda)  rms(ref)
+      1     1.0e-04    7.2e-04     0.0072     0.0073
+      9     7.1e-04    3.1e-03     0.0163     0.0164
+     10     1.0e-03    6.9e-02     0.0638     0.0664   <- divergence starts
+     21     1.2e-02    5.2e-01     0.0713     0.0729
+     22     9.4e-02    2.2e+01     1.4387     0.6208   <- explosion
+     40     9.7e-02    3.7e+00     0.3608     0.2612
 
-For a 5-token prompt the deltas are +0.034 / -0.072 / +0.048 / -0.274 / -0.166
-/ +0.245. So the error is present at a SINGLE token, in the per-layer math, and
-is ~0.02-0.36 nats -- far too large for fp32 accumulation order (~1e-5) but too
-small to be a structural logic error.
+Two conclusions:
 
-Estimate: a 0.36 nat logit shift needs a hidden-state perturbation of order 0.1
-in a stream whose RMS is order 1. Something in the layer computation is
-systematically off in some component, not merely rounded differently.
+1. **The residual stream amplifies perturbations by roughly 20% per layer.**
+   Over 40 layers that is ~1000x. This is why a per-layer difference of only
+   ~1e-4 becomes a ~0.3 nat logit shift. It also means **exact C1 parity
+   requires matching llama.cpp's arithmetic to ~1e-6 per layer** -- matching
+   the algorithm is not sufficient.
+2. **CUDA and an independent implementation of the same stated semantics
+   already diverge from layer 10.** So there is a genuine implementation
+   difference to find, not merely an unavoidable rounding gap. This is now
+   bisectable: layer 0-9 agree to 1e-4, layer 10 is the first disagreement.
 
-## Hypotheses, cheapest first
+Note layer 10 is the 3rd attention layer (attention at il%4==2: 2,6,10,...).
+Layers 2 and 6 agree well, so whatever differs is not "attention is broken"
+but something that first bites at layer 10.
 
-1. **Residual/activation dtype.** llama.cpp may keep the residual stream in f16
-   for part of this graph, or quantise the activation differently (Q8_1 vs f16)
-   for some matmuls. Cheap test: round `x` to f16 after each layer and see
-   whether parity improves.
-2. **Activation quantisation convention on the mmvq path.** We match ggml's CUDA
-   `quantize_q8_1` (ds = (amax/127, RAW sum)) and the Q4_0 correction
-   `d4*(d8*sumi - 8*sum_raw)`. Worth confirming which kernel this build actually
-   selects at runtime for batch-1 (mmvq vs mmq vs a dequant path).
-3. **Per-layer bisect against an independent reference.** Write a NumPy forward
-   pass over the SAME pack data and compare layer by layer. This is the rigorous
-   route: it separates "our CUDA does not do what we think" from "we
-   misunderstand llama.cpp semantics".
+## Next step (precise)
+
+Instrument layer 10: dump the normalised activation `h`, the Q8_1 blocks, the
+raw QKV GEMV outputs, and the post-QK-norm/RoPE Q and K from the CUDA engine,
+and compare each against `tools/ref_forward.py`. That isolates whether the
+divergence is in the norm, the quantiser, the GEMV, or the attention inputs.
 
 ## Working tools
 
-    ./build/engine topk <ids...>     # normalised log-probs for the top 20
-    ./build/engine gen <ids...>      # greedy tokens (LK_NGEN=n)
-    python3 tools/parity.py [case]   # C1 comparison vs ref/oracle_ref.json
-    LK_DEBUG_STEPS=1 ./build/engine ...   # synchronise + name every faulting stage
+    ./build/engine topk <ids...>       # normalised log-probs, top 20
+    ./build/engine gen <ids...>        # greedy tokens (LK_NGEN=n)
+    python3 tools/parity.py [case]     # C1 vs ref/oracle_ref.json
+    python3 tools/ref_forward.py 597   # NumPy forward + per-layer diff table
+    LK_DUMP_LAYERS=/tmp/x.bin ./build/engine topk <ids...>   # residual per layer
+    LK_DEBUG_STEPS=1 ./build/engine ...   # sync + name every faulting stage
 
-Note: `topk` prints ranks 11-20 unsorted -- `std::partial_sort` only orders the
-first 10. Only ranks 1-10 are meaningful as printed.
+Caveats:
+ * `topk` prints ranks 11-20 unsorted (`partial_sort` orders only the first 10).
+ * `tools/ref_forward.py` scores attention as V, valid only for a 1-token prompt.
