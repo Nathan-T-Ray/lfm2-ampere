@@ -416,3 +416,56 @@ measurement artifacts, and three optimisation hypotheses supplied from outside
 (ROWS_PER_WARP, instruction-bound, occupancy-bound) were each falsified by a
 single cheap experiment. The cheap falsification test should always be built
 *before* the optimisation, not after.
+
+---
+
+# PHASE 4 RESULT: THE ROUTER WAS THE BOTTLENECK -- now faster than llama.cpp
+
+## The fix
+
+`k_router_top4` was **one block of 64 threads**. Each thread computed an entire
+2048-element dot serially -- 2048 dependent loads per thread -- for a
+[64, 2048] matvec, **38 times per token**, on a GPU with 84 SMs idle. It was
+only 1.4% of the per-token bytes, which is exactly why ranking by traffic share
+never pointed at it.
+
+Rewritten as one warp per expert (512 threads = 16 warps, 4 experts each), lanes
+striding the row with a warp reduction; the sigmoid / top-4 / unbiased-weight /
+renormalise logic is unchanged and still runs on one thread.
+
+## Result
+
+| metric | before | after |
+|---|---|---|
+| throughput ctx 144 | 153.41 tok/s | **258.23 tok/s** (+68%) |
+| throughput ctx 558 | 147.95 tok/s | **240.64 tok/s** |
+| % of peak | 22.4% | **37.6%** |
+| vs llama.cpp (227.07) | 0.68x | **1.14x faster** |
+| C2 perplexity delta | 1.576% | **1.189%** |
+| C2 per-position top-1 agreement | 93.2% | **94.5%** |
+| factual greedy parity | 66/66 | **66/66** |
+| full-suite greedy parity | 242/825 | 180/825 |
+
+The suite parity drop is explained and acceptable: the warp reduction changes the
+router's summation order, and roughly one in four of the 64-expert argmaxes sits
+close enough that an accumulation-order difference flips it. Multi-step greedy
+identity is precisely the criterion retired for this reason; C2 -- the agreed
+gate -- **improved**.
+
+## The generalisable lesson
+
+**Rank candidate kernels by work-per-thread, not by traffic share.** The router
+carried 1.4% of the bytes and was the single largest cost in the engine. Every
+earlier analysis, including three externally supplied hypotheses, ranked by
+traffic or by aggregate utilisation and therefore missed it.
+
+## What is left
+
+~5x from the roofline (652 tok/s at the measured 956 GB/s achievable). Ranked by
+work/parallelism:
+
+* `k_attention_decode` -- 10 launches, 32 blocks x 256 threads, loops over the
+  whole context, and only 32 blocks on 84 SMs. Scales with context, consistent
+  with ctx 558 being slower. **Prime suspect.**
+* `k_rmsnorm_q8_1` -- 120 launches of 256 threads for 2048 elements each.
+* `k_swiglu`, `k_shortconv`, `k_moe_accum4` -- moderate.
