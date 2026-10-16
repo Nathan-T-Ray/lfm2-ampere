@@ -146,8 +146,28 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 #if LK_NORM_PROD_GEMV && !LK_GEMV_BIGBLOCK
 #error "LK_NORM_PROD_GEMV needs LK_GEMV_BIGBLOCK: a block must own a whole Q8_1 block"
 #endif
-#if LK_NORM_PROD_GEMV && LK_FUSE_ROUTER
-#error "LK_FUSE_ROUTER is superseded by LK_NORM_PROD_GEMV; the two cannot be combined"
+// T4r: rebuild the top-4 in the consumer's prologue instead of in its own
+// <<<1,64>>> node.  MEASURED AND REJECTED -- 0.17% SLOWER.  The selection work
+// is barrier-free in the Phase 4y sense, but hosting it in k_gemv_q4_0_exp2
+// puts a __syncthreads in front of the weight stream of the single hottest
+// kernel in the engine (1536 blocks), and that stall costs more than the
+// 1.77 us/node the <<<1,64>>> node was measured at in isolation.
+//
+// This is the SECOND router fusion to lose.  Both lost for the same reason:
+// the router's own node is tiny, so any fusion that perturbs a large kernel to
+// absorb it pays more than it saves.  Kept so the negative result is
+// reproducible.
+#ifndef LK_ROUTER_PRO
+#define LK_ROUTER_PRO 0
+#endif
+
+// LK_FUSE_ROUTER (Phase 4x Step 3) is RETIRED, not merely off.  It folded the
+// top-4 into the last block of k_router_dot behind a threadfence+atomicAdd
+// barrier, measured 0.09-0.39% slower, and has since gone stale: it never
+// learned about Phase 4y's inv_rms multiply, so enabling it today would route
+// on unscaled logits.  T4r supersedes it with no barrier at all.
+#if LK_FUSE_ROUTER
+#error "LK_FUSE_ROUTER is retired: it is stale (no Phase 4y inv) and was measured slower. See DIAGNOSIS.md."
 #endif
 
 // attn_norm(L) is produced by layer L-1's channel mixer.  Which kernel that is
@@ -383,9 +403,54 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // MoE router: sigmoid gate, top-4 selected by (sigmoid + bias), weights taken
 // from the UNBIASED sigmoid and renormalised.  Exactly llama.cpp's
 // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID path.
+//
+// T4r.  The selection half, callable from any kernel with one warp to spare.
+// This is byte-for-byte the body of the original k_router_top4 -- same four
+// rounds of butterfly argmax, same tie-break `ov > mv || (ov == mv && oi < mi)`
+// so ties still go to the lower expert index, same unbiased weights
+// renormalised under the same guard -- so extracting it cannot change a result.
+//
+// `sel` is (sigmoid + bias), which is what the RANKING uses; `sig` is the
+// unbiased sigmoid, which is what the WEIGHTS use.  Both are 64 floats (512 B
+// together) so they stay in L1 across every block that re-reads them.
+//
+// The expf is deliberately NOT here.  k_router_dot already has each logit in a
+// register and computes the sigmoid once per expert (64 expf total); moving it
+// into a consumer that runs in 1536 blocks would cost 1536*64 = 98k expf, about
+// 3.3 us per layer, which is more than the node it removes.
+__device__ __forceinline__ void lk_router_select(const float * __restrict__ sel,
+                                                 const float * __restrict__ sig,
+                                                 int lane, int * ord, float * wv) {
+    static_assert(LK_TOP_K == 4, "four selection rounds assume top-4");
+    float v0 = sel[lane], v1 = sel[lane + 32];
+    const int i0 = lane,  i1 = lane + 32;
+#pragma unroll
+    for (int r = 0; r < LK_TOP_K; ++r) {
+        float mv = (v0 >= v1) ? v0 : v1;
+        int   mi = (v0 >= v1) ? i0 : i1;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+            const int   oi = __shfl_xor_sync(0xffffffffu, mi, o);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        ord[r] = mi;                       // the butterfly leaves all lanes equal
+        if (i0 == mi) v0 = -1e30f;
+        if (i1 == mi) v1 = -1e30f;
+    }
+    float wsum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < LK_TOP_K; ++k) { wv[k] = sig[ord[k]]; wsum += wv[k]; }
+    if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
+#pragma unroll
+    for (int k = 0; k < LK_TOP_K; ++k) wv[k] = wv[k] / wsum;
+}
+
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
-        float * __restrict__ logits, const float * __restrict__ ssq, float eps);
+        float * __restrict__ logits, const float * __restrict__ bias,
+        float * __restrict__ sel, float * __restrict__ sig,
+        const float * __restrict__ ssq, float eps);
 __global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out);
@@ -527,6 +592,8 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
                                  int out_rows, int bpr, int rows_per_expert,
                                  int xq_stride,
                                  const int * __restrict__ d_idx,
+                                 const float * __restrict__ sel, const float * __restrict__ sig,
+                                 int * __restrict__ idx_out, float * __restrict__ w_out,
                                  float * __restrict__ y_a, float * __restrict__ y_b,
                                  const float * __restrict__ ssq, float eps);
 __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,

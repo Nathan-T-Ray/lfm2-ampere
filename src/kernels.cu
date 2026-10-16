@@ -512,7 +512,9 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 #define LK_ROUTER_UNROLL 16
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
-        float * __restrict__ logits, const float * __restrict__ ssq, float eps) {
+        float * __restrict__ logits, const float * __restrict__ bias,
+        float * __restrict__ sel, float * __restrict__ sig,
+        const float * __restrict__ ssq, float eps) {
     const int e = blockIdx.x;
     const int lane = threadIdx.x;
     // Phase 4y: with ffn_norm folded into the mixer output projection, `h` holds
@@ -534,7 +536,20 @@ __global__ void __launch_bounds__(32) k_router_dot(
         for (int j = 0; j < LK_ROUTER_UNROLL; ++j) acc += v[j] * hv[j];
     }
     acc = warp_sum(acc);
-    if (lane == 0) logits[e] = acc * ninv;
+    if (lane == 0) {
+        const float l = acc * ninv;
+        logits[e] = l;
+        // T4r.  The sigmoid happens HERE, where the logit is already in a
+        // register and there is exactly one thread per expert -- 64 expf for
+        // the whole layer.  Doing it in the consumer would run it once per
+        // block of the 1536-block gate/up GEMV: 98k expf, ~3.3 us per layer,
+        // which is more than the node this transformation deletes.
+        if (sel) {
+            const float g = 1.0f / (1.0f + expf(-l));
+            sig[e] = g;
+            sel[e] = g + bias[e];
+        }
+    }
 }
 
 // The selection half: sigmoid + bias ranking, top-4, renormalised.  Byte for
@@ -568,36 +583,17 @@ __global__ void k_router_top4(const float * __restrict__ logits,
     // insertion maintains the list sorted descending, so round r recovers
     // exactly p_r.  Ties go to the lower expert index.  Each round is five
     // shfl_xor steps carrying a (value, index) pair.
-    static_assert(LK_TOP_K == 4, "four selection rounds assume top-4");
+    // The body now lives in lk_router_select so that this kernel and the T4r
+    // consumer prologue cannot drift apart.  Shared memory is no longer needed
+    // for the selection -- lk_router_select reads the two 64-float arrays
+    // straight from global, where they stay L1-resident.
     const int lane = t;
-    float v0 = s_sel[lane],      v1 = s_sel[lane + 32];
-    const int i0 = lane,         i1 = lane + 32;
-    int ord[LK_TOP_K];
-#pragma unroll
-    for (int r = 0; r < LK_TOP_K; ++r) {
-        float mv = (v0 >= v1) ? v0 : v1;
-        int   mi = (v0 >= v1) ? i0 : i1;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
-            const int   oi = __shfl_xor_sync(0xffffffffu, mi, o);
-            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
-        }
-        ord[r] = mi;                       // the butterfly leaves all lanes equal
-        if (i0 == mi) { v0 = -1e30f; }
-        if (i1 == mi) { v1 = -1e30f; }
-    }
-    if (lane != 0) return;
-    float wsum = 0.0f;
+    int   ord[LK_TOP_K];
     float wv[LK_TOP_K];
+    lk_router_select(s_sel, s_sig, lane, ord, wv);
+    if (lane != 0) return;
 #pragma unroll
-    for (int k = 0; k < LK_TOP_K; ++k) {
-        wv[k] = s_sig[ord[k]];             // unbiased sigmoid, computed above
-        wsum += wv[k];
-    }
-    if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
-#pragma unroll
-    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = ord[k]; w_out[k] = wv[k] / wsum; }
+    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = ord[k]; w_out[k] = wv[k]; }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +960,8 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
                                  int out_rows, int bpr, int rows_per_expert,
                                  int xq_stride,
                                  const int * __restrict__ d_idx,
+                                 const float * __restrict__ sel, const float * __restrict__ sig,
+                                 int * __restrict__ idx_out, float * __restrict__ w_out,
                                  float * __restrict__ y_a, float * __restrict__ y_b,
                                  const float * __restrict__ ssq, float eps) {
     const int half = blockIdx.y >> 2;               // 0 = gate, 1 = up
@@ -971,15 +969,59 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
     const uint4  * qs = half ? qs_b : qs_a;
     const __half * d  = half ? d_b  : d_a;
     float        * y  = half ? y_b  : y_a;
+    const int tw   = threadIdx.x >> 5;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
+
+#if LK_ROUTER_PRO
+    // ---- T4r: the top-4, re-derived here instead of by its own node --------
+    //
+    // k_router_top4 was a <<<1,64>>> node costing 1.769 us per layer in a
+    // graph -- far more than the ~70 instructions of work it carries.  The
+    // selection is barrier-free in the Phase 4y sense: k_router_dot has already
+    // reduced the logits to two 64-float arrays (512 B, L1-resident), so every
+    // block can rebuild the answer from them with one warp and no cross-block
+    // communication at all.
+    //
+    // Only warp 0 runs it, and the other 7 warps wait on the barrier below.
+    // Re-running it in every warp instead would avoid the wait but costs
+    // 1536 blocks * 8 warps * 70 instructions, measured at ~1.45 us per layer,
+    // which is most of what this saves.
+    __shared__ int s_idx[LK_TOP_K];
+    if (tw == 0) {
+        int   ord[LK_TOP_K];
+        float wv[LK_TOP_K];
+        lk_router_select(sel, sig, lane, ord, wv);
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < LK_TOP_K; ++j) s_idx[j] = ord[j];
+            // Only the expert INDICES are needed inside this grid.  The weights
+            // are consumed from global by moe_down, which is a later kernel
+            // launch, so they are written once by block (0,0) and never staged
+            // through shared memory.
+            if (blockIdx.x == 0 && blockIdx.y == 0) {
+#pragma unroll
+                for (int j = 0; j < LK_TOP_K; ++j) { idx_out[j] = ord[j]; w_out[j] = wv[j]; }
+            }
+        }
+    }
+    // Unconditional, and ahead of the early exit below: a divergent
+    // __syncthreads hangs rather than errors.
+    __syncthreads();
+    const int expert = s_idx[k];
+    (void) d_idx;
+#else
+    (void) tw; (void) sel; (void) sig; (void) idx_out; (void) w_out;
+    const int expert = d_idx[k];
+#endif
+
     if (warp >= out_rows) return;
     // Phase 4y.  The grid is exact here (blockIdx.x*8 warps covers out_rows, and
     // rows_per_expert == out_rows for this model), so no warp exits early and
     // the full-mask shuffles below are well defined.
     float ninv = 1.0f;
     if (ssq) ninv = lk_norm_inv(ssq, lane, eps);
-    const size_t base = (size_t) d_idx[k] * rows_per_expert * bpr;
+    const size_t base = (size_t) expert * rows_per_expert * bpr;
     const uint4  * qrow = qs + base + (size_t) warp * bpr;
     const __half * drow = d  + base + (size_t) warp * bpr;
     float acc = 0.0f;

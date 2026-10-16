@@ -200,6 +200,12 @@ struct Engine {
     float *  moe_gate = nullptr, * moe_up = nullptr, * moe_inter = nullptr;
     float *  moe_down = nullptr;
     float *  d_gate = nullptr;   // [64]  router logits, one per expert
+    // T4r: the two 64-float arrays the selection actually consumes.  `d_sel` is
+    // sigmoid + bias and drives the RANKING; `d_sig` is the unbiased sigmoid and
+    // supplies the WEIGHTS.  Both are written by k_router_dot and re-read by
+    // every block of moe_gate_up, which is what lets k_router_top4 disappear.
+    float *  d_sel = nullptr;    // [64]
+    float *  d_sig = nullptr;    // [64]
     float *  d_apv = nullptr;    // [125] argmax stage-1 block winners
     int *    d_api = nullptr;    // [125] their indices
     int *    d_routelog = nullptr; // [max_seq][LK_N_LAYERS][LK_TOP_K], G4b only
@@ -359,6 +365,8 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->attn_part,
                   (size_t) LK_N_HEADS * LK_ATTN_SPLIT * LK_ATTN_PARTW * 4));
     CK(cudaMalloc(&e->d_gate, LK_N_EXPERTS * 4));
+    CK(cudaMalloc(&e->d_sel, LK_N_EXPERTS * 4));
+    CK(cudaMalloc(&e->d_sig, LK_N_EXPERTS * 4));
     CK(cudaMalloc(&e->d_apv, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_idx, LK_TOP_K * 4));
@@ -626,11 +634,20 @@ static void forward(Engine & e, cudaStream_t st) {
             // build_lora_mm runs f32 x f32.  (The experts, by contrast, take
             // the Q8_1-quantised activation.)
             LKP_B("router_dot");
-#if LK_FUSE_ROUTER
-    k_router_dot_top4<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
-                P32(e, l.rbias), e.d_idx, e.d_w, e.router_ctr); LKP_E();
-#else
+    // T4r.  k_router_dot now also emits the two 64-float arrays the selection
+    // needs -- `sel` = sigmoid + bias (what the RANKING uses) and `sig` = the
+    // unbiased sigmoid (what the WEIGHTS use).  The expf happens here, once per
+    // expert, because this is the only kernel that has the logit in a register.
+    // k_router_top4 is gone: every block of moe_gate_up rebuilds the top-4 from
+    // those two arrays in its own prologue, with no barrier.
+#if LK_ROUTER_PRO
     k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
+                                              P32(e, l.rbias), e.d_sel, e.d_sig,
+                                              ffn_norm_ssq, LK_EPS); LKP_E();
+#else
+    // T4r is OFF by default: measured 0.17% SLOWER.  See LK_ROUTER_PRO.
+    k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
+                                              P32(e, l.rbias), nullptr, nullptr,
                                               ffn_norm_ssq, LK_EPS); LKP_E();
             LKP_B("router_top4");
     // one lane per expert: the sigmoids are computed cooperatively, so a
@@ -638,10 +655,6 @@ static void forward(Engine & e, cudaStream_t st) {
     k_router_top4<<<1, LK_N_EXPERTS, 0, st>>>(e.d_gate, P32(e, l.rbias),
                                     e.d_idx, e.d_w); LKP_E();
 #endif
-            if (e.d_routelog) {          // G4b instrumentation (off unless asked)
-                LKP_B("route_log");
-    k_route_log<<<1, 32, 0, st>>>(e.d_idx, e.d_pos, il, e.d_routelog); LKP_E();
-            }
             // Phase 4: ONE launch per matrix for all 4 experts (grid.y = expert),
             // replacing 16 launches per MoE layer.  Weights stay on device, so the
             // per-layer cudaStreamSynchronize host round-trip is gone too.
@@ -650,7 +663,20 @@ static void forward(Engine & e, cudaStream_t st) {
     k_gemv_q4_0_exp2<<<dim3(grid_for(LK_MOE_INTER), 2 * LK_TOP_K), 256, 0, st>>>(
                 PQS(e, l.eg), PD(e, l.eg), PQS(e, l.eu), PD(e, l.eu), ffn_xq,
                 LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu, e.moe_gu + GU, ffn_norm_ssq, LK_EPS); LKP_E();
+                // Under T4r the d_idx parameter is superseded by the prologue's
+                // own selection, and passing it twice would alias two
+                // __restrict__ parameters -- so exactly one group is live.
+#if LK_ROUTER_PRO
+                nullptr, e.d_sel, e.d_sig, e.d_idx, e.d_w,
+#else
+                e.d_idx, nullptr, nullptr, nullptr, nullptr,
+#endif
+                e.moe_gu, e.moe_gu + GU, ffn_norm_ssq, LK_EPS); LKP_E();
+            if (e.d_routelog) {          // G4b instrumentation (off unless asked)
+                // After moe_gate_up, which is what now writes d_idx.
+                LKP_B("route_log");
+    k_route_log<<<1, 32, 0, st>>>(e.d_idx, e.d_pos, il, e.d_routelog); LKP_E();
+            }
             LKP_B("moe_swiglu");
     k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
             
