@@ -553,9 +553,11 @@ static void forward(Engine & e, cudaStream_t st) {
         // ---- channel mixer --------------------------------------------
 #if (LK_FUSE_NORM || LK_NORM_PROD_GEMV)
         // The norm already ran inside whichever projection produced e.x
-        // (shortconv_out or attn_out, above).  LK_STEP is kept so the phase
-        // still appears in the timing breakdown.
-        LKP_B("norm_ffn"); LKP_E();
+        // (shortconv_out or attn_out, above).  Deliberately NO LKP_B/LKP_E here:
+        // an empty bracket pair costs ~1.3 us of measured time and shows up in
+        // the profile as a `norm_ffn` row for a kernel that does not exist --
+        // the profiler then reports the fused build as ~0.05 ms slower than it
+        // is.  The LK_STEP below still covers the phase in the debug trace.
 #else
         LKP_B("norm_ffn");
     // the f32 form is the router's input and exists only in MoE layers; the
