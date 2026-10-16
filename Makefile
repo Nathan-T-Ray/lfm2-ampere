@@ -22,16 +22,22 @@ SPLIT_MIN ?= 8
 # so the negative result stays reproducible with one flag.
 FUSE_NORM ?= 0
 FUSE_ROUTER ?= 0
-# Phase 4y: reshape the three residual-producing GEMVs to one Q8_1 block per
-# block.  Off by default; see the note in kernels.cuh.  This is a falsification
-# test -- it changes the launch shape only, and no arithmetic.
-BIGBLOCK  ?= 0
 # Phase 4y: fold RMSNorm into the kernel that produces its input, via the
 # scale-invariance of Q8_1 (see kernels.cuh).  Two halves, measured separately:
-#   ACCUM  attn_norm(L>=3) into k_moe_accum4  -- needs no shape change
-#   GEMV   the other 42 sites                 -- requires BIGBLOCK=1
-NORM_ACCUM ?= 0
-NORM_GEMV  ?= 0
+#   ACCUM  attn_norm(L>=3) + norm_final into k_moe_accum4 -- no shape change
+#   GEMV   the other 42 sites                              -- requires BIGBLOCK
+#
+# These are ON because they WIN: +5.80/+5.33/+5.05% on interleaved A/B at ctx
+# 272/2128/8128, C2 0.0140% against a 0.1% gate, and an end-to-end nll that
+# moves by less than the corpus can resolve.  (Phase 4x's FUSE_NORM and
+# FUSE_ROUTER stay off because they lost; a losing switch keeps its flag so the
+# negative result stays reproducible, a winning one becomes the default.)
+#
+# `make BIGBLOCK=0 NORM_ACCUM=0 NORM_GEMV=0` reproduces the pre-Phase-4y build,
+# and was verified bit-identical to it on all 7 trajectory cases.
+BIGBLOCK   ?= 1
+NORM_ACCUM ?= 1
+NORM_GEMV  ?= 1
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
 NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \

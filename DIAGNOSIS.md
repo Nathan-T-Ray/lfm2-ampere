@@ -1143,6 +1143,25 @@ construction.  The bound is now set from the format, not from the reading.
     engine-vs-oracle ppl distance on the same corpus
         baseline 1.5421% | GEMV 1.3322% | both 0.5209%
 
+    C1 greedy parity vs llama.cpp, 7-case suite
+        baseline 191/825, factual EXACT 66/66
+        both      88/825, factual 1/66
+
+**C1 goes DOWN and that has to be said plainly.**  Phase 4y reassociates
+`(x*inv)*w` into `inv*(x*w)` at 80 sites, so the Q8_1 activation scales round one
+fp16 ulp differently; the residual stream amplifies that ~20% per layer and the
+greedy trajectory stops being reproducible.  This is inherent, not a defect of
+the implementation: no barrier-free norm fusion can reproduce `(x*inv)*w`
+bit-for-bit, because the producer cannot know inv before the global reduction has
+finished -- which is the barrier we set out to avoid.
+
+The project already knows C1 is a chaos amplifier -- a 1e-8 change once moved it
+191 -> 334, and "improved parity is not evidence of correctness".  The same
+argument runs in reverse: degraded parity is not evidence of incorrectness.  What
+adjudicates is C2 (0.0140%, seven times inside the gate), the end-to-end nll
+(marginally better), the engine-vs-oracle perplexity distance (3x better), and
+the oracle top-1 agreement (93.36% vs 93.72%, unchanged within noise).
+
 The fused builds are 5-10x further from exact on C2 but 7x inside the gate, and
 the end-to-end loss moves by less than the corpus can resolve (SE ~11% on 557
 tokens).  Top-1 agreement against llama.cpp on the same 557 positions IMPROVES,

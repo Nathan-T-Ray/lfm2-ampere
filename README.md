@@ -6,20 +6,31 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 159 | **417.4 tok/s** (3 repeats, sd 1.87) |
-| effective bandwidth | 612 GB/s = **60.7% of the 1008 GB/s spec** |
+| decode, ctx 159 | **438.8 tok/s** (interleaved A/B, 5 rounds, sd 0.4) |
+| before Phase 4y, same session | 414.7 tok/s |
+| effective bandwidth | 644 GB/s = **63.9% of the 1008 GB/s spec** |
 | llama.cpp, same GGUF/GPU, same session | 257.9 tok/s |
-| speedup vs llama.cpp | **1.62x**, and flat at 1.61-1.62x to 3.2k context |
-| speedup vs this engine's own Phase-3 baseline | **3.99x** (102.79 tok/s) |
+| speedup vs llama.cpp | **1.70x**, and 1.67-1.70x to 3.2k context |
+| speedup vs this engine's own Phase-3 baseline | **4.27x** (102.79 tok/s) |
 | traffic | 1466.75 MB/token, so the bandwidth floor is 1.534 ms = **652 tok/s** |
 
 ## Correctness
 
 Three gates, all measured against references that can actually adjudicate.
 
-**C1 — greedy parity vs llama.cpp.** `factual` is **EXACT, 66/66 tokens**, on
-the fast split-attention path -- previously only reachable with `LK_ATTN_SERIAL=1`.
-The full 7-case suite matches 191/825. Multi-step greedy identity is chaotic and
+**C1 — greedy parity vs llama.cpp.** The pre-Phase-4y build is **EXACT, 66/66**
+on `factual` and 191/825 on the full 7-case suite. **The default build is not: it
+matches 88/825.** Phase 4y reassociates `(x*inv)*w` into `inv*(x*w)` at the 80
+sites where an RMSNorm is folded into its producer, which rounds the Q8_1
+activation scales one fp16 ulp differently; the residual stream amplifies that
+~20% per layer, so the greedy trajectory is no longer reproducible. That is a
+real cost and it is stated rather than buried. It is also inherent: no
+barrier-free norm fusion can reproduce `(x*inv)*w` bit-for-bit, because the
+producer cannot know `inv`. What adjudicates is C2 and the end-to-end loss, both
+of which are unmoved or better -- see below. `make BIGBLOCK=0 NORM_ACCUM=0
+NORM_GEMV=0` restores the 191/825 build, verified bit-identical to it.
+
+Multi-step greedy identity is chaotic and
 this is *demonstrated*, not asserted -- see "How fragile greedy parity is" below;
 the suite score moves by tens of tokens when a kernel's rounding changes by 1e-8,
 so treat it as a smoke alarm rather than a measurement.
