@@ -53,6 +53,16 @@ __global__ void k_stream(const float * __restrict__ in, float * __restrict__ out
         out[i] = in[i] * k;
 }
 
+// A pure READ-ONLY streaming kernel: no store, so it is the cleanest possible
+// model of a weight-streaming node.  The guard is never true, which keeps the
+// loop live without generating traffic.
+__global__ void k_readonly(const float * __restrict__ in, float * __restrict__ out, int n) {
+    float acc = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        acc += in[i];
+    if (acc == 1.2345e30f) out[0] = acc;
+}
+
 static const int N = 550;
 
 static double replay_us(cudaGraphExec_t ge, cudaStream_t st, cudaEvent_t a, cudaEvent_t b,
@@ -208,10 +218,153 @@ int main() {
            M, M, t_mix, t_mix / M);
     printf("    --> MARGINAL COST PER NORM NODE    : %6.3f us\n", (t_mix - t_big) / M);
 
+    // =====================================================================
+    // (8) THE RECOVERABLE TOLL.
+    //
+    // The engine's 0.268 ms launch toll was derived BY SUBTRACTION, not
+    // measured, and the whole megakernel proposal rests on it being dead air.
+    // But the bracket-corrected profiler sum (2.978 - 343*1.024us = 2.627 ms)
+    // EXCEEDS the 2.269 ms wall clock, which cannot happen unless kernels
+    // overlap -- i.e. node k+1's CTAs are already launching on SMs freed by
+    // node k's retiring tail.  If that overlap is real, most of the "toll" is
+    // not recoverable and a persistent kernel buys far less than 11.8%.
+    //
+    // Measure it directly: N nodes, each reading a distinct cold slab, with the
+    // TOTAL bytes held constant.  Then
+    //
+    //     t = N * a + TOT / BW      ->   t/N = a + (TOT/N)/BW
+    //
+    // so plotting t/N against (TOT/N)/BW must give a straight line of slope 1
+    // whose INTERCEPT is the per-node overhead with real work in every node.
+    // Compare that intercept against the empty-node cost from (5), measured at
+    // the same grid.  If a_busy << a_empty, the toll is already hidden.
+    // =====================================================================
+    printf("\n(8) per-node overhead when every node does REAL work, total bytes held\n"
+           "    constant at 512 MB (grid 768x256 throughout, so only N varies):\n");
+    {
+        const size_t TOT = (size_t) 512 << 20;          // 512 MB, >> the 6 MB L2
+        const int G8 = 768, B8 = 256;
+        float * d_rd = nullptr, * d_sink = nullptr;
+        CK(cudaMalloc(&d_rd, TOT));
+        CK(cudaMemset(d_rd, 0, TOT));
+        CK(cudaMalloc(&d_sink, 4));
+
+        const int CFG8[][2] = {{16, 0}, {32, 0}, {64, 0}, {128, 0}, {256, 0}, {512, 0}};
+        printf("    %5s %10s %11s %11s %11s %11s %9s\n",
+               "N", "MB/node", "wall us", "us/node", "pure us", "overhead", "GB/s");
+        double intercept_sum = 0.0; int intercept_n = 0;
+        for (int c = 0; c < 6; ++c) {
+            const int NN = CFG8[c][0];
+            const size_t per = TOT / (size_t) NN;
+            const int nf = (int) (per / 4);
+
+            cudaGraph_t gg; cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+            for (int j = 0; j < NN; ++j)
+                k_readonly<<<G8, B8, 0, st>>>(d_rd + (size_t) j * nf, d_sink, nf);
+            CK(cudaStreamEndCapture(st, &gg));
+            CK(cudaGraphInstantiate(&ge, gg, nullptr, nullptr, 0));
+            const double t = replay_us(ge, st, a, b, 10);
+            CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gg));
+
+            const double per_node = t / NN;
+            const double pure = (double) per / 941.8e9 * 1e6;   // us at the marginal rate
+            const double over = per_node - pure;
+            const double gbs = (double) TOT / (t * 1e-6) / 1e9;
+            printf("    %5d %10.2f %11.3f %11.3f %11.3f %11.3f %9.1f\n",
+                   NN, per / 1048576.0, t, per_node, pure, over, gbs);
+            if (NN >= 64) { intercept_sum += over; ++intercept_n; }
+        }
+        const double a_busy = intercept_n ? intercept_sum / intercept_n : 0.0;
+
+        // the same N and the same grid, with EMPTY nodes: what the toll is
+        // claimed to be
+        const int NE = 512;
+        cudaGraph_t gg; cudaGraphExec_t ge;
+        CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        for (int j = 0; j < NE; ++j) k_nop<<<G8, B8, 0, st>>>();
+        CK(cudaStreamEndCapture(st, &gg));
+        CK(cudaGraphInstantiate(&ge, gg, nullptr, nullptr, 0));
+        const double a_empty = replay_us(ge, st, a, b, 10) / NE;
+        CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gg));
+
+        printf("\n    per-node overhead, node does real work : %8.3f us\n", a_busy);
+        printf("    per-node overhead, node is EMPTY       : %8.3f us  (grid %d)\n",
+               a_empty, G8);
+        printf("    --> share of the empty-node toll that is HIDDEN behind real work: %5.1f%%\n",
+               100.0 * (1.0 - a_busy / a_empty));
+        printf("    --> of the engine's 0.268 ms toll (343 x 0.781 us), the part that\n"
+               "        would survive a persistent kernel is ~%.3f ms = %.1f%% of the step\n",
+               343.0 * a_busy / 1000.0, 100.0 * 343.0 * a_busy / 1000.0 / 2.266);
+
+        // ---- (8b) sum(brackets) vs wall, in the profiler's exact regime ----
+        //
+        // The engine's profiler puts each kernel in its own event pair and syncs
+        // once at the end.  If that sum EXCEEDS the graph replay time for the
+        // same work, the kernels overlap and the gaps are not dead air.
+        {
+            const int NB = 343;                  // the engine's node count
+            const size_t per2 = TOT / (size_t) NB;
+            const int nf2 = (int) (per2 / 4);
+            std::vector<cudaEvent_t> ea(NB), eb(NB);
+            for (int j = 0; j < NB; ++j) {
+                CK(cudaEventCreate(&ea[j])); CK(cudaEventCreate(&eb[j]));
+            }
+            for (int w = 0; w < 2; ++w)                       // warm
+                for (int j = 0; j < NB; ++j)
+                    k_readonly<<<G8, B8, 0, st>>>(d_rd + (size_t) j * nf2, d_sink, nf2);
+            CK(cudaStreamSynchronize(st));
+
+            CK(cudaEventRecord(a, st));
+            for (int j = 0; j < NB; ++j) {
+                CK(cudaEventRecord(ea[j], st));
+                k_readonly<<<G8, B8, 0, st>>>(d_rd + (size_t) j * nf2, d_sink, nf2);
+                CK(cudaEventRecord(eb[j], st));
+            }
+            CK(cudaEventRecord(b, st));                       // ONE sync, as the profiler does
+            CK(cudaStreamSynchronize(st));
+            float wall_ms; CK(cudaEventElapsedTime(&wall_ms, a, b));
+            double sum = 0.0;
+            for (int j = 0; j < NB; ++j) {
+                float ms; CK(cudaEventElapsedTime(&ms, ea[j], eb[j]));
+                sum += ms;
+            }
+            // the same work, but bracketed by ONE pair: the un-instrumented cost
+            for (int w = 0; w < 2; ++w)
+                for (int j = 0; j < NB; ++j)
+                    k_readonly<<<G8, B8, 0, st>>>(d_rd + (size_t) j * nf2, d_sink, nf2);
+            CK(cudaStreamSynchronize(st));
+            CK(cudaEventRecord(a, st));
+            for (int j = 0; j < NB; ++j)
+                k_readonly<<<G8, B8, 0, st>>>(d_rd + (size_t) j * nf2, d_sink, nf2);
+            CK(cudaEventRecord(b, st));
+            CK(cudaStreamSynchronize(st));
+            float clean_ms; CK(cudaEventElapsedTime(&clean_ms, a, b));
+
+            printf("\n(8b) the profiler's own regime, %d real nodes:\n", NB);
+            printf("     one event pair around everything : %9.3f us\n", clean_ms * 1000.0);
+            printf("     one event pair PER NODE, one sync: %9.3f us\n", wall_ms * 1000.0);
+            printf("     SUM of the %d per-node brackets  : %9.3f us\n", NB, sum * 1000.0);
+            printf("     --> per-node bracket cost        : %9.3f us\n",
+                   (wall_ms - clean_ms) * 1000.0 / NB);
+            printf("     --> sum(brackets) - wall         : %9.3f us  (instrument, not silicon)\n",
+                   (sum - wall_ms) * 1000.0);
+            for (int j = 0; j < NB; ++j) {
+                CK(cudaEventDestroy(ea[j])); CK(cudaEventDestroy(eb[j]));
+            }
+        }
+
+        CK(cudaFree(d_rd)); CK(cudaFree(d_sink));
+    }
+
     printf("\nInterpretation: if (2) >> (1), the profiler's floor is event overhead,\n"
            "and the small-kernel rows in the report are inflated by that constant.\n"
            "If (3) << (1), graph replay already hides most of the dispatch cost.\n"
            "The number that governs Phase 4x is (7): deleting an isolated norm node\n"
-           "saves its isolated cost, deleting one behind a busy stream saves (7).\n");
+           "saves its isolated cost, deleting one behind a busy stream saves (7).\n"
+           "The number that governs the MEGAKERNEL is (8): if a busy node's overhead\n"
+           "is far below an empty node's, the toll is already overlapped and a\n"
+           "persistent kernel buys little.  (8b) tests the same thing via the\n"
+           "profiler's own instrument and says whether that instrument is lying.\n");
     return 0;
 }

@@ -1,0 +1,56 @@
+(1) empty kernel, batched launches   :  1.230 us/launch
+(1b) tiny store kernel, batched      :  1.511 us/launch
+(2) empty kernel, event-bracketed    :  2.621 us/launch (sum of brackets)
+    wall clock for the same 550 launches:  3.990 us/launch
+(3) empty kernel, graph replay       :  0.606 us/node
+(4) tiny store kernel, graph replay  :  0.786 us/node
+
+(5) marginal cost of an EMPTY node, by grid (256 threads/block):
+    grid     1 :  0.605 us/node
+    grid     8 :  0.640 us/node
+    grid    64 :  0.672 us/node
+    grid   256 :  0.824 us/node
+    grid   768 :  1.154 us/node
+    grid  1024 :  1.308 us/node
+    grid  1536 :  1.500 us/node
+
+(6) norm-shaped kernel (1 block, 256 thr, 8 KB smem, 2048-elem reduction):
+    isolated in a graph                :  2.616 us/node
+
+(7) marginal cost of a norm node BEHIND a busy stream:
+    32 streaming nodes alone           :  692.813 us  (21.65 us each)
+    same 32 + 32 norm nodes            :  810.077 us  (25.31 us each)
+    --> MARGINAL COST PER NORM NODE    :  3.665 us
+
+(8) per-node overhead when every node does REAL work, total bytes held
+    constant at 512 MB (grid 768x256 throughout, so only N varies):
+        N    MB/node     wall us     us/node     pure us    overhead      GB/s
+       16      32.00     644.198      40.262      35.628       4.634     833.4
+       32      16.00     662.416      20.700      17.814       2.887     810.5
+       64       8.00     701.338      10.958       8.907       2.051     765.5
+      128       4.00     780.800       6.100       4.453       1.647     687.6
+      256       2.00     880.608       3.440       2.227       1.213     609.7
+      512       1.00    1155.574       2.257       1.113       1.144     464.6
+
+    per-node overhead, node does real work :    1.514 us
+    per-node overhead, node is EMPTY       :    1.053 us  (grid 768)
+    --> share of the empty-node toll that is HIDDEN behind real work: -43.8%
+    --> of the engine's 0.268 ms toll (343 x 0.781 us), the part that
+        would survive a persistent kernel is ~0.519 ms = 22.9% of the step
+
+(8b) the profiler's own regime, 343 real nodes:
+     one event pair around everything :  1244.160 us
+     one event pair PER NODE, one sync:  2210.464 us
+     SUM of the 343 per-node brackets  :  1760.576 us
+     --> per-node bracket cost        :     2.817 us
+     --> sum(brackets) - wall         :  -449.888 us  (instrument, not silicon)
+
+Interpretation: if (2) >> (1), the profiler's floor is event overhead,
+and the small-kernel rows in the report are inflated by that constant.
+If (3) << (1), graph replay already hides most of the dispatch cost.
+The number that governs Phase 4x is (7): deleting an isolated norm node
+saves its isolated cost, deleting one behind a busy stream saves (7).
+The number that governs the MEGAKERNEL is (8): if a busy node's overhead
+is far below an empty node's, the toll is already overlapped and a
+persistent kernel buys little.  (8b) tests the same thing via the
+profiler's own instrument and says whether that instrument is lying.

@@ -1,0 +1,101 @@
+binary build/engine   ngen=384   base 443.04 tok/s
+greedy speculation with exact verification is lossless, so this simulation is exact
+
+break-even bars, corrected for the lm_head redundancy and the missing router term:
+   M drafts              bar        legacy bar
+   2      1   1.259 -  1.393    1.350 -  1.497
+   3      2   1.585 -  1.863    1.676 -  1.967
+   4      3   1.884 -  2.302    1.976 -  2.406
+
+  (legacy = what this tool hardcoded before: 2.11-2.41 for M=4, applied to every M)
+
+=== drafts=1  (M=2, lm_head runs 1x, bar 1.259-1.393) ===
+case       minm   trig%      E         E/bar         tok/s  verdict
+-------------------------------------------------------------------
+ALL           1           1.34   0.96- 1.06    425-  471  BREAK-EVEN
+factual       1   92.4%   1.72   1.23- 1.36    546-  604  PAYS
+reasoning     1   75.1%   1.31   0.94- 1.04    418-  462  BREAK-EVEN
+code          1   67.5%   1.27   0.91- 1.01    404-  448  BREAK-EVEN
+prose         1   66.7%   1.24   0.89- 0.99    396-  438  DOES NOT PAY
+math          1   75.4%   1.24   0.89- 0.99    395-  437  DOES NOT PAY
+agentic       1   57.5%   1.23   0.88- 0.97    390-  431  DOES NOT PAY
+ALL           2           1.34   0.96- 1.07    427-  473  BREAK-EVEN
+factual       2   88.6%   1.88   1.35- 1.49    597-  661  PAYS
+prose         2   40.4%   1.28   0.92- 1.02    407-  450  BREAK-EVEN
+reasoning     2   48.1%   1.27   0.91- 1.01    404-  447  BREAK-EVEN
+math          2   45.7%   1.23   0.88- 0.97    390-  431  DOES NOT PAY
+code          2   39.8%   1.22   0.88- 0.97    388-  430  DOES NOT PAY
+agentic       2   28.3%   1.17   0.84- 0.93    373-  413  DOES NOT PAY
+ALL           3           1.31   0.94- 1.04    415-  460  BREAK-EVEN
+factual       3   87.5%   1.87   1.34- 1.49    595-  658  PAYS
+prose         3   30.1%   1.25   0.90- 0.99    397-  440  DOES NOT PAY
+math          3   30.9%   1.21   0.87- 0.96    385-  426  DOES NOT PAY
+reasoning     3   33.6%   1.20   0.86- 0.96    383-  423  DOES NOT PAY
+code          3   24.9%   1.16   0.83- 0.92    368-  407  DOES NOT PAY
+agentic       3   17.8%   1.12   0.81- 0.89    358-  396  DOES NOT PAY
+
+=== drafts=2  (M=3, lm_head runs 2x, bar 1.585-1.863) ===
+case       minm   trig%      E         E/bar         tok/s  verdict
+-------------------------------------------------------------------
+ALL           1           1.58   0.85- 1.00    376-  442  DOES NOT PAY
+factual       1   92.4%   2.43   1.30- 1.53    577-  679  PAYS
+reasoning     1   75.1%   1.48   0.79- 0.93    352-  413  DOES NOT PAY
+prose         1   66.7%   1.42   0.76- 0.89    337-  396  DOES NOT PAY
+code          1   67.5%   1.41   0.76- 0.89    336-  395  DOES NOT PAY
+agentic       1   57.5%   1.37   0.74- 0.86    326-  383  DOES NOT PAY
+math          1   75.4%   1.35   0.72- 0.85    320-  376  DOES NOT PAY
+ALL           2           1.62   0.87- 1.02    386-  454  BREAK-EVEN
+factual       2   88.6%   2.75   1.47- 1.73    653-  768  PAYS
+prose         2   40.4%   1.51   0.81- 0.95    359-  422  DOES NOT PAY
+reasoning     2   48.1%   1.43   0.77- 0.90    339-  399  DOES NOT PAY
+math          2   45.7%   1.38   0.74- 0.87    329-  387  DOES NOT PAY
+code          2   39.8%   1.35   0.72- 0.85    321-  377  DOES NOT PAY
+agentic       2   28.3%   1.29   0.69- 0.82    308-  362  DOES NOT PAY
+ALL           3           1.57   0.84- 0.99    373-  439  DOES NOT PAY
+factual       3   87.5%   2.73   1.47- 1.72    650-  764  PAYS
+prose         3   30.1%   1.46   0.78- 0.92    347-  408  DOES NOT PAY
+math          3   30.9%   1.36   0.73- 0.86    324-  381  DOES NOT PAY
+reasoning     3   33.6%   1.34   0.72- 0.84    318-  374  DOES NOT PAY
+code          3   24.9%   1.27   0.68- 0.80    302-  355  DOES NOT PAY
+agentic       3   17.8%   1.22   0.65- 0.77    289-  340  DOES NOT PAY
+
+=== drafts=3  (M=4, lm_head runs 3x, bar 1.884-2.302) ===
+case       minm   trig%      E         E/bar         tok/s  verdict
+-------------------------------------------------------------------
+ALL           1           1.78   0.77- 0.95    343-  419  DOES NOT PAY
+factual       1   92.4%   3.13   1.36- 1.66    603-  736  PAYS
+prose         1   66.7%   1.57   0.68- 0.83    301-  368  DOES NOT PAY
+reasoning     1   75.1%   1.56   0.68- 0.83    300-  367  DOES NOT PAY
+code          1   67.5%   1.49   0.65- 0.79    288-  351  DOES NOT PAY
+agentic       1   57.5%   1.48   0.64- 0.78    284-  347  DOES NOT PAY
+math          1   75.4%   1.42   0.62- 0.75    273-  334  DOES NOT PAY
+ALL           2           1.87   0.81- 0.99    360-  440  DOES NOT PAY
+factual       2   88.6%   3.61   1.57- 1.92    695-  849  PAYS
+prose         2   40.4%   1.70   0.74- 0.90    328-  401  DOES NOT PAY
+reasoning     2   48.1%   1.53   0.66- 0.81    294-  359  DOES NOT PAY
+math          2   45.7%   1.50   0.65- 0.80    289-  353  DOES NOT PAY
+code          2   39.8%   1.45   0.63- 0.77    278-  340  DOES NOT PAY
+agentic       2   28.3%   1.38   0.60- 0.73    266-  325  DOES NOT PAY
+ALL           3           1.81   0.79- 0.96    348-  425  DOES NOT PAY
+factual       3   87.5%   3.59   1.56- 1.91    691-  844  PAYS
+prose         3   30.1%   1.64   0.71- 0.87    317-  387  DOES NOT PAY
+math          3   30.9%   1.47   0.64- 0.78    283-  346  DOES NOT PAY
+reasoning     3   33.6%   1.44   0.62- 0.76    277-  338  DOES NOT PAY
+code          3   24.9%   1.36   0.59- 0.72    262-  319  DOES NOT PAY
+agentic       3   17.8%   1.28   0.56- 0.68    246-  300  DOES NOT PAY
+
+monotone cross-check (per-draft survival is non-increasing, so the
+K=4 measurement bounds the K=2 one from below):
+  E(K=4, minmatch=2) = 1.873  ->  E(K=2) >= 1.291
+  simulated E(K=2, minmatch=2) = 1.344   OK
+  simulated E(K=3, minmatch=2) = 1.625   OK
+
+best (minmatch, drafts) by E/bar, sweeping only configs that PAY:
+  minmatch=2 drafts=1  E=1.34 bar>=1.393  E/bar=0.965  BREAK-EVEN
+  minmatch=1 drafts=1  E=1.34 bar>=1.393  E/bar=0.960  BREAK-EVEN
+  minmatch=3 drafts=1  E=1.31 bar>=1.393  E/bar=0.937  BREAK-EVEN
+  minmatch=2 drafts=2  E=1.62 bar>=1.863  E/bar=0.872  BREAK-EVEN
+  minmatch=1 drafts=2  E=1.58 bar>=1.863  E/bar=0.848  DOES NOT PAY
+  minmatch=3 drafts=2  E=1.57 bar>=1.863  E/bar=0.843  DOES NOT PAY
+  minmatch=2 drafts=3  E=1.87 bar>=2.302  E/bar=0.814  DOES NOT PAY
+  minmatch=3 drafts=3  E=1.81 bar>=2.302  E/bar=0.785  DOES NOT PAY

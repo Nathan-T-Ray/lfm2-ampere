@@ -23,8 +23,12 @@ not be re-measured it says so.
 | vs this engine's own Phase-3 baseline | **4.31x** (102.79 tok/s) |
 | traffic | 1466.75 MB/token → bandwidth floor 1.534 ms = **652 tok/s** |
 | CUDA graph | **343 nodes**, replayed per token |
-| **measured batch-1 ceiling** | **488.9 tok/s** |
-| batch-4 on the same one card | 731–832 tok/s (estimated from the same decomposition) |
+| **measured batch-1 ceiling, current 343-node graph** | **488.9 tok/s** |
+| batch-1 if the launch toll is removed entirely (§13.5, measured additive) | **500.5 tok/s** |
+| batch-4 on the same one card | 682–827 tok/s (§13.3; supersedes 731–832) |
+| batch-8 on the same one card | 819–1068 tok/s (§13.3) |
+| single-stream with triggered speculation, `factual` | **695–849 tok/s** (§13.4) |
+| single-stream with triggered speculation, 7-workload average | break-even, 0.96x of the bar (§13.4) |
 | C2 accuracy, re-measured live | **0.0140%** from exact float64 against a 0.1% gate — **PASS**; llama.cpp is 0.2199% from the same reference |
 
 Build reproducibility: `make engine` from the committed tree reproduces
@@ -1037,11 +1041,12 @@ How to read this **correctly**, which is what Phase 4z was about:
    `<<<8,256>>>`, 0.026 ms over 30 layers.
 5. **Further small-node work:** `swiglu`, `qk_norm_rope`, `argmax`.
 6. **Batch-4 / M=4 — the big one.** The only remaining step change on one card.
-   731–832 tok/s aggregate from the measured decomposition. Staged plan:
-   (a) re-derive the M=4 byte model and verify `tools/g4c.py` does not double-count
-   the non-expert ~45% read once per batch, or `lm_head`; (b) M=4 GEMV with shared
+   **682–827 tok/s aggregate**, corrected in §13.2. Staged plan:
+   (a) ~~re-derive the M=4 byte model~~ **DONE, §13.2 — the model was wrong in two
+   places**; (b) M=4 GEMV with shared
    weights; (c) expert-union dispatch validated against the route trace;
-   (d) benchmark, then triggered prompt-lookup speculation.
+   (d) benchmark, then triggered prompt-lookup speculation — **which §13.3 has now
+   simulated in full and which pays on copy-heavy text only**.
 
    **Batching uses the INDEPENDENT row, not the consecutive row.** A batch holds B
    tokens from B *different* sequences, which share only the static marginal expert
@@ -1053,17 +1058,20 @@ How to read this **correctly**, which is what Phase 4z was about:
    4    11.22 (1.65x)      12.89 (1.51x)    14.56 (1.39x)
    8    17.91 (2.04x)      21.07 (1.83x)    25.81 (1.60x)
    ```
-   Byte floor 971.7 MB/token at B=4 against **1447.9** at B=1. An earlier README
-   revision claimed 2x from the consecutive figure; the honest figure is
-   **1.35–1.45x**, corrected against the author's own interest. Only the launch
-   toll fully amortises, so batch-4 lands at **1.47–1.88x** depending on whether
-   the 0.444 ms execution term is latency-bound (constant) or work-bound (4x).
+   Byte model corrected in §13.2. B=4 is **1.540–1.867x** — **682–827 tok/s** —
+   against the corrected 1467.9 MB/token at B=1. An earlier README revision
+   claimed 2x from the consecutive figure; the honest byte reduction is **1.24x**
+   (k=4 independent reuse), corrected against the author's own interest. Only the
+   launch toll fully amortises, so batch-4 lands at **1.540–1.867x** depending on
+   how the 0.441 ms ramp+small term scales — now a **bracket** rather than a coin
+   flip; see §13.2.
 
-   **Known inconsistency #5, to resolve before building any of this:** the
+   ~~**Known inconsistency #5, to resolve before building any of this:** the
    batching byte model uses **1447.9 MB/token at B=1** while §2.1 derives
    **1466.75 MB/token** for the same single token. The 18.85 MB gap is 1.3% and
-   is not itemised. One of the two models is counting a category the other
-   omits, and every batch-4 speedup figure above inherits whichever is wrong.
+   is not itemised.~~ **RESOLVED, §13.2: it was a missing `router_dot` term**
+   (`lk_prof_bytes` charges 524288 B/layer x 38 = 19.92 MB). The base now
+   reconciles to within **0.077%** and `tools/lkbytes.py` asserts it.
 
 7. Re-measure the context table and the llama.cpp ratios on the current build (§7).
 8. Promote the end-to-end nll table into Gate C2.
@@ -1077,13 +1085,22 @@ How to read this **correctly**, which is what Phase 4z was about:
     spending their budget on stale numbers.
 
 **What the author believes is not reachable, and wants challenged:**
-**500 tok/s single-stream on ONE card at batch 1 for this weight format.** The
-roofline is 652. The measured ceiling with this kernel structure is 488.9. Four
-separate attacks on the overhead have been tried and three lost. Reaching 500
-needs 0.266 ms of the 0.71 ms recoverable, i.e. ~50% of the small kernels, ~30% of
-the launch toll and ~30% of the streaming ramp **simultaneously** — and every one
-of those three has already defeated a direct attempt. The honest expectation for a
-lot of grinding is **475–490**.
+**500 tok/s single-stream on ONE card at batch 1, *without changing the graph's
+structure*.** The roofline is 652. The measured ceiling with the current 343-node
+graph is 488.9, and it is reached by filling the small kernels — four separate
+attacks on the overhead have been tried and three lost. Grinding inside the
+existing graph lands at **475–490**.
+
+**This was revised in §13.5, and the revision is upward.** Part (8) of
+`bench_launch` measured the per-node toll and found it **additive**
+(`busy_node = empty_toll + pure_transfer`), so the 0.268 ms is not already
+overlapped. Removing the node boundaries entirely gives
+`2.266 − 0.268 = 1.998 ms = 500.5 tok/s` on paper — which is a *structural*
+change, not an optimisation, and is therefore not bounded by the 488.9 figure.
+
+It remains unmeasured whether an intra-kernel handoff is cheaper than a kernel
+boundary's 0.78 µs, and that single number decides whether the megakernel is
+worth building at all.
 
 ---
 
@@ -1093,8 +1110,17 @@ Attack the measurement instead, and say what was wrong with the instrument.
 
 * Tensor parallelism / any second-GPU scheme. Out of scope by user instruction;
   no P2P on this platform anyway.
-* Speculative decoding, in both the draft-model and prompt-lookup forms
-  (E 1.87 against a break-even of 2.11–2.41).
+* Speculative decoding **as a general-purpose win**. §13.3 re-ran the sweep across
+  the whole `minmatch` x `drafts` space, which the original verdict never did, and
+  the position is now: **`factual` pays 1.57–1.92x (695–849 tok/s); the aggregate
+  over 7 workloads is break-even at 0.96x of the bar.** Not dead — but confined to
+  text the model is copying, and the binding constraint is first-draft precision
+  (`p1`), not trigger rate.
+* **A draft MODEL**, for this checkpoint specifically: viable arithmetic (the
+  corrected M=2 bar means a drafter only has to cost < 0.26 of a step) but
+  **no sibling checkpoint exists** — the QAD weights do not match public
+  `LiquidAI/LFM2.5-24B-A2B` (embedding correlation −0.036), so `p1` for any
+  public small model is unknown and probably poor.
 * Raising the power limit. Already at the 450 W card maximum, drawing 363 W, no
   throttle reason active, counter 0 µs.
 * Occupancy tuning / wave quantisation. 1–2% across six configurations spanning
@@ -1159,9 +1185,9 @@ restatement, or a summary of what I wrote. I want the errors.
 2. **FINDINGS, ranked by impact.** For each: what is wrong, how you know, and the
    ONE measurement that would confirm or kill it.
 3. Anything in §12's asks you can close.
-4. **Any place where two of my own numbers are mutually inconsistent.** Ten are
-   already listed, so do not spend your budget rediscovering them — find the ones
-   I have *not* listed:
+4. **Any place where two of my own numbers are mutually inconsistent.** Nine are
+   already listed (one closed in §13.2), so do not spend your budget
+   rediscovering them — find the ones I have *not* listed:
    (i) §3.1a the README's "~2.1 µs bracket" versus the measured 1.38 µs increment;
    (ii) §3.1d 333 profiler rows versus 343 graph nodes;
    (iii) §3.6 three irreconciled exchange rates for deleting a node
@@ -1170,8 +1196,9 @@ restatement, or a summary of what I wrote. I want the errors.
    header's 443.2 and 343;
    (v) the README's "4.27x vs the Phase-3 baseline" does not follow from its own
    `443.2 / 102.79 = 4.31` — the ratio was computed against the older 438.8;
-   (vi) §9.6 the batching model's 1447.9 MB/token at B=1 versus §2.1's
-   1466.75 MB/token for the same token;
+   (vi) ~~§9.6 the batching model's 1447.9 MB/token at B=1 versus §2.1's
+   1466.75 MB/token for the same token~~ — **RESOLVED in §13.2: a missing
+   `router_dot` term, 19.92 MB. This is now nine, not ten.**
    (vii) §6.3 **four different C2 figures for the same measurement** — README §C2
    `0.0222%`, README status list `0.0402%`, DIAGNOSIS Phase 4m `0.0402%`, live
    `0.0140%` — and three different oracle distances (`91x / 17x / 15.8x`);
@@ -1223,3 +1250,251 @@ table.
   retracted my own claims three times in this project and each retraction was
   worth more than the optimisation it cancelled. A refutation with arithmetic
   attached is the most valuable thing you can send.
+
+---
+
+## 13. PHASE 4z.7 — THE CORRECTIONS, AND THREE OF MY OWN ERRORS
+
+This section exists because an external reviewer re-derived a model this
+document had already refuted, and chasing it down found **three errors in my own
+work**: two in the byte model that every multi-token figure in §9.6 inherited,
+and one hypothesis I had written into a draft brief. All three are recorded here
+in the same style as the earlier retractions.
+
+The tools now live in one place, `tools/lkbytes.py`, so the two consumers
+(`tools/g4b.py`, `tools/g4c.py`) cannot drift apart again. It self-tests, and the
+self-test asserts the invariant `ratio(1) == 1.000`.
+
+### 13.1 ERROR 1 — `lm_head` was charged one time too many per pass
+
+`tools/g4b.py` and `tools/g4c.py` both computed
+
+```python
+per_pass = K * LM_HEAD_MB + len(MOE_LAYERS) * U * EXPERT_MB + FIXED_MB
+```
+
+and `DIAGNOSIS.md`, `tools/lookup.py` and §9.6 all inherited it. `lm_head` is
+215.04 MB — **14.7% of a single-token step**, second only to the MoE experts — so
+this was the most expensive line item to get wrong.
+
+A verification pass over `K` positions produces `K` logit vectors, but the
+**first** is the vector the previous step already computed to emit the token that
+seeds the pass. It is in hand. So the pass computes `K-1`:
+
+| K | `lm_head` charged | needed | phantom MB/pass |
+|---|---|---|---|
+| 1 | 1 | 1 | 0 |
+| 2 | 2 | 1 | **215.04** |
+| 3 | 3 | 2 | **215.04** |
+| 4 | 4 | 3 | **215.04** |
+
+It is a **fixed** 215.04 MB, independent of `K`. That is exactly why it survived
+this long: every headline number in this document comes from `K=1`, where the
+charge is correct.
+
+Batching is **not** the same formula. `B` independent sequences each need their
+own logits to continue, so batching runs `lm_head` `B` times with no redundancy.
+`lkbytes.py` exposes `lm_head_evals_spec` and `lm_head_evals_batch` as separate
+functions precisely so the two cannot be conflated again.
+
+### 13.2 ERROR 2 — the router term was missing, and it closes inconsistency #5
+
+`lk_prof_bytes` in `src/engine.cu` contains `{"router_dot", 524288.0}`. Over 38
+MoE layers that is **19.92 MB**. `FIXED_MB = 283.0 + 59.0 + 81.0 + 3.0` never had
+a router row.
+
+That 19.92 MB is the whole of the unreconciled **18.85 MB** gap of §9.6 — known
+inconsistency #5, carried unresolved for two phases. The model base now
+reconciles:
+
+```
+model base 1467.88 MB  vs measured 1466.75 MB   -> residual +0.077%
+```
+
+and the residual is the rounding in `283.0` (true 283.85, from
+`30 x (shortcout_in 7077888 + conv 24576 + out 2359296)`). `tools/lkbytes.py`
+asserts the residual is under 0.1%.
+
+**Inconsistency count: ten, now nine.**
+
+### 13.3 The break-even bracket, and two figures the document had both published
+
+`T(1) = 2.266 ms` decomposes into four terms, and they do not all scale the same
+way with the number of tokens in a pass:
+
+```
+1.557 ms  wire   -- per BYTE, scales with R = pass_MB / base_MB
+0.220 ms  ramp   -- per KERNEL per pass; kernels do not get bigger, but grids do
+0.268 ms  toll   -- per NODE, and the node count barely moves -> CONSTANT
+0.221 ms  small  -- per TOKEN of work, plus dependency stalls which are not
+```
+
+Rather than pick the flattering end:
+
+```
+lower = R*WIRE + TOLL + RAMP + SMALL
+upper = R*(WIRE+RAMP) + TOLL + SMALL*ntok
+```
+
+**The document had already published both ends without noticing.**
+`DIAGNOSIS.md:1419` gives M=4 as `1.98x .. 2.56x`; `DIAGNOSIS.md:1675-1683` gives
+M=4 as `2.11x .. 2.41x`. They are not in conflict — they are the two ends of a
+bracket nobody wrote down. `lkbytes._selftest` now asserts that the legacy model
+reproduces both, which makes the bracket a **check** rather than an excuse.
+
+Corrected bars (`bar` = break-even `E[tokens/pass]`):
+
+| M | drafts | lm_head | U_M | pass MB | bar corrected | bar legacy | change |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 | 1 | 4.00 | 1467.9 | 1.001 | 0.991 | — |
+| 2 | 1 | 1 | 6.73 | 2019.4 | **1.259 – 1.393** | 1.350 – 1.497 | −6.8% |
+| 3 | 2 | 2 | 9.12 | 2716.1 | **1.585 – 1.863** | 1.677 – 1.967 | −5.5% |
+| 4 | 3 | 3 | 11.22 | 3355.2 | **1.885 – 2.302** | 1.976 – 2.407 | −4.6% |
+
+Batching (independent row, `lm_head` x B): B=2 **1.270–1.411x**, B=4
+**1.540–1.867x = 682–827 tok/s**, B=8 **1.848–2.410x = 819–1068 tok/s**. This
+supersedes the 731–832 in §0 and §9.6.
+
+### 13.4 The speculation verdict, re-measured across the space that was never swept
+
+`tools/lookup.py` hardcoded `ratio = 2.11, 2.41` and never varied it, so the
+recorded verdict *"speculative decoding … measured dead"* was taken at **one
+point in a two-dimensional space** (`minmatch` x `drafts`). M=4 is the **worst**
+point on the curve: the bar rises ~0.3x per extra draft while the marginal
+acceptance decays.
+
+Now swept, `ngen=384`, 7 cases, log at `ref/lookup_sweep.log`:
+
+| config | trigger | E | bar | E/bar | tok/s | verdict |
+|---|---|---|---|---|---|---|
+| **M=4 minmatch=2, `factual`** | 88.6% | 3.61 | 1.885–2.302 | **1.57–1.92** | **695–849** | **PAYS** |
+| M=3 minmatch=2, `factual` | 88.6% | 2.75 | 1.585–1.863 | 1.47–1.73 | 653–768 | PAYS |
+| M=2 minmatch=2, `factual` | 88.6% | 1.88 | 1.259–1.393 | 1.35–1.49 | 597–661 | PAYS |
+| M=4 minmatch=2, ALL | — | **1.873** | 1.885–2.302 | 0.81 | 360–440 | DOES NOT PAY |
+| M=2 minmatch=2, ALL | — | 1.34 | 1.259–1.393 | 0.96 | 427–473 | BREAK-EVEN |
+
+**The last-but-one row is the whole story.** `E = 1.873` against the legacy bar
+`1.976–2.407` was 5.5–21.9% short — clearly dead. Against the corrected bar
+`1.885–2.302` it is **0.6% short of the optimistic end**. The verdict did not
+flip, but it moved from *comfortably dead* to *on the line*, and the case
+breakdown shows the win is concentrated where the text is copied.
+
+**The binding constraint is precision, not trigger rate.** `code` at
+`minmatch=1` triggers **67.5%** of the time and still gets `E = 1.27`, because
+its continuation is right only **40%** of the time. Per-case first-draft
+accuracy, from `E = 1 + trigger * p1`:
+
+```
+factual 99.3% | reasoning 41.3% | code 40.0% | agentic 40.0%
+              | prose 36.0%     | math 31.8%
+```
+
+To clear 500 tok/s needs `p1 > 0.468` at M=2 or `p1 > 0.418` at M=4 with a 90%
+trigger. **Prompt-lookup delivers ~0.40. It misses on a threshold, not a
+mechanism** — which is why the next question is a better predictor, not a bigger
+M.
+
+The **monotone cross-check** passes: `E(K=4)=1.873` bounds `E(K=2) >= 1.291`
+arithmetically, and the simulation gives `1.344` and `1.625`, both above it. A
+bug in the simulation would have shown up here.
+
+**Caveat, stated plainly:** `E` is exact (lossless greedy speculation can be
+simulated offline), but **the bars are a model, not a measurement** — no M-pass
+kernel exists. The build must re-measure the bar before the payoff is claimed.
+
+### 13.5 ERROR 3 — my own hypothesis that the launch toll was already overlapped
+
+A draft of the external brief argued:
+
+> *the bracket-corrected profiler sum (2.978 − 0.351 = 2.627 ms) exceeds the
+> 2.269 ms wall clock, which cannot happen unless kernels overlap, so much of the
+> 0.268 ms toll may already be hidden and a megakernel would recover far less.*
+
+**Tested and refuted.** `tests/bench_launch.cu` part (8): `N` nodes, each reading
+a distinct cold slab, **total bytes held constant at 512 MB**, grid fixed at
+768x256 so only `N` varies. Log at `ref/bench_launch.log`.
+
+```
+    N    MB/node     us/node     pure us    overhead      GB/s
+   16      32.00      40.729      35.628       5.101     823.8
+   32      16.00      20.954      17.814       3.140     800.7
+   64       8.00      11.076       8.907       2.169     757.3
+  128       4.00       6.250       4.453       1.797     671.0
+  256       2.00       3.562       2.227       1.336     588.7
+  512       1.00       2.361       1.113       1.248     444.0
+```
+
+The decisive check is `busy_node ?= empty_node_toll + pure_transfer`:
+
+| N | empty toll | pure | sum | measured | excess (= ramp) |
+|---|---|---|---|---|---|
+| 512 | 1.154 | 1.113 | 2.267 | **2.361** | +0.094 |
+| 256 | 1.154 | 2.227 | 3.381 | **3.562** | +0.181 |
+| 128 | 1.154 | 4.453 | 5.607 | **6.250** | +0.643 |
+
+**The toll is additive, not hidden.** My hypothesis is withdrawn. Part (8b) also
+shows *why* the argument from the profiler sum was unsound: over 343 **uniform**
+1.5 MB nodes the instrument gives `sum(brackets) = 1854 µs` against a `2323 µs`
+wall — it **under**-counts there and **over**-counts on the engine's mixed
+small/large load. **The instrument's sign depends on the node mix, so the
+engine's 2.978 vs 2.269 comparison cannot carry the weight I put on it.** That is
+now inconsistency (xi), found by my own probe.
+
+**Consequence:** removing only the 0.268 ms toll gives `2.266 − 0.268 = 1.998 ms`
+= **500.5 tok/s**. This does **not** contradict the 488.9 ceiling of §4 — 488.9
+was measured by filling the small kernels while *keeping* the 343 nodes; 500.5
+comes from removing the node boundaries, which is a structural change rather than
+an optimisation inside the existing graph.
+
+**The one thing still unmeasured, and it is the whole risk:** whether an
+intra-kernel handoff costs less than a kernel boundary's 0.78 µs. If a
+band-local producer/consumer flag plus `__threadfence` costs 0.8 µs, a megakernel
+buys nothing. That is a microbenchmark, not a build, and it must be written first.
+And the design risk is already measured: this project's own law is that placing a
+barrier in front of a bandwidth-critical kernel loses (`FUSE_ROUTER` 0.09–0.39%,
+`T4r` 0.17%, `T2` 1.75% — three attempts, three losses).
+
+**Second finding from the same table:** achieved bandwidth collapses from
+**823.8 GB/s at 32 MB/node to 444.0 GB/s at 1 MB/node**, with the engine's
+overall 650 GB/s sitting inside that range. That is the "0.220 ms streaming size
+inefficiency" seen directly, and it suggests **shaping kernels larger is a lever
+nobody has attacked at the kernel level.**
+
+### 13.6 The block-identity rule (needed before any M-pass build)
+
+From `k_moe_down_accum`:
+
+```c
+const int row = blockIdx.x * 32 + tw;          /* ONE OUTPUT ROW PER WARP */
+for (int k = 0; k < LK_TOP_K; ++k) {
+    float acc = 0.0f;
+    for (int j = lane; j < bpr; j += 32)       /* lane-strided accumulator */
+        acc += dot_q4_0_q8_1(qrow, drow, j, xk + j);
+    a += d_w[k] * warp_sum(acc);               /* warp tree, then k = 0..3 */
+}
+```
+
+The entire reduction order for a row lives **inside one warp**. Therefore:
+
+> **Which warp and which block computes a row is free to change. The lane loop,
+> the `warp_sum` tree, the `k = 0..3` expert order, and the per-token Q8_1 block
+> ownership are not.**
+
+That is what makes an expert-union M-pass possible at all without breaking
+bit-identity — and `tools/ab.py` gives a 7/7 check on every build. **Any M-pass
+kernel that is not 7/7 bit-identical is not a lossless speculative verifier,
+whatever else it is.** Note this constraint binds *speculation*; batching has no
+such requirement, which is why batching is the easier of the two to build.
+
+### 13.7 New open items from this phase
+
+1. **Price the intra-kernel handoff** (§13.5). Gates the megakernel. Cheap.
+2. **Fix or fold `tools/lklookup`'s trajectory cache** — done in this phase, but
+   note the key must include `ngen`; a 64-token run poisoned a 384-token one
+   during development.
+3. **Shape the kernels larger** (§13.5 second finding). The 823.8 → 444.0 GB/s
+   collapse across node sizes is measured and unexploited.
+4. **Find a better single-token predictor** (§13.4). The bar is `p1 ≈ 0.42–0.47`;
+   prompt-lookup gives 0.40. A drafter costing < 0.26 of a step is now viable in
+   principle, but **no QAD sibling checkpoint exists**, so `p1` for any public
+   small model is unknown and probably poor.
