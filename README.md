@@ -242,6 +242,22 @@ the consecutive-token figure.  The uniform row is the floor of what is even
 theoretically available, and the measurement beats it, which is the whole reason
 the MoE is worth exploiting.
 
+**How much of the step can a batch amortise?** `tests/bench_shapes.cu` builds a
+graph of 343 EMPTY kernels with the engine's exact grids and block sizes -- the
+tollbooth floor, with no memory traffic at all:
+
+    343 nodes, empty, exact shapes   :  0.268 ms/token  =  0.782 us/node
+    the real step at ctx 272         :  2.269 ms
+    the toll as a fraction of it     :  11.8%
+
+So the step decomposes as 0.268 ms of launch toll + 1.557 ms of wire + 0.444 ms
+of latency-bound execution, and **only the first term amortises across a batch**.
+Batch-4 therefore lands at **1.47-1.88x** depending on whether the execution term
+is latency-bound (constant) or work-bound (4x), against a pure byte floor of
+1.51x.  The equivalent shift for speculative verification is a cost ratio of
+1.98-2.56x rather than the 2.42x assumed, i.e. a break-even of 1.98-2.56 accepted
+tokens of 4 instead of 2.42.
+
 ## Architecture ground truth
 
 Extracted from llama.cpp `src/models/lfm2.cpp` (which `lfm2moe.cpp` aliases):
