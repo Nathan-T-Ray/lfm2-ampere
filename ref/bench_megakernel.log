@@ -1,0 +1,23 @@
+device: NVIDIA GeForce RTX 3090 Ti  SMs=84  maxThreadsPerSM=1536
+NVIDIA_DRIVER: 806
+k_persist occupancy: 6 blocks/SM -> NB = 504 blocks of 256 threads (all resident, or modes 2-4 deadlock)
+
+ slab     S   MB tot     graph   m0 none   m1 BASE   m2 self  m4 cross   m3 grid | boundary  hs self  h cross  gridbar
+----------------------------------------------------------------------------------------------------------------------
+    8   130      512     783.7     578.9     583.6     593.9     614.4     594.8 |    1.539    0.079    0.237    0.086
+      spread over 3 reps: graph 2.05, base 0.41, cross 0.93 us
+   32    32      504     619.9     565.9     566.3     568.6     571.4     568.7 |    1.675    0.073    0.160    0.074
+      spread over 3 reps: graph 46.42, base 47.10, cross 1.02 us
+  128    16     1008    1160.5    1125.4    1126.4    1127.1    1124.4    1123.3 |    2.129    0.043   -0.125   -0.192
+      spread over 3 reps: graph 98.04, base 1.00, cross 4.98 us
+  512    16     4032    4544.7    4468.7    4474.5    4474.9    4476.6    4475.6 |    4.387    0.021    0.128    0.064
+      spread over 3 reps: graph 142.79, base 1.71, cross 1.95 us
+
+VERDICT  (all per stage, all against mode 1, which differs from the
+          treatments ONLY by the spin -- see the header)
+  boundary  = a KERNEL BOUNDARY   (graph vs persistent, same traffic)
+  hs self   = an intra-kernel handoff on the block's OWN flag
+  h cross   = an intra-kernel handoff on ANOTHER block's flag  <-- the real one
+  gridbar   = a full grid barrier
+  cross-block handoff across slab sizes: -0.125 .. 0.237 us
+  --> the handoff costs a fraction of the boundary it replaces.
