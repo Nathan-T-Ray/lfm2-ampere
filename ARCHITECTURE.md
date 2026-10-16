@@ -1221,6 +1221,13 @@ Do not open with a summary of this document. Do not compliment it. Start with th
 table.
 
 ### ASKS TO THE GROUP
+
+> **§13 was written after this section and supersedes parts of it.** A2 (the
+> two-term law), A5 (persistent GEMV bit-identity) and A8 (is 500 unreachable)
+> have all moved: §13.3 corrects the bars, §13.5 measures the toll as additive
+> and puts 500.5 tok/s on the table, and §13.6 gives the block-identity rule that
+> A5 was asking for. Read §13 before answering A2, A5 or A8.
+
 * **A1 — AUDIT §2.3**, the scale-invariant Q8_1 norm split. Is
   `dot(inv*u) = inv*dot(u)` valid as stated given `ds.x`/`ds.y` are **fp16** and
   `qs` is int8? Is there a range or precision interaction I have missed?
