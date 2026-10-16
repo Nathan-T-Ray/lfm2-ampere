@@ -786,3 +786,121 @@ decoding to amortise anything.
 ---
 
 # Phase 4r is folded into the commit above; see git log.
+
+---
+
+# Phase 4v: the context cliff was not where we thought, and the instruments were lying
+
+This phase produced no new algorithmic insight.  It produced a correction to a
+diagnosis that had survived four rounds, and it found three faults in the
+measurement harness that had already turned two of them into committed claims.
+
+## The diagnosis that was wrong
+
+For several rounds the story was: attention at long context re-reads the
+conversation history four times, because four query heads share every kv_head and
+the split-K grid was (32 query heads x SPLIT), so each of the four blocks
+independently fetched the same K and V.  This is arithmetically true.  It was also
+irrelevant, and nobody had tested it.
+
+The test is one line of arithmetic that was never done.  The kernel measured
+0.789 ms at 8k context for 658 MB of fetched pages at a 956 GB/s ceiling -- 87%
+of peak.  A kernel at 87% of peak is not a kernel with a traffic problem.
+
+Cutting the traffic 4x (grid remapped to 8 kv_heads x SPLIT, so one block loads a
+kv_head's slice once and computes all four query heads that share it) changed the
+time from 0.789 to 0.805 ms.  Nothing.  The traffic was redundant; it was not
+what cost the time, because L2 was already absorbing most of the redundancy and
+because the kernel was never bandwidth-bound in the first place.
+
+## Finding out what did cost the time: LK_ATTN_ABLATE
+
+An ablation switch was added to the kernel (`make ABLATE=n`) that removes the
+score dot and the V scan independently.  At 8k context, in ms per step:
+
+    ABLATE=0  both loops        0.802
+    ABLATE=1  no V scan         0.298      V scan  = 0.504
+    ABLATE=2  no score dot      0.578      score   = 0.224
+    ABLATE=3  neither           0.076      fixed   = 0.076
+
+End-to-end at 8k that is 325.9 tok/s with attention and 425.3 tor/s without it, so
+attention is worth 0.72 ms of a 3.07 ms step -- real, but it is the two loops, not
+the traffic, and both loops want the same thing: more of them in flight.
+
+That is why the first GQA version was SLOWER.  It computed four dots per lane
+against four q vectors, blew the register budget to 255 registers with spills,
+and the spills stopped the V loop unrolling.  59 registers, no spills, and the
+four q values stored dim-major so one float4 shared load feeds all four heads.
+Shared transactions per token fell from 256 to 64.
+
+The V scan is now half2 with the slice split over t: a warp covers exactly one
+128-byte line and each thread carries two dims per load instead of one.
+
+## The split count must depend on the context
+
+    seq      best slices   at that setting   at 8 slices
+     272          16           419.1           418.5
+    2128          32           408.5           389.4
+    4128          32           394.7           372.6
+    8128         128           373.3           352.6
+
+The best constant is wrong at one end whichever constant is chosen.  The rule now
+is slices = clamp(ceil(seq/64), 8, 128), which reproduces every measured optimum.
+The grid stays fixed at the cap because CUDA graphs need fixed launch dimensions;
+blocks past the live slice count exit immediately.
+
+## Three faults in the harness
+
+1. **make does not rebuild when a -D value changes.**  The ablation above first
+   "showed" that removing both loops changed nothing -- because all four ABLATE
+   runs executed the same binary.  A flags stamp makes the compiler flags a real
+   prerequisite.
+
+2. **`make ... | grep -q` SIGPIPE-kills make mid-build.**  A SPLIT sweep measured
+   a stale binary for the same reason.  Every measurement now records the md5 of
+   the binary that produced it.
+
+3. **Sequential sweeps confound the parameter with drift.**  SPLIT=192 measured
+   6% faster than SPLIT=128 on throughput while its attention kernel measured 22%
+   SLOWER.  Both cannot be true.  `tools/abbench.sh` interleaves binaries within
+   one time window; that is now the only comparison believed.
+
+Session-to-session drift on this machine is about 2%, which is larger than most
+of the effects being chased.  This is also why the README's short-context lead
+against llama.cpp moved from 1.76x to 1.62x when both engines were finally
+measured in the same session.
+
+## The bug the new test found
+
+`k_attn_combine` staged per-slice maxima with `if (d < LK_ATTN_SPLIT)` in a
+64-thread block.  It therefore only worked while LK_ATTN_SPLIT <= 64.  At 224 it
+read uninitialised shared memory, every logit became NaN, and the oracle gate
+scored 0/825.
+
+It also measured **12% faster**.  NaN routing collapses expert selection, so the
+MoE read fewer distinct expert weights.  Had there been no equivalence test, the
+fastest configuration in the sweep would have been the broken one, and the
+regression would have been committed with a benchmark table to support it.
+
+`tests/test_attn.cu` exists because of that, and compares the split attention
+against both `k_attention_decode` and an exact float64 host reference at seq
+8192/4096/513/512/100/5/1.  The kernel is correct to 6.9e-8 against the serial
+kernel and 1.2e-8 against exact -- closer to the true answer than the kernel it
+replaces.
+
+## Result, interleaved A/B in one session
+
+    ctx      before    after
+     272      416.31   415.30    -0.2%
+    1192      404.30   410.36    +1.5%
+    2192      389.91   405.48    +4.0%
+    4192      365.85   390.03    +6.6%
+    8128      325.96   365.98   +12.3%
+
+## The lesson
+
+The ablation should have been written before the fix, not after.  The arithmetic
+that killed the traffic theory -- 87% of peak is not a traffic problem -- took one
+line and was available four rounds earlier.  A four-fold traffic reduction was
+implemented, benchmarked, and reported as a win before anyone checked whether the
+kernel was bandwidth-bound at all.

@@ -6,7 +6,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../setenv.sh" >/dev/null
 
 PIDFILE="$LK_SCRATCH/oracle.pid"
-LOGFILE="$LK_SCRATCH/oracle.log"
+# The timing lines that tools/oracle_bench.py parses only appear at -lv 4, so the
+# default log is the verbose one: the numbers quoted in README.md have to be
+# reproducible from a scripted `oracle.sh start`, not from a manual invocation.
+LOGFILE="$LK_SCRATCH/oracle_verbose.log"
 CTX="${LK_ORACLE_CTX:-8192}"
 
 start() {
@@ -17,8 +20,8 @@ start() {
       -m "$LK_MODEL" \
       --host 127.0.0.1 --port "$LK_ORACLE_PORT" \
       -ngl 99 -c "$CTX" \
-      --metrics --no-webui \
-      >"$LOGFILE" 2>&1 &
+      --metrics --no-webui -lv "${LK_ORACLE_VERBOSE:-4}" \
+      >"${LK_ORACLE_LOG:-$LOGFILE}" 2>&1 &
   echo $! > "$PIDFILE"
   echo "starting oracle pid $(cat "$PIDFILE") on GPU $LK_ORACLE_GPU :$LK_ORACLE_PORT (ctx $CTX)"
   for i in $(seq 1 120); do
