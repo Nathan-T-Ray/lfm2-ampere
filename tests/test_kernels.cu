@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
         CK(cudaMemcpy(dbcx, bcx.data(), 3 * n * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dhist, hist.data(), 2 * n * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dcw, conv_w.data(), conv_w.size() * 4, cudaMemcpyHostToDevice));
-        k_shortconv<<<8, 256>>>(dbcx, 0, dcw, dhist, dy);
+        k_shortconv<<<8, 256>>>(dbcx, 0, dcw, dhist, dy, nullptr);
         CK(cudaDeviceSynchronize());
         std::vector<float> gy(n), gh(2 * n);
         CK(cudaMemcpy(gy.data(), dy, n * 4, cudaMemcpyDeviceToHost));
@@ -181,15 +181,21 @@ int main(int argc, char ** argv) {
         double ws = 0; for (int k = 0; k < LK_TOP_K; ++k) ws += pr[ord[k]];
         if (ws < LK_TOPK_GUARD) ws = LK_TOPK_GUARD;
 
-        float *dh, *dgi, *db; int *didx; float *dw;
+        float *dh, *dgi, *dlogits, *db; int *didx; float *dw;
         CK(cudaMalloc(&dh, LK_HIDDEN * 4));
         CK(cudaMalloc(&dgi, gate_inp.size() * 4));
+        CK(cudaMalloc(&dlogits, LK_N_EXPERTS * 4));
         CK(cudaMalloc(&db, LK_N_EXPERTS * 4));
         CK(cudaMalloc(&didx, LK_TOP_K * 4)); CK(cudaMalloc(&dw, LK_TOP_K * 4));
         CK(cudaMemcpy(dh, h.data(), LK_HIDDEN * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dgi, gate_inp.data(), gate_inp.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(db, bias.data(), LK_N_EXPERTS * 4, cudaMemcpyHostToDevice));
-        k_router_top4<<<1, 64>>>(dh, dgi, db, didx, dw);
+        // The router is two kernels now, and the test exercises both: dot into
+        // a logits tensor, then select.  Calling only the second one (as an
+        // earlier revision of this test did after the split) silently tested
+        // nothing at all.
+        k_router_dot<<<LK_N_EXPERTS, 32>>>(dh, dgi, dlogits);
+        k_router_top4<<<1, LK_N_EXPERTS>>>(dlogits, db, didx, dw);
         CK(cudaDeviceSynchronize());
         int gi[LK_TOP_K]; float gw[LK_TOP_K];
         CK(cudaMemcpy(gi, didx, LK_TOP_K * 4, cudaMemcpyDeviceToHost));
@@ -207,7 +213,7 @@ int main(int argc, char ** argv) {
         check_abs("max |weight - ref|", mw, 0.0, 1e-5);
         double sum = 0; for (int k = 0; k < LK_TOP_K; ++k) sum += gw[k];
         check_rel("sum(weights) == 1", sum, 1.0, 1e-6);
-        cudaFree(dh); cudaFree(dgi); cudaFree(db); cudaFree(didx); cudaFree(dw);
+        cudaFree(dh); cudaFree(dgi); cudaFree(dlogits); cudaFree(db); cudaFree(didx); cudaFree(dw);
     }
 
     printf("\nGATE G2 (kernels): %s\n", g_fail ? "FAIL" : "PASS - all semantic kernels match");

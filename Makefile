@@ -6,7 +6,22 @@
 CUDA_HOME ?= $(shell for c in $$HOME/local-agent-harnesses/model-scratch/cuda-12.6/usr/local/cuda-12.6 /model-scratch/cuda-12.6/usr/local/cuda-12.6 /usr/local/cuda; do [ -x $$c/bin/nvcc ] && echo $$c && break; done)
 NVCC      := $(CUDA_HOME)/bin/nvcc
 ARCH      := -gencode arch=compute_86,code=sm_86
-NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra -I$(CURDIR)/src
+# Sweepable tuning constants.
+#
+# LK_ATTN_SPLIT is the attention context split CAP (the operating point is
+# derived at runtime from the sequence length; see kernels.cuh).  It MUST be swept through this
+# variable rather than by editing kernels.cuh, because a sweep that edits a
+# source constant and then fails to restore it silently invalidates every
+# measurement taken afterwards -- that happened once already with LK_GEMV_ROWS
+# and cost hours.  `make SPLIT=n engine` either rebuilds with n or fails loudly.
+SPLIT     ?= 128
+TARGET_N  ?= 64
+SPLIT_MIN ?= 8
+# Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
+ABLATE    ?= 0
+NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \
+             -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
+             -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN)
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
 BUILD     := build
 
@@ -25,29 +40,51 @@ check-cuda:
 $(BUILD):
 > @mkdir -p $(BUILD)
 
-$(BUILD)/devinfo: tools/devinfo.cu | $(BUILD) check-cuda
+# ---------------------------------------------------------------------------
+# Flag-change detection.
+#
+# GNU make does not rebuild when a -D value changes, because nothing on disk
+# changed.  That is not a theoretical hazard here: an ablation sweep that
+# appeared to show "attention costs nothing at 8k context" was in fact running
+# the SAME binary four times, and an earlier sweep left LK_GEMV_ROWS at 4 for
+# hours of measurements.  This stamp makes a flag change a real dependency, so
+# `make SPLIT=16` either rebuilds or fails; it can never silently reuse objects
+# built with different flags.
+FORCE:
+$(BUILD)/flags.stamp: FORCE | $(BUILD)
+> @printf '%s\n' '$(NVFLAGS)' '$(LDFLAGS)' > $@.new
+> @cmp -s $@.new $@ || { mv $@.new $@; echo "build flags changed -> rebuilding objects"; }
+> @rm -f $@.new
+
+$(BUILD)/devinfo: tools/devinfo.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
 
 devinfo: $(BUILD)/devinfo
 > @echo "--- device properties (CUDA_VISIBLE_DEVICES=$(LK_GPU)) ---"
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/devinfo
 
-$(BUILD)/test_quant: tests/test_quant.cu src/quant.cuh | $(BUILD) check-cuda
+$(BUILD)/test_quant: tests/test_quant.cu src/quant.cuh $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) tests/test_quant.cu -o $@ $(LDFLAGS)
 
 test-quant: $(BUILD)/test_quant
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_quant $(LK_REF)/quant_fixture.bin
 
-$(BUILD)/kernels.o: src/kernels.cu src/kernels.cuh src/quant.cuh | $(BUILD) check-cuda
+$(BUILD)/kernels.o: src/kernels.cu src/kernels.cuh src/quant.cuh $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) -c src/kernels.cu -o $@
 
-$(BUILD)/test_kernels: tests/test_kernels.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+$(BUILD)/test_kernels: tests/test_kernels.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) tests/test_kernels.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
 test-kernels: $(BUILD)/test_kernels
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_kernels $(LK_REF)/kernel_fixture.bin
 
-$(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h | $(BUILD) check-cuda
+$(BUILD)/test_attn: tests/test_attn.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_attn.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+test-attn: $(BUILD)/test_attn
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_attn
+
+$(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
 engine: $(BUILD)/engine
@@ -72,13 +109,13 @@ $(BUILD)/oracle_ppl: tools/oracle_ppl.cpp | $(BUILD)
 
 oracle-tools: $(BUILD)/oracle_logits $(BUILD)/oracle_ppl
 
-$(BUILD)/bench_launch: tests/bench_launch.cu | $(BUILD) check-cuda
+$(BUILD)/bench_launch: tests/bench_launch.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
 
-$(BUILD)/bench_norm: tests/bench_norm.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+$(BUILD)/bench_norm: tests/bench_norm.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) -I src tests/bench_norm.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
-$(BUILD)/bench_small: tests/bench_small.cu $(BUILD)/kernels.o | $(BUILD) check-cuda
+$(BUILD)/bench_small: tests/bench_small.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) -I src tests/bench_small.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
 # True marginal cost of the small kernels, and a phase ablation of the norm.
@@ -110,7 +147,7 @@ gate-c1a: engine oracle-tools
 gate-c2: engine oracle-tools
 > @python3 tools/perplexity.py ppl_natural.bin 200
 
-all: devinfo test_quant test_kernels engine oracle-tools
+all: devinfo test_quant test_kernels test_attn engine oracle-tools
 
 # Gate G2: every kernel primitive verified against an independent reference.
 test-all: test-quant test-kernels

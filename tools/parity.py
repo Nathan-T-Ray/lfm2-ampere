@@ -15,7 +15,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REF = pathlib.Path(os.environ.get("LK_REF", ROOT / "ref"))
-ENGINE = ROOT / "build" / "engine"
+ENGINE = pathlib.Path(os.environ.get("LK_ENGINE", ROOT / "build" / "engine"))
 
 
 def run_engine(ids, ngen, timeout=3600):
