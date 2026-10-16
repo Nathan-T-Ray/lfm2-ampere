@@ -17,11 +17,12 @@ number in this file measured on the machine rather than estimated.
 
 Three gates, all measured against references that can actually adjudicate.
 
-**C1 — greedy parity vs llama.cpp.** `factual` is **bit-identical for 39/66
-tokens**; the full 7-case suite matches 179/825. Multi-step greedy identity is
-chaotic and this is now *demonstrated*, not asserted -- see "How fragile greedy
-parity is" below. `LK_ATTN_SERIAL=1` restores 66/66 by reverting attention to its
-order-preserving form, at the cost of the long-context speed in the table below.
+**C1 — greedy parity vs llama.cpp.** `factual` is **EXACT, 66/66 tokens**, on
+the fast split-attention path -- previously only reachable with `LK_ATTN_SERIAL=1`.
+The full 7-case suite matches 191/825. Multi-step greedy identity is chaotic and
+this is *demonstrated*, not asserted -- see "How fragile greedy parity is" below;
+the suite score moves by tens of tokens when a kernel's rounding changes by 1e-8,
+so treat it as a smoke alarm rather than a measurement.
 
 ## Context scaling, against the oracle
 
