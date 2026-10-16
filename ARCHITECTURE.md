@@ -25,6 +25,7 @@ not be re-measured it says so.
 | CUDA graph | **343 nodes**, replayed per token |
 | **measured batch-1 ceiling** | **488.9 tok/s** |
 | batch-4 on the same one card | 731–832 tok/s (estimated from the same decomposition) |
+| C2 accuracy, re-measured live | **0.0140%** from exact float64 against a 0.1% gate — **PASS**; llama.cpp is 0.2199% from the same reference |
 
 Build reproducibility: `make engine` from the committed tree reproduces
 `build/engine` **md5-identical** (`e3051b18b27b1fb08e0d1f288bed68a0`).
@@ -356,7 +357,7 @@ single-kernel row.
 | `bench_norm`, `bench_small` | true marginal cost of small kernels, back-to-back under one event pair | valid |
 | `LK_ABLATE_SMALL` | empties a group of non-streaming kernels, keeping grids and weight traffic | valid **only with the contamination guard** |
 | `test_*` | G2 dots/kernels, G6 attention, G7 normfuse, G8 normscale | all PASS |
-| `tools/paired.py` | paired per-token nll with a sign test | validated: same binary twice → **exactly 0.000000** |
+| `tools/paired.py` | paired per-token nll with a sign test | validated: same binary twice → **exactly 0.000000**; pairing sharpens the standard error **14.2x** (sd(nll) 2.3775 → sd(Δ) 0.2358, se 0.1420 → 0.00999). Honest bound: it resolves **2.0%** of perplexity on 557 tokens, not the 0.08% predicted for it |
 | `tools/ab.py` | bit-identity over 7 trajectory cases | 7/7 |
 | `tools/sweep.py`, `abbench.sh` | throughput, interleaved | — |
 | `tools/lookup.py`, `g4b.py`, `g4c.py` | speculation and expert-reuse simulation | — |
@@ -476,8 +477,20 @@ Negative results are kept behind flags in the tree so they stay reproducible.
 Symptom: plausible output, no greedy parity. Rounds 4 and 5 concluded the
 `out_proj` GEMV was the culprit. **Round 6 proved the GEMV exact and showed round
 5's conclusion was a harness artifact.** Round 7 found the real root cause: **fp32
-summation order, amplified.** Round 8 attempted an `rms_norm` fix that
-**regressed**, and that falsification is what produced the amplification model.
+summation order, amplified.** Round 8 attempted the obvious fix and **falsified its
+own root-cause fix**, which is what produced the amplification model.
+
+Round 8 replicated ggml-cuda's `rms_norm_f32<1024>` exactly — same 1024 threads,
+same butterfly, same accumulation order — and it **regressed `factual` from 66/66
+to 38/66.** Isolating the change confirmed the rewrite itself was the cause, and
+restoring the original 256-thread tree reduce returned 66/66. So **llama.cpp is
+not executing `rms_norm_f32<1024>` on this path for this model and batch size**;
+there is a fused or differently-configured norm in its actual graph. *Which kernel
+it really runs is still unidentified* — an honest open question, not a resolved
+one. The falsification is also what produced the amplification model, so the round
+paid for itself. What the author wrote at the time: *"I optimised toward a
+hypothesis instead of measuring. The measurement falsified it in one run, which is
+cheap, but I should have made the falsification test first."*
 
 The chain, measured end to end in layer 0: a different summation order changes a
 few low bits of the residual → the next layer's RMSNorm divides by a slightly
@@ -496,14 +509,40 @@ two kernels are **bit-identical**. At 2 tokens the top-64 logits differ by
 > correlation) replaced it, and C2 is adjudicated against exact float64.
 
 ### Phase 4 — the router was the bottleneck
+Decode was stuck at ~153 tok/s with healthy-looking kernels. Four cheap
+falsification experiments, run *before* any optimisation, killed the three obvious
+hypotheses and pointed at the real one:
+
+```
+-DLK_LOADONLY (delete ~80% of the arithmetic)   153.70 -> 153.47 tok/s  NOT instruction-bound
+split-K probe -DLK_GEMV_WPR=2 (double the warps) 153.99 -> 152.98        NOT occupancy-bound
+ONE k_gemv_q4_0 isolated, 2000 free launches     4.08 us = 577.8 GB/s    kernels are fine alone
+q8 block re-read from HBM would imply 1733 GB/s  impossible              q8 is cached correctly
+```
+The model that fits: ~310 strictly serial kernels, 6.52 ms/token = **21.0 µs per
+serial step**, of which one kernel with no dependency takes **4.08 µs** and graph
+dispatch **0.78 µs** — so **~17 µs is exposed dependency, ramp and drain latency,
+not work.** That also explains why fusing rmsnorm+quantiser (310 → 229 launches)
+did *not* help: a step must be large enough to cover its own latency.
+
 The decisive insight: **a kernel with one block cannot be fast, however many
 threads it has.** Three of the most expensive kernels were single-block reductions
 holding ~1 KB of loads outstanding; at ~500 cycles of HBM latency that is
 **~2.8 GB/s**, a hard ceiling independent of block size. Each had previously been
 "optimised" by *adding threads*, which could never work.
 
-Fix: split the router across 64 blocks, the argmax across 125. Router
-**25.7 → 4.5 µs**; argmax **145 → 6 µs**.
+Fix, in two parts: split the router dot across 64 blocks (one warp per expert) and
+the argmax across 125; then hand-unroll the top-4 *selection* out of a spilled
+local-memory insertion sort into explicit registers, preserving the same insertion
+and the same tie-breaking. Router dot **25.7 → 4.5 µs**, selection **15.3 → 2.2 µs**,
+argmax **145 → 6 µs**. End to end **153.41 → 258.23 tok/s (+68%)**, and the engine
+went from **0.68x to 1.14x llama.cpp** for the first time.
+
+The suite parity moved 242/825 → 180/825 in that same change, and the author's
+reasoning is worth stating because it recurs: the warp reduction changes the
+router's summation order, ~1 in 4 of the 64-expert argmaxes sits close enough to
+flip, and the criterion that would call that a regression is the one just retired
+as unusable. **C2 improved.**
 
 > **Generalised law: rank kernels by work-per-thread, not by traffic share. The
 > router carried 1.4% of the bytes and was the single largest cost in the engine.**
@@ -581,6 +620,41 @@ vector** (maxabs / rms / median / correlation) rather than a token trajectory.
 > nothing; the full vector tells you immediately and quantitatively.
 
 **ACCEPTED, with the C1 cost stated rather than buried.**
+
+The accuracy accounting, honestly, because this is the change that moved C1:
+
+```
+interleaved A/B, REPS=5, both halves (80 of the 81 norm nodes removed)
+    ctx 272    414.73 -> 438.78   +5.80%
+    ctx 2128   404.53 -> 426.07   +5.33%
+    ctx 8128   364.78 -> 383.20   +5.05%
+
+C2, lm_head vs exact float64 GIVEN the engine's residual stream
+    baseline 0.0013%   ACCUM 0.0067%   GEMV half 0.0137%   both 0.0140%
+    gate: <= 0.1%
+end-to-end nll, 557-token natural corpus
+    baseline 1.890377   ACCUM 1.903387   GEMV 1.888308   both 1.880269
+engine-vs-oracle perplexity distance, same corpus
+    baseline 1.5421%    GEMV 1.3322%     both 0.5209%
+```
+So the fused builds are **5–10x further from exact on C2 and still 7x inside the
+gate**, and the end-to-end loss is marginally *better*. The honest size of the
+residual-stream perturbation, comparing the full 128k logit vectors: **median
+|diff| 0.110, max 0.892, correlation 0.99747** — about **1000x more than a naive
+rounding-drift estimate**, and dominated by a common-mode shift that cancels in
+the softmax (which is why nll moves 0.02% while individual logits move 1%). The
+GEMV half adds 42 more sites and moves the median to 0.133, i.e. it behaves
+exactly like the half already accepted.
+
+Gate G8's diagnostics explain the residual rather than merely bounding it: the
+int8 payload is **bit-identical to the reference (0 flips in 2048 elements)**,
+every scale field reconstructs to within one fp16 ulp and **~78% bit-exactly**,
+and the remaining **~22% are one ulp out** — the signature of two fp16 roundings
+not commuting, which is exactly the predicted mechanism. An earlier draft of that
+gate asserted the fields would match *exactly* with a 2e-4 tolerance; both were
+guesses, and **2e-4 is below fp16's own relative precision of 4.9e-4**, so it was
+unachievable by construction. The bound is now derived from the format, not from
+the reading.
 
 ### Phase 4z — the profiler's fixed cost, and where node deletion stops paying
 Retracted the author's own prior claim (the `moe_down` / `moe_gate_up` GB/s gap).
@@ -798,7 +872,8 @@ the final `lm_head` is not amplified at all. **The metric is scale-dependent.**
 | G7 normfuse | PASS, across replays |
 | G8 normscale | PASS, **with a no-scale negative control that must be measurably wrong** |
 | C1 greedy parity | pre-4y build EXACT 66/66 on `factual`, 191/825 full suite. Default build **88/825** |
-| C2 perplexity | **0.0222% from exact on 200 paired positions** against a 0.1% target — **PASS** |
+| C2 perplexity | **0.0140% from exact on 200 paired positions** against a 0.1% target — **PASS** (re-measured live) |
+| C2 engine-vs-oracle | 0.5209% on the full 557-token corpus; top-1 agreement 93.36% |
 
 `make BIGBLOCK=0 NORM_ACCUM=0 NORM_GEMV=0` restores the 191/825 build, **verified
 bit-identical to it.**
@@ -809,19 +884,41 @@ the end-to-end loss.
 
 ### 6.3 C2's reference is not llama.cpp
 `tools/perplexity.py` recomputes the `lm_head` in **float64 straight from the
-GGUF**, because comparing two engines cannot say which one is right.
+GGUF**, because comparing two engines cannot say which one is right. Re-measured
+live on the shipped build:
 
-| | nll | vs exact | sd per position |
-|---|---|---|---|
-| exact (float64 lm_head) | 1.804137 | — | — |
-| **liquid-kernel** | — | **0.022%** | — |
-| llama.cpp | — | 2.0192% | 0.315 |
+```
+over 200 paired positions:
+  exact (float64 lm_head) nll=1.795644  ppl=6.023353
+  liquid-kernel           nll=1.795895  ppl=6.024863   -> 0.0140% from exact
+  llama.cpp               nll=1.791696  ppl=5.999621   -> 0.2199% from exact
+  oracle is 15.8x further from exact than the engine
+full corpus (557 positions), engine vs oracle:
+  ppl 6.555266 vs 6.521300 -> 0.5209% apart
+  top-1 agreement: 520/557 = 93.36%
+  GATE C2 vs exact (<=0.1%): PASS
+```
 
-The engine is **91x closer to the exact model than llama.cpp is**, and the entire
-two-engine "delta" is *the oracle's error*. The caveat the author states against
-himself: the exact reference is recomputed from the engine's own dumped residual
-stream, so this validates the final norm + `lm_head` stage against float64
-mathematics — **not** the 40 layers upstream.
+**The engine is 15.8x closer to the exact model than llama.cpp is**, and the
+entire two-engine "delta" is *the oracle's error*.
+
+**This paragraph carried a wrong number into an earlier draft of this document,
+and two wrong numbers are in the README.** The README's own C2 table says
+`liquid-kernel 0.0222% / llama.cpp 2.0192% / 91x`, while its own status list
+(line 352) says `0.0402%`, and `DIAGNOSIS.md` Phase 4m says
+`0.0402% / 0.6896% / 17x`. **All four figures are stale; the measurement above is
+current and matches the Phase 4y record's `0.0140%`.** The reason the comparison
+ratio moved so much is that the *reference itself* moves: "exact" is recomputed
+in float64 from the engine's own residual stream, so it changes whenever the
+residual stream changes. Only the engine's distance from exact is a stable
+quantity; the ratio is not.
+
+The caveat the author states against himself: the exact reference is recomputed
+from the engine's own dumped residual stream, so this validates the final norm +
+`lm_head` stage against float64 mathematics — **not** the 40 layers upstream. That
+blind spot is a real gap in the gate (Phase 4y flagged it: "a fusion that perturbs
+the residual stream is only weakly constrained by C2") and `tools/paired.py` was
+built to cover it.
 
 The single-token comparison isolates the same effect with no upstream involvement:
 feeding one prompt token and recomputing the `lm_head` in float64,
@@ -970,6 +1067,14 @@ How to read this **correctly**, which is what Phase 4z was about:
 
 7. Re-measure the context table and the llama.cpp ratios on the current build (§7).
 8. Promote the end-to-end nll table into Gate C2.
+9. **Identify which norm kernel llama.cpp actually executes.** Phase 3 round 8
+   proved it is *not* `rms_norm_f32<1024>` on this path (replicating that exactly
+   regressed parity 66/66 → 38/66), so there is a fused or differently-configured
+   norm in its real graph. Nothing in the engine depends on the answer, but the
+   question was left open and should stay on the record.
+10. **Six of the ten self-inconsistencies in §12.4 are documentation drift, not
+    measurement error.** Reconciling them is cheap and would stop a reviewer
+    spending their budget on stale numbers.
 
 **What the author believes is not reachable, and wants challenged:**
 **500 tok/s single-stream on ONE card at batch 1 for this weight format.** The
@@ -1054,19 +1159,32 @@ restatement, or a summary of what I wrote. I want the errors.
 2. **FINDINGS, ranked by impact.** For each: what is wrong, how you know, and the
    ONE measurement that would confirm or kill it.
 3. Anything in §12's asks you can close.
-4. **Any place where two of my own numbers are mutually inconsistent.** Six are
+4. **Any place where two of my own numbers are mutually inconsistent.** Ten are
    already listed, so do not spend your budget rediscovering them — find the ones
    I have *not* listed:
    (i) §3.1a the README's "~2.1 µs bracket" versus the measured 1.38 µs increment;
    (ii) §3.1d 333 profiler rows versus 343 graph nodes;
    (iii) §3.6 three irreconciled exchange rates for deleting a node
-   (0.3–0.45 / 1.5 / 3.811 µs);
+   (0.3–0.45 / 1.5 / 3.811 µs), plus 1.29 and 2.07 in the same record;
    (iv) §7 the README body quoting 417.4 tok/s and 509 nodes against its own
    header's 443.2 and 343;
    (v) the README's "4.27x vs the Phase-3 baseline" does not follow from its own
    `443.2 / 102.79 = 4.31` — the ratio was computed against the older 438.8;
    (vi) §9.6 the batching model's 1447.9 MB/token at B=1 versus §2.1's
-   1466.75 MB/token for the same token.
+   1466.75 MB/token for the same token;
+   (vii) §6.3 **four different C2 figures for the same measurement** — README §C2
+   `0.0222%`, README status list `0.0402%`, DIAGNOSIS Phase 4m `0.0402%`, live
+   `0.0140%` — and three different oracle distances (`91x / 17x / 15.8x`);
+   (viii) the full-suite greedy parity baseline appears as **242/825** (Phase 4),
+   **180/825** (Phase 4, after the router fix) and **191/825** (Phase 4y, called
+   "the baseline" for the pre-4y build). 242 → 180 is explained; **180 → 191 is
+   not**, and the 191 figure is the one this document quotes;
+   (ix) the pre-Phase-4z baseline is quoted as **438.8** in the README and Phase
+   4z.6 but was measured as **438.31** inside Phase 4z itself;
+   (x) the "before Phase 4z" byte model, the phase-4x budget (`2.398` stated vs
+   `2.399` summed) and the reference RMS values for layers 21/22/final, which
+   differ between Phase 3 rounds 3 and 6 while round 6 calls its table "unchanged
+   from round 3".
 5. For each law in §11, predict a specific experimental outcome that would
    falsify it if you believe it is false.
 6. **One thing I should do next**, justified in bytes and microseconds, not
