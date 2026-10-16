@@ -97,9 +97,62 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 #define LK_GEMV_BLOCKS(rows) ((((rows) / LK_GEMV_ROWS) + 7) / 8)
 
 // Generic Q4_0 x Q8_1 GEMV: LK_GEMV_ROWS output rows per warp.
+//
+// Phase 4x: an optional RMSNorm epilogue.  Every FFN norm in a token is
+// preceded by one of three GEMVs (shortconv_out, attn_out, dense_down) that
+// produces exactly the 2048 residual values the norm then reduces.  Running
+// the norm as its own kernel costs 2.66 us of which 0.61 is dispatch, and
+// bench_launch.cu measures the marginal cost of such a node behind a busy
+// stream at 3.81 us -- 80 times a token.  So the norm moves into the producer:
+// every block contributes its rows' sum of squares, and the LAST block to
+// finish (a threadfence + atomicAdd, NOT a grid sync) reduces them in block
+// order, applies the norm and emits Q8_1 and optionally f32.
+//
+// The reduction is deterministic -- partials are summed in strict block index
+// order -- but it is NOT bit-identical to k_rmsnorm_q8_1, whose 2048 elements
+// are partitioned across threads differently.  C2 adjudicates that; C1 cannot.
+#define LK_NORM_PARTIALS 256      // == LK_GEMV_BLOCKS(LK_HIDDEN); see static_assert
+// Phase 4x Step 1: run the FFN norm inside the projection that produces its
+// input, for the 40 shortconv_out/attn_out sites.
+//
+// MEASURED AND REJECTED -- default 0.  Interleaved A/B, 3 rounds each:
+//
+//   ctx      fuse0    fuse1
+//    272     417.02   410.39   -1.6%
+//   2128     406.71   399.25   -1.8%
+//   8128     367.26   361.68   -1.5%
+//
+// The 40 norm nodes did disappear (norm_ffn 0.185 -> 0.054 ms) but each
+// producer absorbed +3.2 us (shortconv_out 0.186 -> 0.282, attn_out 0.063 ->
+// 0.094), which is the 3.3 us node it replaced.  The norm's cost is NOT launch
+// overhead: bench_launch.cu measures a 1-block node at 0.605 us empty and
+// 2.661 us with a real 2048-element reduction, and 3.814 us when it sits
+// behind a busy stream.  The extra 1.15 us is the stall waiting for the
+// preceding kernel's last wave to drain, and that stall is a property of the
+// DEPENDENCY, not of the kernel -- folding the work into the producer inherits
+// the identical stall and adds a threadfence plus a 256-way atomic to it.
+//
+// Kept as a switch so the negative result stays reproducible, and because
+// tests/test_normfuse.cu guards the epilogue if it is ever revisited.
+#ifndef LK_FUSE_NORM
+#define LK_FUSE_NORM 0
+#endif
+struct LKNormEpilogue {
+    const float * w;              // [n] norm weights, or null to skip the epilogue
+    float         eps;
+    float *       y32;            // optional f32 output (the router's input)
+    block_q8_1 *  yq8;            // Q8_1 output
+    float *       partial;        // [LK_NORM_PARTIALS] scratch
+    unsigned int * ctr;           // one counter, reset by the last block
+};
+
 __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
                             int out_rows, int bpr, float * __restrict__ y, int add_residual);
+__global__ void k_gemv_q4_0_norm(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                                 LKNormEpilogue ne);
 
 // Generic Q6_K x Q8_1 GEMV: one warp per output row; each super-block consumes
 // 8 consecutive Q8_1 blocks.

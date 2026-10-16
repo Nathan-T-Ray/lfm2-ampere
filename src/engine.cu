@@ -161,6 +161,12 @@ struct Engine {
     float *  h = nullptr;        // [2048] post-norm (fp32, for the router)
     __half * h16 = nullptr;      // [2048] post-norm (fp16, router input)
     block_q8_1 * xq = nullptr;   // [368] quantised hidden-state activations
+    // Phase 4x fused norm epilogue.  One scratch array and one counter, shared
+    // by every fused call site.  Safe because they are stream-ordered and the
+    // last block resets the counter before exiting -- but the reset is
+    // load-bearing, so tests/test_normfuse.cu replays twice.
+    float *        norm_partial = nullptr;   // [LK_NORM_PARTIALS]
+    unsigned int * norm_ctr = nullptr;       // [1], zeroed at init
     float *  attn_part = nullptr; // [heads][SPLIT][2 + head_dim] split-K scratch
     block_q8_1 * xq2 = nullptr;  // [368] second scratch: the MoE expert loop needs
                                  //       the hidden-state activation to survive
@@ -200,6 +206,19 @@ static inline const uint4 *   PQS(const Engine & e, const LKTensor * t) { return
 static inline const __half *  PD (const Engine & e, const LKTensor * t) { return (const __half *)P(e, t, 1); }
 
 static inline int grid_for(int rows) { return (rows + 7) / 8; }   // 8 warps/block
+
+// Phase 4x: the FFN norm that follows the mixer's output projection, described
+// as an epilogue for that projection to run for free.  See kernels.cuh.
+static inline LKNormEpilogue ffn_norm_epi(Engine & e, const Layer & l) {
+    LKNormEpilogue ne;
+    ne.w       = P32(e, l.ffn_norm);
+    ne.eps     = LK_EPS;
+    ne.y32     = l.is_moe ? e.h : nullptr;   // the router's input, MoE layers only
+    ne.yq8     = e.xq;
+    ne.partial = e.norm_partial;
+    ne.ctr     = e.norm_ctr;
+    return ne;
+}
 
 // ---------------------------------------------------------------------------
 static void load_layers(Engine & e) {
@@ -275,6 +294,11 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->h16, LK_HIDDEN * 2));
     CK(cudaMalloc(&e->xq,  368 * sizeof(block_q8_1)));
     CK(cudaMalloc(&e->xq2, 368 * sizeof(block_q8_1)));
+    CK(cudaMalloc(&e->norm_partial, LK_NORM_PARTIALS * 4));
+    CK(cudaMalloc(&e->norm_ctr, 4));
+    // Must start at zero: the fused epilogue is skipped, silently and with
+    // plausible output, if the counter is stale.
+    CK(cudaMemset(e->norm_ctr, 0, 4));
     CK(cudaMalloc(&e->y,  2 * LK_DENSE_INTER * 4));
     CK(cudaMalloc(&e->inter, LK_DENSE_INTER * 4));
     CK(cudaMalloc(&e->tmp, LK_HIDDEN * 4));
@@ -395,8 +419,16 @@ static void forward(Engine & e, cudaStream_t st) {
             // raw projection can be compared in isolation (debug only).
             const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
             LKP_B("shortconv_out");
+#if LK_FUSE_NORM
+    // This GEMV produces exactly the 2048 residual values the FFN norm then
+    // reduces, so the norm runs inside it -- see kernels.cuh.
+    k_gemv_q4_0_norm<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar,
+                ffn_norm_epi(e, l)); LKP_E();
+#else
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar); LKP_E();
+#endif
             if (il == 0 && getenv("LK_DUMP_L0X")) {   // immediately after the GEMV
                 const char * dp = getenv("LK_DUMP_L0X");
                 FILE * df = fopen(dp, "wb");
@@ -435,17 +467,30 @@ static void forward(Engine & e, cudaStream_t st) {
     LKP_E();
             
             LKP_B("attn_out");
+#if LK_FUSE_NORM
+    k_gemv_q4_0_norm<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
+                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1,
+                ffn_norm_epi(e, l)); LKP_E();
+#else
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1); LKP_E();
+#endif
             LK_STEP("attention");
         }
 
         // ---- channel mixer --------------------------------------------
+#if LK_FUSE_NORM
+        // The norm already ran inside whichever projection produced e.x
+        // (shortconv_out or attn_out, above).  LK_STEP is kept so the phase
+        // still appears in the timing breakdown.
+        LKP_B("norm_ffn"); LKP_E();
+#else
         LKP_B("norm_ffn");
     // the f32 form is the router's input and exists only in MoE layers; the
     // fp16 form is never read anywhere in the engine.
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.ffn_norm), LK_HIDDEN, LK_EPS,
                                               l.is_moe ? e.h : nullptr, nullptr, e.xq); LKP_E();
+#endif
         LK_STEP("ffn-norm");
 
         if (!l.is_moe) {

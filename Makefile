@@ -17,11 +17,16 @@ ARCH      := -gencode arch=compute_86,code=sm_86
 SPLIT     ?= 128
 TARGET_N  ?= 64
 SPLIT_MIN ?= 8
+# Phase 4x fusion switches.  FUSE_NORM=1 was measured 1.6% SLOWER on
+# interleaved A/B and is off; see the note in kernels.cuh.  The switch is kept
+# so the negative result stays reproducible with one flag.
+FUSE_NORM ?= 0
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
 NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \
              -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
-             -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN)
+             -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN) \
+             -DLK_FUSE_NORM=$(FUSE_NORM)
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
 BUILD     := build
 
@@ -83,6 +88,12 @@ $(BUILD)/test_attn: tests/test_attn.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp |
 
 test-attn: $(BUILD)/test_attn
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_attn
+
+$(BUILD)/test_normfuse: tests/test_normfuse.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_normfuse.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+test-normfuse: $(BUILD)/test_normfuse
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_normfuse
 
 $(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
@@ -147,7 +158,7 @@ gate-c1a: engine oracle-tools
 gate-c2: engine oracle-tools
 > @python3 tools/perplexity.py ppl_natural.bin 200
 
-all: devinfo test_quant test_kernels test_attn engine oracle-tools
+all: devinfo test_quant test_kernels test_attn test_normfuse engine oracle-tools
 
 # Gate G2: every kernel primitive verified against an independent reference.
 test-all: test-quant test-kernels

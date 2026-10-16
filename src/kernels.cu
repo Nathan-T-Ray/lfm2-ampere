@@ -138,9 +138,27 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 }
 
 // ---------------------------------------------------------------------------
-__global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
-                            const block_q8_1 * __restrict__ xq,
-                            int out_rows, int bpr, float * __restrict__ y, int add_residual) {
+// Phase 4x: the Q4_0 GEMV with an optional RMSNorm epilogue folded in.
+//
+// See kernels.cuh for why.  The epilogue is the tail of k_rmsnorm_q8_1's
+// n == 2048 path, moved into the block that happens to finish last.  The
+// thread-to-element mapping is kept identical to that kernel (thread `tid`
+// owns elements tid + 256j, which is exactly Q8_1 block (tid>>5) + 8j), so the
+// quantisation itself is unchanged; only the reduction tree that produces
+// `inv` differs, and it is deterministic.
+//
+// The done-counter is a plain device counter shared by every call site.  That
+// is safe because all of them are stream-ordered and the last block resets it
+// before exiting, but it means the reset is load-bearing: if the last block
+// fails to run, the epilogue is skipped silently on the next replay.  A stale
+// counter produces plausible output, not a crash, which is why
+// tests/test_normfuse.cu drives two consecutive replays rather than one.
+template <bool NORM_EPILOGUE>
+__device__ __forceinline__ void k_gemv_q4_0_t(const uint4 * __restrict__ qs,
+                              const __half * __restrict__ d,
+                              const block_q8_1 * __restrict__ xq,
+                              int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                              LKNormEpilogue ne) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     const int row0 = warp * LK_GEMV_ROWS;
@@ -161,14 +179,92 @@ __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __rest
         }
     }
     // row0 is warp-uniform, so these reductions are reached by every lane
+    float v[LK_GEMV_ROWS];
 #pragma unroll
     for (int r = 0; r < LK_GEMV_ROWS; ++r) {
         const int row = row0 + r;
+        v[r] = 0.0f;
         if (row < out_rows) {
             const float a = warp_sum(acc[r]);
-            if (lane == 0) y[row] = add_residual ? (y[row] + a) : a;
+            if (NORM_EPILOGUE) {
+                // warp_sum returns the total to every lane, so all 32 lanes
+                // compute the same v and the sum of squares can be formed
+                // without another shuffle.
+                v[r] = add_residual ? (y[row] + a) : a;
+                if (lane == 0) y[row] = v[r];
+            } else {
+                if (lane == 0) y[row] = add_residual ? (y[row] + a) : a;
+            }
         }
     }
+
+    if (!NORM_EPILOGUE) return;
+
+    static_assert(LK_GEMV_ROWS == 1,
+                  "the fused norm epilogue assumes one output row per warp");
+    static_assert(LK_GEMV_BLOCKS(LK_HIDDEN) == LK_NORM_PARTIALS,
+                  "LK_NORM_PARTIALS must equal the block count of a 2048-row GEMV");
+
+    __shared__ float s_warp[8];
+    __shared__ int   s_last;
+    __shared__ float s_ss;
+    __shared__ float s_red[LK_NORM_PARTIALS];
+
+    if (lane == 0) {
+        float sq = 0.0f;
+#pragma unroll
+        for (int r = 0; r < LK_GEMV_ROWS; ++r) sq += v[r] * v[r];
+        s_warp[threadIdx.x >> 5] = sq;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) s += s_warp[i];
+        ne.partial[blockIdx.x] = s;
+        // Required: without it the last block may read a partial written by a
+        // block that has incremented the counter but whose store has not
+        // reached L2 yet.  This is the standard threadfence-reduction pattern.
+        __threadfence();
+        s_last = (atomicAdd(ne.ctr, 1u) == (unsigned) gridDim.x - 1u);
+    }
+    __syncthreads();
+    if (!s_last) return;
+
+    // ---- last block out ---------------------------------------------------
+    s_red[threadIdx.x] = ne.partial[threadIdx.x];
+    __syncthreads();
+#pragma unroll
+    for (int o = LK_NORM_PARTIALS / 2; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) s_red[threadIdx.x] += s_red[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { s_ss = s_red[0]; *ne.ctr = 0u; }
+    __syncthreads();
+
+    const float inv = rsqrtf(s_ss / (float) out_rows + ne.eps);
+    const int wp = threadIdx.x >> 5, ln = threadIdx.x & 31;
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        const int i0 = threadIdx.x + j * 256, i1 = threadIdx.x + (j + 1) * 256;
+        const float t0 = y[i0] * inv * ne.w[i0];
+        const float t1 = y[i1] * inv * ne.w[i1];
+        if (ne.y32) { ne.y32[i0] = t0; ne.y32[i1] = t1; }
+        if (ne.yq8) quantize_q8_1_warp2(t0, t1, ne.yq8 + wp + 8 * j, ne.yq8 + wp + 8 * j + 8, ln);
+    }
+}
+
+__global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                            const block_q8_1 * __restrict__ xq,
+                            int out_rows, int bpr, float * __restrict__ y, int add_residual) {
+    k_gemv_q4_0_t<false>(qs, d, xq, out_rows, bpr, y, add_residual, LKNormEpilogue{});
+}
+
+__global__ void k_gemv_q4_0_norm(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                                 LKNormEpilogue ne) {
+    k_gemv_q4_0_t<true>(qs, d, xq, out_rows, bpr, y, add_residual, ne);
 }
 
 // ---------------------------------------------------------------------------
