@@ -50,14 +50,26 @@ NORM_ACCUM ?= 1
 NORM_GEMV  ?= 1
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
+# FP16 range audit: records min/max of block_q8_1's ds.x and ds.y over a real
+# run.  AUDIT=1 puts atomics in the quantisation hot path, so it is MEASUREMENT
+# ONLY -- never benchmark an AUDIT=1 build.  Gate: `make AUDIT=1 engine` then
+# run and read the "FP16 RANGE AUDIT" block.  See ARCHITECTURE.md 9.1.
+AUDIT     ?= 0
 NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \
              -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
              -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN) \
              -DLK_FUSE_NORM=$(FUSE_NORM) -DLK_FUSE_ROUTER=$(FUSE_ROUTER) \
              -DLK_ROUTER_PRO=$(ROUTER_PRO) -DLK_ABLATE_SMALL=$(ABLATE_SMALL) -DLK_ROUTER_UNROLL=$(ROUTER_UNROLL) -DLK_PF_LOAD=$(PF_LOAD) \
-             -DLK_GEMV_BIGBLOCK=$(BIGBLOCK) \
+             -DLK_GEMV_BIGBLOCK=$(BIGBLOCK) -DLK_NORM_AUDIT=$(AUDIT) \
              -DLK_NORM_PROD_ACCUM=$(NORM_ACCUM) -DLK_NORM_PROD_GEMV=$(NORM_GEMV)
-LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
+LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm -Wl,--build-id=none
+# --build-id=none is REQUIRED for the reproducibility claim in ARCHITECTURE.md
+# section 0 to be true.  Without it the linker regenerates a 25-byte
+# .note.gnu.build-id on every link, so the file md5 changes while every code
+# section stays byte-identical -- verified by `cmp`: 25 differing bytes out of
+# 989688, the first inside .note.gnu.build-id, with .text and .rodata identical
+# across rebuilds.  An earlier "md5-identical" check passed only because make
+# reused a cached kernels.o and never relinked.
 BUILD     := build
 
 .PHONY: help all check-cuda devinfo test-all clean
@@ -200,6 +212,18 @@ bench-shapes: $(BUILD)/bench_shapes
 # before believing any per-kernel profile.
 bench-launch: $(BUILD)/bench_launch
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_launch
+
+$(BUILD)/bench_megakernel: tests/bench_megakernel.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
+
+# THE megakernel gate.  bench_launch part (8) measured the per-node toll as
+# ADDITIVE, so the 0.268 ms of 343 kernel boundaries is real and removing it
+# gives 500.5 tok/s.  But a megakernel does not delete the dependency, it MOVES
+# it -- a boundary becomes a flag plus a __threadfence.  This prices that
+# handoff against the boundary it would replace.  If the handoff is not clearly
+# cheaper, the megakernel is closed before it is designed.
+bench-megakernel: $(BUILD)/bench_megakernel
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_megakernel
 
 # --- gates ------------------------------------------------------------------
 # C1  greedy parity vs llama.cpp

@@ -775,6 +775,10 @@ int main(int argc, char ** argv) {
     g_debug_steps = getenv("LK_DEBUG_STEPS") ? atoi(getenv("LK_DEBUG_STEPS")) : 0;
     Engine * e = engine_create(pack, max_seq);
     printf("liquid-kernel engine ready: 40 layers, max_seq=%d\n", max_seq);
+#if LK_NORM_AUDIT
+    lk_audit_init();
+    printf("FP16 RANGE AUDIT BUILD: recording min/max of ds.x and ds.y\n");
+#endif
 
     cudaStream_t st; CK(cudaStreamCreate(&st));
 
@@ -942,5 +946,49 @@ int main(int argc, char ** argv) {
     printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f\n",
            (int)toks.size() + done, done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
            100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0);
+
+#if LK_NORM_AUDIT
+    // ARCHITECTURE.md 9.1 / REBRIEF A6.  Phase 4y's scale invariance is exact in
+    // fp32 but block_q8_1 stores BOTH fields as fp16, so it holds only while they
+    // stay in range.  A min/max RANGE is not enough to judge it: what decides the
+    // risk is how MANY blocks sit below the fp16 normal floor, because there
+    // fp16(d) carries only a couple of bits and inv*fp16(d) stops matching
+    // fp16(inv*d).  So the distribution is counted, not just the extremes.
+    {
+        float au[8];
+        lk_audit_read(au);
+        const double SUBN = 6.103515625e-5;      // fp16 smallest NORMAL
+        const double SUBS = 5.9604644775390625e-8; // fp16 smallest subnormal
+        const double FMAX = 65504.0;             // fp16 largest finite
+        const double n    = au[3];
+        printf("\n=== FP16 RANGE AUDIT (%.0f Q8_1 blocks = %.0f per token) ===\n",
+               n, n / (double) done);
+        printf("  ds.x = d    min %.4e   max %.4e   mean %.4e\n", au[0], au[1],
+               n > 0 ? au[6] / n : 0.0);
+        printf("  ds.y = SUM  max|.| %.4e\n", au[2]);
+        printf("  d   below the fp16 NORMAL floor %.4e : %.4f%% of blocks\n",
+               SUBN, 100.0 * au[4] / (n > 0 ? n : 1.0));
+        printf("  d   below 1e-6 (<= %.0f subnormal quanta)     : %.4f%% of blocks\n",
+               1.0e-6 / SUBS, 100.0 * au[5] / (n > 0 ? n : 1.0));
+        printf("  SUM headroom below the fp16 finite max %.0f: %.0fx\n", FMAX, FMAX / au[2]);
+        printf("  d   headroom above the fp16 subnormal floor %.3e: %.1fx\n",
+               SUBS, au[0] / SUBS);
+        if (n <= 0.0f) {
+            printf("  VERDICT: NO BLOCKS OBSERVED -- instrument not wired in\n");
+        } else if (au[0] <= SUBS) {
+            printf("  VERDICT: *** d REACHES ZERO -- fp16 cannot represent it ***\n");
+        } else if (au[4] > 0.0f) {
+            printf("  VERDICT: SUM is safe (%.0fx); d ENTERS THE SUBNORMAL RANGE for\n"
+                   "           %.4f%% of blocks.  d stays representable, but below the\n"
+                   "           normal floor inv*fp16(d) and fp16(inv*d) diverge, so the\n"
+                   "           scale invariance is APPROXIMATE there, not exact.  The\n"
+                   "           open question is the WEIGHT those blocks carry, which a\n"
+                   "           range instrument cannot answer -- see REBRIEF A6.\n",
+                   FMAX / au[2], 100.0 * au[4] / n);
+        } else {
+            printf("  VERDICT: SAFE -- both fields stay in the fp16 NORMAL range\n");
+        }
+    }
+#endif
     return 0;
 }

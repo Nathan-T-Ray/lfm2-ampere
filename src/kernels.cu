@@ -1,6 +1,38 @@
 #include "kernels.cuh"
 #include <cstdio>
 
+#if LK_NORM_AUDIT
+// ---------------------------------------------------------------------------
+// FP16 range audit storage.  quant.cuh says what is being checked and why.
+// The counter is a float so one atomicAdd covers it; it stays exact far past
+// the 1.8M blocks a 558-token corpus produces.
+// ---------------------------------------------------------------------------
+__device__ float g_audit[8] = {3.0e38f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+__device__ void lk_audit_hook(float d, float s) {
+    atomicMin((int *) &g_audit[0], __float_as_int(d));
+    atomicMax((int *) &g_audit[1], __float_as_int(d));
+    atomicMax((int *) &g_audit[2], __float_as_int(fabsf(s)));
+    atomicAdd(&g_audit[3], 1.0f);
+    // A min/max range alone cannot say whether a subnormal excursion matters:
+    // it is the COUNT of affected blocks that decides that.  6.1035e-5 is the
+    // fp16 normal floor and 5.96e-8 the subnormal floor, so d is representable
+    // throughout -- but below the normal floor it carries only a few bits.
+    if (d < 6.103515625e-5f) atomicAdd(&g_audit[4], 1.0f);
+    if (d < 1.0e-6f)         atomicAdd(&g_audit[5], 1.0f);
+    atomicAdd(&g_audit[6], d);
+}
+
+void lk_audit_init() {
+    const float v[8] = { 3.0e38f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    cudaMemcpyToSymbol(g_audit, v, sizeof(v));
+}
+
+void lk_audit_read(float out[8]) {
+    cudaMemcpyFromSymbol(out, g_audit, 8 * sizeof(float));
+}
+#endif
+
 // ---------------------------------------------------------------------------
 __global__ void k_rmsnorm(const float * __restrict__ x, const float * __restrict__ w,
                           int n, float eps,

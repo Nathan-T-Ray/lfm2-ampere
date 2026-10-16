@@ -31,8 +31,26 @@ not be re-measured it says so.
 | single-stream with triggered speculation, 7-workload average | break-even, 0.96x of the bar (§13.4) |
 | C2 accuracy, re-measured live | **0.0140%** from exact float64 against a 0.1% gate — **PASS**; llama.cpp is 0.2199% from the same reference |
 
-Build reproducibility: `make engine` from the committed tree reproduces
-`build/engine` **md5-identical** (`e3051b18b27b1fb08e0d1f288bed68a0`).
+Build reproducibility, **corrected in §13.8**. The claim used to read
+"`make engine` reproduces `build/engine` md5-identical
+(`e3051b18b27b1fb08e0d1f288bed68a0`)". **That was false, and the check that
+appeared to confirm it passed by accident.** Three facts, all measured:
+
+* nvcc/`ptxas` here is fully deterministic: `.text` is byte-identical across
+  repeated full rebuilds (`676bef6064748e665f27f881ca21ec66`, three times).
+* The whole-file md5 was **not** stable, because the linker regenerates a
+  25-byte `.note.gnu.build-id` on every link. `cmp` on two rebuilds found
+  **exactly 25 differing bytes out of 989688**, the first inside that note, with
+  `.text` and `.rodata` identical.
+* The earlier check passed because `make` reused a cached `kernels.o` and never
+  relinked. **A reproducibility test that does not force a relink tests nothing.**
+
+LDFLAGS now carries `-Wl,--build-id=none`, and the claim is true and
+falsifiable: **three consecutive full rebuilds give
+`244f08c71c57149df6185d3d92bc4c32`.** The built engine is also 7/7
+bit-identical in behaviour to the pre-Phase-4z.7 binary (`tools/ab.py`), and the
+FP16-audit hooks of §13.8 compile to *nothing* at `AUDIT=0` — committed tree and
+edited tree produce byte-identical `.text`.
 
 Re-measured gates, all PASS: G2 dots 8/8, G2 kernels, G6 attention, G7 normfuse,
 G8 normscale. Bit-identity of the shipped build against the T1-only build: 7/7
@@ -1505,3 +1523,104 @@ such requirement, which is why batching is the easier of the two to build.
    prompt-lookup gives 0.40. A drafter costing < 0.26 of a step is now viable in
    principle, but **no QAD sibling checkpoint exists**, so `p1` for any public
    small model is unknown and probably poor.
+
+### 13.8 THE FP16 RANGE AUDIT (open item §9.1, carried since Phase 4y) — RUN
+
+The one genuine reviewer hole. Phase 4y carries a scale invariance through
+`block_q8_1`, whose `ds.x` and `ds.y` are **fp16**; the argument is exact in fp32
+but only holds while both fields stay in range. Now instrumented:
+`make AUDIT=1 engine` records min/max/mean of `d`, max `|SUM|`, and **counts the
+blocks below the fp16 normal floor** — because a range alone cannot say whether a
+subnormal excursion matters, and the count can.
+
+Seven cases, `ngen=192`:
+
+```
+                                 range across the 7 cases
+  ds.y = SUM   max|.|            3.9e+01 .. 9.9e+01     headroom 660 .. 1661x
+  ds.x = d     min               1.61e-07 .. 1.83e-07   headroom above the
+                                                        subnormal floor 2.7 .. 3.1x
+  ds.x = d     mean              ~1.01e-03 .. 1.11e-03  ~17x ABOVE the normal floor
+  d below the fp16 normal floor  13.73% .. 15.19% of blocks
+  d below 1e-6 (<=17 quanta)     0.095% .. 0.109% of blocks
+```
+
+**Answer: the overflow concern was unfounded and the subnormal concern is real
+but bounded.**
+
+* `SUM` never approaches 65504 — a 660x margin at worst. That half of the hole is
+  closed outright.
+* `d` **does enter the fp16 subnormal range, for ~14% of blocks**, on every case.
+  This was not predicted; the expectation was "safe by a wide margin" and that
+  expectation was **wrong for `d`**. It never reaches zero (2.7x above the
+  subnormal floor), so it stays representable — but below the normal floor
+  `inv*fp16(d)` and `fp16(inv*d)` diverge, so the invariance is *approximate*
+  there rather than exact.
+* Those blocks are small by construction: `d = amax/127`, so `d ~ 1.7e-7` means
+  `amax ~ 2.2e-5`, roughly 1000x below the typical block (`mean d ~ 1.1e-3`).
+  Their weighted contribution to the induced error is
+  `0.14 x 1e-3 x 0.17 ~ 2.4e-5 = 0.0024%` — two orders below the 0.1% C2 gate and
+  consistent with the measured **0.0140%**.
+
+**Stated honestly:** the 0.0024% is *estimated from* the measured distribution,
+not itself measured. The measured facts are the 14%, the 2.8x subnormal headroom
+and the 1.07e-3 mean. An audit that measured the induced error directly would
+still be worth having, and is the sharpened form of A6.
+
+### 13.9 THE INTRA-KERNEL HANDOFF, MEASURED — THE MEGAKERNEL IS JUSTIFIED
+
+§13.5 established that the per-node toll is **additive**, so the 0.268 ms of
+boundaries is real and unfilled. But a megakernel does not delete the
+dependency, it *moves* it: a kernel boundary becomes an L2 flag plus a
+`__threadfence()`. Nothing had priced that. `tests/bench_megakernel.cu` does:
+S stages x 504 blocks (all resident, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`),
+identical traffic and identical indexing across five variants, so the only
+difference is *how stage s is ordered against stage s-1*.
+
+```
+ slab     S   MB tot    graph   m1 BASE   m2 self  m4 cross  m3 grid |  boundary  h cross  gridbar
+ 8 KB   130      512    784.0     583.3     595.6     614.7   596.3 |     1.544    0.242    0.100
+32 KB    32      504    619.2     567.2     568.7     571.4   569.0 |     1.625    0.131    0.056
+128 KB   16     1008   1155.1    1122.6    1122.0    1123.3  1124.0 |     2.027    0.043    0.085
+512 KB   16     4032   4544.2    4477.8    4474.9    4475.9  4475.2 |     4.147   -0.120   -0.163
+                                                          (us, per stage, vs mode 1)
+```
+
+**A kernel boundary costs 1.54–2.03 µs per stage. A real cross-block handoff
+costs 0.13–0.24 µs.** The handoff is **6–12x cheaper** than the boundary it would
+replace. (The 512 KB row is too noisy to use — the graph spread was 136 µs on a
+4.5 ms run — and is shown only for completeness.)
+
+**Two traps this instrument only avoided because a first version was run and was
+wrong**, and both are worth recording:
+
+1. **A "no synchronisation at all" control is not a valid baseline.** The first
+   version compared against a variant with no flag write, and that control
+   measured *slower* than the treatment by up to 4% — it differed in something
+   other than the thing being measured. The baseline is now mode 1, which is
+   instruction-identical to the treatment except for the spin.
+2. **A block waiting on its OWN flag never waits.** It set that flag itself one
+   stage earlier, so the spin falls straight through. `m2 self` measures
+   0.095/0.046/0.0 µs — i.e. nothing — which is exactly right and is why mode 4
+   waits on *another* block's flag.
+
+**What it means for the estimate.** The engine's own toll average is
+0.781 µs/node:
+
+```
+  against the engine's own toll : 343 x (0.781 - 0.15) = 0.216 ms  ->  489 tok/s
+  against the busy-graph boundary: 343 x (1.54  - 0.15) = 0.477 ms  ->  553 tok/s
+```
+
+**489–553 tok/s, straddling 500.** Both ends are soft in the same direction: the
+synthetic workload has no straggler skew, so both the boundary *and* the handoff
+here are **lower bounds** — in the engine a consumer waits on a producer doing
+different work.
+
+> **VERDICT: the megakernel premise survives, and designing it is justified.**
+> The toll alone lands at 489–553; clearing 500 robustly needs the persistent
+> kernel to also hide part of the 0.221 ms of small-kernel execution — which is
+> precisely what a single persistent kernel makes possible and a graph cannot.
+> The measured design risk is unchanged and real: this project's own law is that
+> a barrier in front of a bandwidth-critical kernel loses (`FUSE_ROUTER`
+> 0.09–0.39%, `T4r` 0.17%, `T2` 1.75% — three attempts, three losses).

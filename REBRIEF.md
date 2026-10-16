@@ -460,13 +460,22 @@ does not match (embedding correlation **−0.036**), so `p1` for any public smal
 model is unknown and probably poor. **Give me a concrete, buildable drafter for
 this checkpoint, or say there is none.**
 
-**A2 — the toll, now measured.** Section 5 shows the per-node toll is **additive**
-(`busy = empty_toll + pure_transfer`), so removing it reaches **500.5 tok/s** on
-paper. The untested step is whether an **intra-kernel handoff** costs less than a
-kernel boundary's 0.78 µs. Design that microbenchmark: two dependent stages, one
-flag, one fence, inside one persistent kernel, against the same two stages as two
-graph nodes. If the handoff is not clearly cheaper, say so and **close the
-megakernel before it is built.**
+**A2 — the toll AND the handoff: BOTH NOW MEASURED. ANSWERED.** Section 5 shows
+the per-node toll is additive. The follow-up -- is an intra-kernel handoff cheaper
+than the boundary it replaces? -- is now measured by `tests/bench_megakernel.cu`:
+
+```
+  kernel boundary        1.54 - 2.03 us/stage
+  cross-block handoff    0.13 - 0.24 us/stage   ->  6-12x cheaper
+  self-flag handoff      ~0.0 us   (it never waits; it set its own flag)
+  grid barrier           0.06 - 0.10 us/stage
+```
+
+**The megakernel premise survives and designing it is justified.** Net of the
+handoff, 343 nodes recover 0.216-0.477 ms = **489-553 tok/s, straddling 500.**
+NEW A2: both figures are LOWER bounds, because the synthetic workload has no
+straggler skew and the engine does. A version with deliberately skewed producers,
+so a consumer waits on a slower peer, would tighten the range.
 
 **A3 — the bracket.** Section 1.3 brackets `RAMP` and `SMALL` because their
 scaling with pass size is unknown. Which end is right, and what measurement
@@ -478,12 +487,19 @@ kernels at 1x and 4x token counts would do it.
 reusable — if there is any reason the first position of a pass must recompute
 its own logits — the correction is wrong and every bar above moves back up.
 
-**A5 — the fp16 range audit, still never run.** `ARCHITECTURE.md §9.1`. Phase 4y
-carries a scale invariant through `block_q8_1`'s `ds.x`/`ds.y` on the claim
-`dot(inv*u) = inv*dot(u)`. That is an *assumption* about fp16 range, not a
-measurement. Construct an input that drives `ds.x` or `ds.y` out of range given
-the architecture, or run the audit. This is the one genuine reviewer hole I know
-of.
+**A5 — the fp16 range audit: RUN. PARTLY ANSWERED, AND IT FOUND SOMETHING.**
+`make AUDIT=1 engine` now exists and counts the distribution, not just the range.
+Seven cases: `SUM` never approaches 65504 (660-1661x margin), so the overflow half
+of the hole is **closed**. But **`d` enters the fp16 SUBNORMAL range for ~14% of
+blocks on every case** (min 1.6-1.8e-7 against a 6.10e-5 normal floor, 2.7-3.1x
+above the subnormal floor). The prior expectation was "safe by a wide margin" and
+that was **wrong for `d`**. Those blocks have `amax ~ 2.2e-5`, ~1000x below the
+1.1e-3 mean, so the induced error *estimates* at ~0.0024% -- two orders under the
+0.1% C2 gate and consistent with the measured 0.0140%.
+
+**The 0.0024% is an estimate, not a measurement.** SHARPENED A5: an audit that
+measures the *induced error* directly -- `dot(q4, q8_1(inv*u))` against
+`inv*dot(q4, q8_1(u))` on real activations -- rather than reporting ranges.
 
 **A6 — bit-identity.** Is the section 4 rule *sufficient* for bit-identity, not
 just necessary? Specifically: does `warp_sum` depend on the warp's *identity*

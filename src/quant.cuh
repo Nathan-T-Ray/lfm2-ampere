@@ -30,6 +30,38 @@ struct block_q8_1 {
 };
 static_assert(sizeof(block_q8_1) == 36, "block_q8_1 must be 36 bytes");
 
+// ---------------------------------------------------------------------------
+// FP16 RANGE AUDIT (ARCHITECTURE.md 9.1 / REBRIEF A6).
+//
+// Phase 4y carries a scale invariance through this struct: with
+// ds.x = d = amax/127 and ds.y = SUM = the raw 32-element sum, both fields are
+// LINEAR in a positive scalar applied to the activations, and `qs` is invariant
+// -- so dot(inv*u) = inv*dot(u) and the RMSNorm's 1/rms can be applied once per
+// output row instead of once per element.
+//
+// That argument is exact in fp32.  The FIELDS ARE fp16, so it holds only while
+// both stay in range:
+//
+//     d   underflows to subnormal below 6.104e-5 and overflows to inf above 65504
+//     SUM overflows to inf above 65504
+//
+// Subnormal d loses mantissa bits; SUM at 65504 with 32 addends of order 1e3 is
+// reachable in principle.  Neither is visible in a benchmark or a loss curve --
+// they would show up as a slowly degrading accuracy that looks like a precision
+// limit.  So it is MEASURED over the real corpus rather than argued.
+//
+// For non-negative floats the IEEE bit pattern orders the same way the
+// corresponding unsigned integer does, so atomicMin/Max on the reinterpreted
+// bits is a valid float min/max.  The hook is a hook rather than an inline body
+// so the counter lives in exactly one translation unit.
+// ---------------------------------------------------------------------------
+#if LK_NORM_AUDIT
+__device__ void lk_audit_hook(float d, float s);
+#define LK_AUDIT_D(d, s) lk_audit_hook((d), (s))
+#else
+#define LK_AUDIT_D(d, s) ((void) 0)
+#endif
+
 // __dp4a is overloaded: (int,int,int) does SIGNED int8 x int8, whereas
 // (unsigned,unsigned,unsigned) does unsigned u8 x u8.  Our Q8_1 activations are
 // int8 and go negative, so the SIGNED overload is mandatory -- the unsigned one
@@ -66,6 +98,8 @@ __device__ __forceinline__ void quantize_q8_1_warp2(const float x0, const float 
     if (lane == 0) {
         y0->ds = __floats2half2_rn(d0, s0);
         y1->ds = __floats2half2_rn(d1, s1);
+        LK_AUDIT_D(d0, s0);
+        LK_AUDIT_D(d1, s1);
     }
 }
 
@@ -83,7 +117,7 @@ __device__ __forceinline__ void quantize_q8_1_warp(const float xi, block_q8_1 * 
     const float d = __uint_as_float(am) / 127.0f;
     const int8_t q = (am == 0u) ? (int8_t)0 : (int8_t)roundf(xi / d);
     y->qs[lane] = q;
-    if (lane == 0) y->ds = __floats2half2_rn(d, sum);
+    if (lane == 0) { y->ds = __floats2half2_rn(d, sum); LK_AUDIT_D(d, sum); }
 }
 
 // ---------------------------------------------------------------------------

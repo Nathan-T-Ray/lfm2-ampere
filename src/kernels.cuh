@@ -709,3 +709,13 @@ __global__ void k_moe_down_accum(const uint4 * __restrict__ qs, const __half * _
                                  int out_rows, int bpr, int rows_per_expert, int xq_stride,
                                  const int * __restrict__ d_idx, const float * __restrict__ d_w,
                                  float * __restrict__ dst, LKNormProd np);
+
+// ---------------------------------------------------------------------------
+// FP16 range audit host interface (ARCHITECTURE.md 9.1 / REBRIEF A6).
+// Built only with -DLK_NORM_AUDIT=1, so a normal build carries no symbols and
+// no atomics in the quantisation hot path.
+// ---------------------------------------------------------------------------
+#if LK_NORM_AUDIT
+void lk_audit_init();
+void lk_audit_read(float out[8]);   // min d, max d, max|SUM|, n, n_subnormal, n<1e-6, sum d
+#endif
