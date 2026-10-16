@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include "kernels.cuh"
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
   printf("CUDA error %s at line %d\n", cudaGetErrorString(e_), __LINE__); return 1; } } while (0)
@@ -134,6 +135,72 @@ int main() {
         Res k = run_windowed(7077888ull, s.b, s.t, 300, 1);
         printf("   %-18s %10.2f %10.1f %10.2f %10.1f   %s\n",
                "", u.us, 7077888.0 / u.us / 1000.0, k.us, 7077888.0 / k.us / 1000.0, s.note);
+    }
+    printf("\n");
+
+    // =====================================================================
+    // E. Occupancy and wave quantization.
+    //
+    // GA102 allows 1536 threads per SM, not 2048, so a 1024-thread block fits
+    // ONE per SM (66.7% occupancy) while a 256-thread block fits six (100%).
+    // The question this answers is whether that matters, and if so whether it
+    // is the block WIDTH or the resulting WAVE COUNT.
+    //
+    // T2 lost 1.75% at <<<(48,4),1024>>>: 192 blocks, 1 block/SM, 84 blocks per
+    // wave, 2.29 waves -- so at each wave boundary the whole SM drains before
+    // the next block loads.  But bench_ovh's own (64,1024) case is fine, and it
+    // is also a 1024-thread block: 64 blocks is 0.76 waves, so it never reaches
+    // a boundary.  That points at wave count, not width, and this measures it.
+    printf("== E1. the occupancy limit ==\n\n");
+    printf("   maxThreadsPerMultiProcessor = %d   (maxThreadsPerBlock = %d)\n",
+           prop.maxThreadsPerMultiProcessor, prop.maxThreadsPerBlock);
+    printf("   a 1024-thread block fits %d per SM; 512 fits %d; 256 fits %d\n\n",
+           prop.maxThreadsPerMultiProcessor / 1024,
+           prop.maxThreadsPerMultiProcessor / 512,
+           prop.maxThreadsPerMultiProcessor / 256);
+
+    printf("== E2. the same 7.078 MB read at matched threads and matched grid ==\n\n");
+    printf("   %-12s %9s %7s %9s %7s %10s %9s\n",
+           "grid x blk", "threads", "blk/SM", "resident", "waves", "unbr us", "GB/s");
+    const Shape waves[] = {
+        {   64, 1024, "1 wave, 1024-thr block -- T1 and Phase 4y both WIN here"},
+        {  192, 1024, "T2's shape: 2.29 waves at 1 blk/SM"},
+        {  192,  512, "same grid, 3 blk/SM -> 0.76 waves"},
+        {  384,  512, "same THREADS as 192x1024, 1.52 waves"},
+        {  768,  256, "equilibrium: 6 blk/SM, 1.52 waves"},
+        { 1536,  256, "moe_gate_up today, 3.05 waves"},
+    };
+    for (const Shape & s : waves) {
+        const int per_sm   = prop.maxThreadsPerMultiProcessor / s.t;
+        const int resident = per_sm * NSM;
+        char nm[24]; snprintf(nm, sizeof nm, "%dx%d", s.b, s.t);
+        Res u = run_windowed(7077888ull, s.b, s.t, 300, 0);
+        printf("   %-12s %9d %7d %9d %7.2f %10.2f %9.1f   %s\n",
+               nm, s.b * s.t, per_sm, resident, (double)s.b / resident, u.us,
+               7077888.0 / u.us / 1000.0, s.note);
+    }
+    printf("\n");
+
+    // =====================================================================
+    printf("== E3. occupancy of the REAL kernels (what the thread limit allows) ==\n\n");
+    printf("   %-22s %7s %8s %12s   %s\n", "kernel", "block", "blk/SM", "threads/SM", "note");
+    struct K { const char * n; const void * f; const char * note; };
+    const K ks[] = {
+        { "k_moe_down_accum", (const void *)k_moe_down_accum, "T1, <<<64,1024>>>" },
+        { "k_gemv_q4_0_prod", (const void *)k_gemv_q4_0_prod, "Phase 4y, <<<64,1024>>>" },
+        { "k_gemv_q4_0_exp2", (const void *)k_gemv_q4_0_exp2, "moe_gate_up" },
+        { "k_gemv_q4_0",      (const void *)k_gemv_q4_0,      "the workhorse GEMV" },
+        { "k_read",           (const void *)k_read,           "this probe" },
+    };
+    for (const K & k : ks) {
+        for (int b : { 1024, 512, 256 }) {
+            int n = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k.f, b, 0) != cudaSuccess)
+                continue;
+            printf("   %-22s %7d %8d %12d   %s\n", k.n, b, n, n * b,
+                   n * b < prop.maxThreadsPerMultiProcessor ? "REGISTER-LIMITED below the thread cap"
+                                                            : "at the thread cap");
+        }
     }
     printf("\n");
 

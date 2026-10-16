@@ -169,8 +169,8 @@ bench-norm: $(BUILD)/bench_norm
 bench-small: $(BUILD)/bench_small
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_small
 
-$(BUILD)/bench_ovh: tests/bench_ovh.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
-> $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
+$(BUILD)/bench_ovh: tests/bench_ovh.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_ovh.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
 # The per-launch fixed cost, and whether a small grid still saturates DRAM.
 # The engine's profile table shows GB/s falling monotonically with kernel size
@@ -180,6 +180,15 @@ $(BUILD)/bench_ovh: tests/bench_ovh.cu $(BUILD)/flags.stamp | $(BUILD) check-cud
 # It also gates the 64-block x 1024-thread shapes the planned fusions require.
 bench-ovh: $(BUILD)/bench_ovh
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_ovh
+
+$(BUILD)/bench_shapes: tests/bench_shapes.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_shapes.cu -o $@ $(LDFLAGS)
+
+# The tollbooth floor.  A graph of 343 EMPTY kernels with the engine's exact
+# grids and block sizes measures how much of the step is launch overhead versus
+# latency-bound execution.  The whole Phase 5 (batching) case rests on it.
+bench-shapes: $(BUILD)/bench_shapes
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_shapes
 
 # Gate G3: launch cost, event-bracket cost and graph-replay cost.  Run this
 # before believing any per-kernel profile.

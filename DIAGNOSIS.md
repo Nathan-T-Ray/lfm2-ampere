@@ -1367,3 +1367,112 @@ shape at 737.9 GB/s against 751.0 for the shape it would replace, a 2% penalty
 on a 0.6% prize.  But T2's failure is evidence that a 3x warp-count drop is not
 free even when the pure-read probe says it is, and shortconv_in would drop from
 6144 warps to 2048.  Left undone deliberately, with that reasoning recorded.
+
+
+# Phase 4z.1: the tollbooth floor, and the occupancy cliff that is not there
+
+Two mechanisms were proposed to explain where the engine's non-wire time goes and
+why a planned fusion lost.  One is real but small; the other is refuted.
+
+## The tollbooth is 0.268 ms, not 0.712 ms
+
+The engine's step at ctx 272 is 2.269 ms for 1466.75 MB of weights.  Reading that
+at the measured 941.8 GB/s marginal rate is 1.557 ms, leaving ~0.71 ms
+unexplained.  The claim under test was that this is a fixed toll paid at every
+one of the 343 graph nodes (2.07 us/node), in which case batching M tokens into
+one pass would pay it once instead of M times -- worth ~1.84x for batch-4 rather
+than the 1.51x byte floor, and dropping speculative verification's cost ratio
+from 2.42x to 2.01x.
+
+`tests/bench_shapes.cu` measures it.  It rebuilds the engine's 343 nodes
+programmatically with their EXACT (grid, block), places one EMPTY kernel at each,
+captures them into a graph and times the replay.  Empty bodies preserve the
+grids, block sizes and wave structure, so what is left is launch plus drain and
+nothing else.
+
+    343 nodes, all empty, exact engine shapes
+        graph replay : 0.268 ms/token  =  0.782 us/node
+        as a fraction of the real 2.269 ms step: 11.8%
+
+**The toll is 0.782 us/node, not 2.07.**  The proposed model is 2.65x too large.
+This agrees with what deleting a node is already known to be worth: T1 deleted 38
+nodes for +0.67% (0.40 us/node) and T4r deleted 38 for -0.17%.  If the toll were
+2.07 us, T1 would have gained 3.5%.
+
+So the ~0.71 ms residual is NOT launch overhead.  It is latency-bound execution
+inside the individual kernels, and it does not vanish when you batch -- it
+multiplies with the work.
+
+### What that does to the Phase 5 economics
+
+The step decomposes as 2.269 = 0.268 (toll) + 1.557 (wire) + 0.444 (latency-bound
+execution).  Only the first term amortises across a batch.
+
+    batch-4, 4 independent sequences
+        bytes      4 x 971.7 = 3886.8 MB  ->  4.127 ms wire
+        toll paid once                    ->  0.268 ms
+        execution: 0.444 ms if latency-bound, 1.776 ms if it scales with work
+        total      4.839 .. 6.171 ms for 4 tokens = 827 .. 648 tok/s
+        speedup    1.88x .. 1.47x     (pure byte floor: 1.51x)
+        the proposed 1.84x sits at the optimistic edge, not the middle
+
+    speculative M=4 consecutive, 3550.4 MB -> 3.770 ms wire
+        total      4.482 .. 5.814 ms
+        ratio vs 2.269 ms : 1.98x .. 2.56x
+        break-even 1.98 .. 2.56 accepted tokens of 4 (2.42 was assumed)
+
+**Conclusion: the byte reduction remains the dominant effect of batching.**  The
+proposed 2.01x verification ratio is the best case of a 1.98-2.56 range, and the
+proposed 1.84x batch speedup is the best case of a 1.47-1.88 range.  Batching is
+still the right next move -- 1.5x is the largest lever left -- but not for the
+reason given, and not by as much.
+
+### A second measurement in the same test that did NOT work, recorded so it is not repeated
+
+`bench_shapes` mode 1 gives every node its real byte count and reads it cold, to
+estimate the floor for (shapes + bytes) with no dependencies.  It reports 3.333 ms
+for 1398.70 MB = 440 GB/s, which is SLOWER than the real engine's 646 GB/s on
+more traffic.  The synthetic reconstruction is therefore not faithful: its
+grid-stride read loop is not unrolled, so nodes with a small grid and many bytes
+per thread (router_dot: 2048 threads, 16 iterations each) run at far lower
+memory-level parallelism than the real kernels, which unroll for exactly this
+reason.  Mode 0 is unaffected by any of this, because an empty kernel cannot be
+affected by an access pattern.
+
+## The occupancy cliff is real, and it is worth 1-2%, not 13%
+
+GA102 allows 1536 threads per SM, so a 1024-thread block fits ONE per SM (66.7%
+occupancy) while a 256-thread block fits six (100%).  Nothing in this project had
+ever queried `maxThreadsPerMultiProcessor`; `bench_ovh` now does.
+
+The proposal was that T2's 1.75% loss came from wave quantization: T2 ran
+`<<<(48,4),1024>>>` = 192 blocks at 1 block/SM = 84 blocks per wave = 2.29 waves,
+so each wave boundary drains the whole SM before the next block loads, whereas the
+original `<<<(192,8),256>>>` packs 6 blocks/SM and hides the boundary.
+
+Measured, same 7.078 MB cold read, in `bench_ovh` part E:
+
+    grid x blk   threads   blk/SM  resident  waves   unbr us    GB/s
+    64x1024        65536        1        84   0.76      9.42   751.6
+    192x1024      196608        1        84   2.29      9.35   757.3   <- T2's shape
+    192x512        98304        3       252   0.76      9.39   753.8
+    384x512       196608        3       252   1.52      9.24   765.7   <- same threads as above
+    768x256       196608        6       504   1.52      9.23   767.2
+    1536x256      393216        6       504   3.05      9.21   768.1
+
+**The entire spread across all six configurations is 2.2%**, and T2's exact shape
+is not the slow one.  At matched thread count, 192x1024 (2.29 waves) and 384x512
+(1.52 waves) differ by 1.1%.  Wave quantization is a real effect and it is worth
+1-2%, not the 13% T2 lost.
+
+So T2's failure is not occupancy and not wave count.  It is that fusion halved the
+warp count (12288 -> 6144) while doubling the work per warp, and the resident
+warps fell from 4032 to 2688.  A retry at 512 threads was planned on the strength
+of the occupancy claim and is now dropped, because the claim does not hold.
+
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` on the real kernels adds one more
+fact worth recording: `k_moe_down_accum`, `k_gemv_q4_0_prod`, `k_gemv_q4_0_exp2`
+and `k_gemv_q4_0` are all REGISTER-LIMITED at 1024 threads -- they reach only
+1024 threads/SM against the 1536 cap, and only reach the cap at 512 or 256.  That
+does not change the 64-block kernels (T1, Phase 4y), where block count is what
+limits occupancy and 1024 threads per block is still the right choice.
