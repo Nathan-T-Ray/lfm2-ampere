@@ -206,6 +206,11 @@ struct Engine {
     // every block of moe_gate_up, which is what lets k_router_top4 disappear.
     float *  d_sel = nullptr;    // [64]
     float *  d_sig = nullptr;    // [64]
+    // Speculative L2 prefetch: bytes to pull forward per moe_swiglu call.
+    // 2 MB measured best in a 3-round interleaved sweep (0 / 512K / 1M / 2M /
+    // 4M gave 441.31 / 439.45 / 442.86 / 443.49 / 441.34), and 2 MB then beat 0
+    // in 6 of 7 confirmation rounds.  LK_PF_BYTES overrides it for sweeping.
+    long pf_bytes = 2 * 1024 * 1024;
     float *  d_apv = nullptr;    // [125] argmax stage-1 block winners
     int *    d_api = nullptr;    // [125] their indices
     int *    d_routelog = nullptr; // [max_seq][LK_N_LAYERS][LK_TOP_K], G4b only
@@ -367,6 +372,7 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->d_gate, LK_N_EXPERTS * 4));
     CK(cudaMalloc(&e->d_sel, LK_N_EXPERTS * 4));
     CK(cudaMalloc(&e->d_sig, LK_N_EXPERTS * 4));
+    if (const char * pfb = getenv("LK_PF_BYTES")) e->pf_bytes = atol(pfb);
     CK(cudaMalloc(&e->d_apv, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_idx, LK_TOP_K * 4));
@@ -685,7 +691,12 @@ static void forward(Engine & e, cudaStream_t st) {
     k_route_log<<<1, 32, 0, st>>>(e.d_idx, e.d_pos, il, e.d_routelog); LKP_E();
             }
             LKP_B("moe_swiglu");
-    k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
+    // The prefetch target is moe_down, whose experts are known by now.
+    // PQS(e, l.ed) is the qs plane; geometry matches the k_moe_down_accum call
+    // below (rows_per_expert = LK_HIDDEN, bpr = 48).
+    k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2,
+                                 PQS(e, l.ed), e.d_idx, LK_HIDDEN, 48,
+                                 e.pf_bytes); LKP_E();
             
             // down: each expert consumes its OWN 48-block activation slice.
             // T1: this node also now does what k_moe_accum4 used to do -- weight

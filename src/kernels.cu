@@ -454,7 +454,29 @@ __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql1, const uint8_t
 // 32 and the block size is too, so no warp is ever partially active and the
 // full-mask shuffles inside quantize_q8_1_warp stay well defined.
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
-                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8) {
+                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8,
+                         const uint4 * __restrict__ pf_qs,
+                         const int * __restrict__ pf_idx,
+                         int pf_rows_per_expert, int pf_bpr,
+                         long pf_bytes) {
+    // Speculative L2 prefetch of the NEXT kernel's weights.  The host is this
+    // kernel because it has 12288 threads, an idle memory system, and d_idx is
+    // already known (router_top4 ran before moe_gate_up).  The first wave of
+    // moe_down reads all four selected experts concurrently, so the HEADS of
+    // all four are what is worth pulling in, not one expert in full.
+    if (pf_qs && pf_bytes > 0) {
+        const long expert_bytes = (long)pf_rows_per_expert * pf_bpr * 16;
+        const long per   = pf_bytes / LK_TOP_K;              // bytes per expert
+        const long lines = ((per < expert_bytes ? per : expert_bytes) >> 7);
+        const long tid   = (long)blockIdx.x * blockDim.x + threadIdx.x;
+        const long nthr  = (long)gridDim.x * blockDim.x;
+        for (int k = 0; k < LK_TOP_K; ++k) {
+            const char * base = (const char *)(pf_qs +
+                                 (size_t)pf_idx[k] * pf_rows_per_expert * pf_bpr);
+            for (long i = tid; i < lines; i += nthr) lk_prefetch_l2(base + (i << 7));
+        }
+    }
+
     LK_ABL_SWIGLU;   // LK_ABLATE_SMALL measurement hook
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const float v = silu_f(gate[i]) * up[i];

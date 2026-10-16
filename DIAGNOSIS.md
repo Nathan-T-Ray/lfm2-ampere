@@ -1810,3 +1810,84 @@ Two smaller readings worth keeping:
     subsystem really is idle for roughly a sixth of the token, and that idle
     time is the launch toll and the per-kernel ramps -- the same 0.71 ms, seen
     from the hardware counter instead of from a timer.
+
+
+# Phase 4z.6: speculative L2 prefetch -- the last idea, tried and measured
+
+The ~20% of the token with the memory subsystem idle splits in two (4z.5):
+0.268 ms of launch GAPS, during which no kernel is running and therefore
+nothing can issue a load, and 0.221 ms of small kernels EXECUTING with memory
+going unused.  The second half is fillable in principle -- a kernel is running
+and can issue loads whose results nobody reads.
+
+The prize is bounded by the WINDOW, not by the traffic: filling an idle window
+of T seconds saves at most T, whatever is fetched during it.  So the theoretical
+ceiling was the 0.221 ms itself, i.e. the 488.9 tok/s the 4z.2 ablation already
+measured by a completely different route.  Two independent methods agreeing on
+the same bound was the reason to believe it.
+
+## What was built
+
+`moe_swiglu` is the host: it runs 38 times, has 12288 threads, takes ~1.5 us
+with an idle memory system, and by then `d_idx` is known (router_top4 ran before
+moe_gate_up).  So it can prefetch `moe_down`'s expert weights -- 1.5 MB per
+expert, and since the first wave of moe_down reads all four selected experts
+concurrently, the HEADS of all four are what is worth pulling in.
+
+`LK_PF_BYTES` is a runtime knob so the size could be swept without rebuilding.
+The prefetch consumes nothing, so **tools/ab.py stays 7/7 bit-identical**, which
+is what made this the cheapest remaining idea to prove correct.
+
+## The sweep (interleaved, 3 rounds, ctx 272)
+
+    LK_PF_BYTES    0        512K     1M       2M       4M
+    mean tok/s   441.31    439.45   442.86   443.49   441.34
+    vs off           -      -0.42%   +0.35%   +0.49%   +0.01%
+
+A clean inverted U with an interior optimum.  512K being WORSE than off in all
+three rounds is systematic, not noise -- a partial prefetch adds queue pressure
+without covering enough to help.
+
+Confirmation with 7 interleaved rounds at 0 vs 2M:
+
+    pf=0    mean 441.17   spread 0.13%
+    pf=2M   mean 442.73   spread 1.09%   (6 of 7 rounds ahead)
+
+And isolated against the T1-only build, spreads 0.03% both:
+
+    T1 only        441.75
+    T1 + prefetch  443.23    +0.34%
+
+## The mechanism test, which came out backwards
+
+The obvious worry was that `prefetch.global.L2` is a HINT the memory controller
+may deprioritise below demand loads, so it would never actually use the idle
+window.  `LK_PF_LOAD=1` swaps it for a real `ld.global` whose destination
+register is never read -- demand priority, no scoreboard stall.  Measured:
+
+    prefetch.global.L2 hint   +0.35%
+    real ld.global             0.00%   (441.42 / 441.44, 441.47 / 441.40,
+                                        441.38 / 441.37, 441.45 / 440.41)
+
+**The hint beats the demand load.**  The priority hypothesis was backwards: a
+demand load occupies LSU and scoreboard resources and gains nothing, whereas the
+hint is cheap to issue and does use whatever bandwidth is spare.
+
+## Verdict
+
+**+0.34%, against a theoretical ceiling of 9.7%.**  The prefetch captured about
+14% of the moe_swiglu window and about 3.5% of the total idle window.
+
+So the answer to "can we push memory utilisation to 90%" is: not this way.  The
+dependency-forced idle windows cannot be meaningfully filled by prefetching,
+because the memory system will not service enough hint traffic inside a 1.5 us
+window to matter.  The remaining 0.221 ms is effectively structural, exactly as
+the ablation said it was.
+
+The 0.34% is real, free, and bit-identical, so it is shipped as the default
+(2 MB).  Extending the same pattern to shortconv_conv -> shortconv_out (26 us of
+window) and qk_norm_rope -> attn_out (10 us) would add perhaps another 0.1-0.2%;
+not done, because the mechanism is now understood and the magnitude is known to
+be small.
+
+Final state: **443.2 tok/s at ctx 272**, against 438.8 before Phase 4z.

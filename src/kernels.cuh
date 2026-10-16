@@ -146,6 +146,39 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 #if LK_NORM_PROD_GEMV && !LK_GEMV_BIGBLOCK
 #error "LK_NORM_PROD_GEMV needs LK_GEMV_BIGBLOCK: a block must own a whole Q8_1 block"
 #endif
+// Speculative L2 prefetch.
+//
+// ~20% of the token has the memory subsystem idle: 0.268 ms of launch gaps
+// (nothing running, so nothing can issue a load) and 0.221 ms of small kernels
+// executing with memory going unused.  The second half IS fillable -- a kernel
+// is running and can issue loads nobody consumes -- and the prize is bounded by
+// the window, not by the traffic: filling an idle window of T seconds saves at
+// most T, whatever is fetched during it.
+//
+// This changes NO arithmetic.  Nothing reads the prefetched lines here; it only
+// asks the memory system to start the transfer early so the next kernel finds
+// them in L2 instead of in DRAM.  tools/ab.py must therefore stay 7/7, which
+// makes this the cheapest remaining idea to prove correct.
+// Two mechanisms, because they have different priority in the memory system.
+//   prefetch.global.L2 is a HINT.  It costs no register and blocks nothing,
+//     but the memory controller is free to deprioritise it below demand loads,
+//     which would mean it never actually uses the idle window.
+//   ld.global is a DEMAND access.  It gets normal priority; the thread issues
+//     it and never reads the destination register, so no scoreboard stall.
+#ifndef LK_PF_LOAD
+#define LK_PF_LOAD 0
+#endif
+__device__ __forceinline__ void lk_prefetch_l2(const void * __restrict__ p) {
+#if LK_PF_LOAD
+#pragma nv_diag_suppress 550
+    unsigned int dummy;
+    asm volatile("ld.global.b32 %0, [%1];" : "=r"(dummy) : "l"(p) : "memory");
+    (void)dummy;   // never read: no scoreboard stall, but see the note above
+#else
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+#endif
+}
+
 // LK_ABLATE_SMALL: empty the NON-streaming kernels, keeping their grids and
 // block sizes, to separate their real EXECUTION from their launch cost (which
 // tests/bench_shapes.cu measures separately at 0.268 ms for all 343 nodes).
@@ -429,7 +462,11 @@ __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql, const uint8_t 
 
 // SwiGLU: out[i] = silu(gate[i]) * up[i]
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
-                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8);
+                         int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8,
+                         const uint4 * __restrict__ pf_qs = nullptr,
+                         const int * __restrict__ pf_idx = nullptr,
+                         int pf_rows_per_expert = 0, int pf_bpr = 0,
+                         long pf_bytes = 0);
 
 // ShortConv one-token step.  semantics (verified against llama.cpp lfm2.cpp):
 //   [B|C|x] = in_proj(h);  bx = B*x;

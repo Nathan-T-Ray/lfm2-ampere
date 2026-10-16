@@ -30,6 +30,8 @@ ROUTER_PRO ?= 0
 ABLATE_SMALL ?= 0
 # Router loads in flight per warp.  Bit-identical at every value.
 ROUTER_UNROLL ?= 16
+# Prefetch mechanism: 0 = prefetch.global.L2 hint, 1 = real ld.global
+PF_LOAD ?= 0
 # Phase 4y: fold RMSNorm into the kernel that produces its input, via the
 # scale-invariance of Q8_1 (see kernels.cuh).  Two halves, measured separately:
 #   ACCUM  attn_norm(L>=3) + norm_final into k_moe_accum4 -- no shape change
@@ -52,7 +54,7 @@ NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextr
              -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
              -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN) \
              -DLK_FUSE_NORM=$(FUSE_NORM) -DLK_FUSE_ROUTER=$(FUSE_ROUTER) \
-             -DLK_ROUTER_PRO=$(ROUTER_PRO) -DLK_ABLATE_SMALL=$(ABLATE_SMALL) -DLK_ROUTER_UNROLL=$(ROUTER_UNROLL) \
+             -DLK_ROUTER_PRO=$(ROUTER_PRO) -DLK_ABLATE_SMALL=$(ABLATE_SMALL) -DLK_ROUTER_UNROLL=$(ROUTER_UNROLL) -DLK_PF_LOAD=$(PF_LOAD) \
              -DLK_GEMV_BIGBLOCK=$(BIGBLOCK) \
              -DLK_NORM_PROD_ACCUM=$(NORM_ACCUM) -DLK_NORM_PROD_GEMV=$(NORM_GEMV)
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
