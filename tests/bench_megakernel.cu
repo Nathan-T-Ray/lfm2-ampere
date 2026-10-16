@@ -10,9 +10,9 @@
 // 500.5 tok/s.  That is the whole case for a persistent megakernel.
 //
 // But a megakernel does not delete the dependency -- it MOVES it.  A kernel
-// boundary becomes a flag in L2 plus a __threadfence().  Nobody has priced that
-// handoff on this GPU.  If it costs the same ~0.8-1.6 us the megakernel buys
-// nothing, and it should be closed before anyone designs it.
+// boundary becomes a flag in L2 plus a __threadfence().  Nobody had priced that
+// on this GPU.  If it costs the same ~0.8-1.6 us the megakernel buys nothing,
+// and it should be closed before anyone designs it.
 //
 // TWO TRAPS THIS INSTRUMENT IS BUILT TO AVOID, both found by running a first
 // version of it:
@@ -27,6 +27,15 @@
 //     stage ago, so the spin falls straight through and measures nothing.  The
 //     real handoff is CROSS-BLOCK, so mode 4 waits on a different block's flag.
 //
+// THE THIRD TRAP, and the reason for the SKEW sweep.  Every number above was
+// measured with all 504 blocks doing identical work, so they all arrive at a
+// barrier together and wait zero.  The engine is not like that.  A grid barrier
+// waits for the SLOWEST block, whereas in a graph the next kernel's blocks can
+// be dispatched onto SMs freed by the previous kernel's early finishers -- i.e.
+// the graph OVERLAPS the stragglers and a barrier cannot.  That is the one
+// mechanism that could erase the 6-12x advantage, and it is measured here by
+// giving block b a slab of (1 + b % K) units, K = 1..8.
+//
 // All blocks must be RESIDENT for the persistent modes or the spin deadlocks,
 // so NB comes from cudaOccupancyMaxActiveBlocksPerMultiprocessor and is printed
 // rather than assumed.
@@ -37,14 +46,30 @@
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
   printf("CUDA error %s at line %d\n", cudaGetErrorString(e_), __LINE__); return 1; } } while (0)
 
-// one stage, as its own kernel: block b reads slab (s, b).  Identical indexing
-// to the persistent variants, so the traffic is bit-for-bit the same.
+// ---------------------------------------------------------------------------
+// Skewed slab geometry, shared by every variant so the traffic is identical.
+//
+// Block b of stage s owns slab_len(b) = base * (1 + b % K) floats starting at
+// ((s * nb * K) + b * K) * base.  K = 1 is the balanced case and reduces to the
+// original layout exactly.  The stride is nb*K so the maximum extent is
+// nstages * nb * K * base, whatever the weights are.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ const float * slab_ptr(const float * __restrict__ buf,
+                                                  int s, int b, int nb, int base, int K) {
+    return buf + (((size_t) s * nb * K) + (size_t) b * K) * (size_t) base;
+}
+__device__ __forceinline__ int slab_len(int b, int base, int K) {
+    return base * (1 + (b % K));
+}
+
+// one stage, as its own kernel: block b reads its own skewed slab.
 __global__ void k_stage(const float * __restrict__ buf, float * __restrict__ sink,
-                        int slab_floats, int s) {
+                        int base, int s, int K) {
     const int b = blockIdx.x;
-    const float * p = buf + ((size_t) s * gridDim.x + b) * slab_floats;
+    const float * p = slab_ptr(buf, s, b, gridDim.x, base, K);
+    const int n = slab_len(b, base, K);
     float acc = 0.0f;
-    for (int i = threadIdx.x; i < slab_floats; i += blockDim.x) acc += p[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += p[i];
     if (acc == 1.2345e30f) sink[b] = acc;
 }
 
@@ -71,7 +96,7 @@ __device__ __forceinline__ void gbar(int * arrived, int * released, int nb, int 
 // mode 4 = wait on ANOTHER block's flag                   (real cross-block wait)
 __global__ void k_persist(const float * __restrict__ buf, float * __restrict__ sink,
                           int * __restrict__ flags, int * __restrict__ bar,
-                          int slab_floats, int nstages, int mode) {
+                          int base, int nstages, int mode, int K) {
     const int b = blockIdx.x;
     const int nb = gridDim.x;
     const int peer = (b + nb / 2) % nb;          // mode 4's producer
@@ -89,9 +114,10 @@ __global__ void k_persist(const float * __restrict__ buf, float * __restrict__ s
                 __syncthreads();
             }
         }
-        const float * p = buf + ((size_t) s * nb + b) * slab_floats;
+        const float * p = slab_ptr(buf, s, b, nb, base, K);
+        const int n = slab_len(b, base, K);
         float acc = 0.0f;
-        for (int i = threadIdx.x; i < slab_floats; i += blockDim.x) acc += p[i];
+        for (int i = threadIdx.x; i < n; i += blockDim.x) acc += p[i];
         if (acc == 1.2345e30f) sink[b] = acc;
         __syncthreads();
         if (mode >= 1 && threadIdx.x == 0) {
@@ -101,7 +127,6 @@ __global__ void k_persist(const float * __restrict__ buf, float * __restrict__ s
     }
 }
 
-// min of `reps`, with the spread reported so a difference can be trusted
 static void timed(const std::vector<double> & v, double & lo, double & hi) {
     lo = v[0]; hi = v[0];
     for (double x : v) { if (x < lo) lo = x; if (x > hi) hi = x; }
@@ -112,7 +137,6 @@ int main() {
     CK(cudaGetDeviceProperties(&prop, 0));
     printf("device: %s  SMs=%d  maxThreadsPerSM=%d\n",
            prop.name, prop.multiProcessorCount, prop.maxThreadsPerMultiProcessor);
-    printf("NVIDIA_DRIVER: %d\n", prop.major * 100 + prop.minor);
 
     cudaStream_t st;
     CK(cudaStreamCreate(&st));
@@ -127,9 +151,11 @@ int main() {
     printf("k_persist occupancy: %d blocks/SM -> NB = %d blocks of %d threads "
            "(all resident, or modes 2-4 deadlock)\n\n", per_sm, NB, THREADS);
 
-    const size_t TARGET_BYTES = (size_t) 512 << 20;
-    const int SLABS_KB[] = {8, 32, 128, 512};
+    const int SLAB_KB = 32;
+    const int base = SLAB_KB * 1024 / 4;
+    const int NSTAGES = 32;
     const int REPS = 3;
+    const int KS[] = {1, 2, 4, 8};
 
     int * d_flags, * d_bar;
     CK(cudaMalloc(&d_flags, NB * sizeof(int)));
@@ -137,31 +163,40 @@ int main() {
     float * d_sink;
     CK(cudaMalloc(&d_sink, NB * sizeof(float)));
 
-    printf("%5s %5s %8s %9s %9s %9s %9s %9s %9s | %8s %8s %8s %8s\n",
-           "slab", "S", "MB tot", "graph", "m0 none", "m1 BASE", "m2 self",
-           "m4 cross", "m3 grid", "boundary", "hs self", "h cross", "gridbar");
-    for (int i = 0; i < 118; ++i) putchar('-');
+    // THE SKEW SWEEP.  K = 1 is the balanced case the first version measured.
+    // As K grows the spread between the fastest and slowest block grows, and
+    // the graph's ability to overlap stragglers -- which a grid barrier cannot
+    // match -- should start to show up as the boundary cost falling.
+    printf("SKEW SWEEP: block b owns (1 + b%%K) units, so K=1 is balanced.\n");
+    printf("%3s %7s %8s %9s %9s %9s | %9s %9s %9s %9s\n",
+           "K", "spread", "MB tot", "graph", "m1 BASE", "m3 grid", "boundary",
+           "gridbar", "graph/base", "bar/base");
+    for (int i = 0; i < 95; ++i) putchar('-');
     putchar('\n');
 
-    double worst_cross = 0.0, best_cross = 1e9;
-    for (int ci = 0; ci < 4; ++ci) {
-        const int slab_kb = SLABS_KB[ci];
-        const int slab_floats = slab_kb * 1024 / 4;
-        const size_t per_stage = (size_t) NB * slab_floats * 4;
-        int ns = (int) (TARGET_BYTES / per_stage);
-        if (ns < 16) ns = 16;                    // S=2 made the first version useless
-        const size_t total = per_stage * ns;
+    for (int ki = 0; ki < 4; ++ki) {
+        const int K = KS[ki];
+        // NORMALISE the slab so total bytes stay constant across K.  The mean
+        // weight is 1 + (K-1)/2, so without this the K=8 case would read 4.5x
+        // the data of K=1 and the columns would not be comparable -- which is
+        // exactly the mistake this line exists to prevent.
+        const int basek = (int) (base / (1.0 + (K - 1) / 2.0));
+        // buffer must cover nstages * NB * K * basek floats (worst-case stride)
+        const size_t total_floats = (size_t) NSTAGES * NB * K * basek;
+        const size_t total_bytes = total_floats * 4;
+        const double read_mb = (double) NSTAGES * NB * (1.0 + (K - 1) / 2.0)
+                               * basek * 4 / 1048576.0;
 
         float * d_buf;
-        CK(cudaMalloc(&d_buf, total));
-        CK(cudaMemset(d_buf, 0, total));
+        CK(cudaMalloc(&d_buf, total_bytes));
+        CK(cudaMemset(d_buf, 0, total_bytes));
 
-        std::vector<double> tg, tm(5);
-        std::vector<std::vector<double>> acc(6);
+        std::vector<std::vector<double>> acc(3);   // graph, mode1, mode3
 
         cudaGraph_t g; cudaGraphExec_t ge;
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-        for (int s = 0; s < ns; ++s) k_stage<<<NB, THREADS, 0, st>>>(d_buf, d_sink, slab_floats, s);
+        for (int s = 0; s < NSTAGES; ++s)
+            k_stage<<<NB, THREADS, 0, st>>>(d_buf, d_sink, basek, s, K);
         CK(cudaStreamEndCapture(st, &g));
         CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
 
@@ -175,58 +210,45 @@ int main() {
             float ms; CK(cudaEventElapsedTime(&ms, ev_a, ev_b));
             acc[0].push_back(ms * 1000.0f / 3.0f);
 
-            for (int m = 0; m < 5; ++m) {
+            const int modes[2] = {1, 3};
+            for (int mi = 0; mi < 2; ++mi) {
                 CK(cudaMemset(d_flags, 0, NB * sizeof(int)));
                 CK(cudaMemset(d_bar, 0, 2 * sizeof(int)));
                 for (int i = 0; i < 2; ++i)
                     k_persist<<<NB, THREADS, 0, st>>>(d_buf, d_sink, d_flags, d_bar,
-                                                      slab_floats, ns, m);
+                                                      basek, NSTAGES, modes[mi], K);
                 CK(cudaStreamSynchronize(st));
                 CK(cudaEventRecord(ev_a, st));
                 for (int q = 0; q < 3; ++q)
                     k_persist<<<NB, THREADS, 0, st>>>(d_buf, d_sink, d_flags, d_bar,
-                                                      slab_floats, ns, m);
+                                                      basek, NSTAGES, modes[mi], K);
                 CK(cudaEventRecord(ev_b, st));
                 CK(cudaStreamSynchronize(st));
                 CK(cudaEventElapsedTime(&ms, ev_a, ev_b));
-                acc[m + 1].push_back(ms * 1000.0f / 3.0f);
+                acc[mi + 1].push_back(ms * 1000.0f / 3.0f);
             }
         }
         CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
 
-        double lo[6], hi[6];
-        for (int i = 0; i < 6; ++i) timed(acc[i], lo[i], hi[i]);
-        const double graph = lo[0], base = lo[2];        // index 2 == mode 1
-        const double boundary = (graph - base) / ns;
-        const double hs = (lo[3] - base) / ns;           // mode 2 minus baseline
-        const double hc = (lo[4] - base) / ns;           // mode 4 minus baseline
-        const double gb = (lo[5] - base) / ns;           // mode 3 minus baseline
-        if (hc > worst_cross) worst_cross = hc;
-        if (hc < best_cross) best_cross = hc;
-
-        printf("%5d %5d %8.0f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f | %8.3f %8.3f "
-               "%8.3f %8.3f\n",
-               slab_kb, ns, total / 1048576.0, graph, lo[1], base, lo[3], lo[4], lo[5],
-               boundary, hs, hc, gb);
-        printf("      spread over %d reps: graph %.2f, base %.2f, cross %.2f us\n",
-               REPS, hi[0] - lo[0], hi[2] - lo[2], hi[4] - lo[4]);
-        (void) tg; (void) tm;
+        double lo[3], hi[3];
+        for (int q = 0; q < 3; ++q) timed(acc[q], lo[q], hi[q]);
+        const double graph = lo[0], basem = lo[1], grid = lo[2];
+        printf("%3d %6dx %8.0f %9.1f %9.1f %9.1f | %9.3f %9.3f %10.3f %8.3f\n",
+               K, K, read_mb, graph, basem, grid,
+               (graph - basem) / NSTAGES, (grid - basem) / NSTAGES,
+               graph / basem, grid / basem);
+        printf("      spread over %d reps: graph %.2f, base %.2f, grid %.2f us\n",
+               REPS, hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
 
         CK(cudaFree(d_buf));
     }
 
-    printf("\nVERDICT  (all per stage, all against mode 1, which differs from the\n"
-           "          treatments ONLY by the spin -- see the header)\n");
-    printf("  boundary  = a KERNEL BOUNDARY   (graph vs persistent, same traffic)\n");
-    printf("  hs self   = an intra-kernel handoff on the block's OWN flag\n");
-    printf("  h cross   = an intra-kernel handoff on ANOTHER block's flag  <-- the real one\n");
-    printf("  gridbar   = a full grid barrier\n");
-    printf("  cross-block handoff across slab sizes: %.3f .. %.3f us\n",
-           best_cross, worst_cross);
-    if (worst_cross < 0.0)
-        printf("  --> one or more NEGATIVE: the baseline is still confounded, do not use.\n");
-    else
-        printf("  --> the handoff costs a fraction of the boundary it replaces.\n");
+    printf("\nVERDICT\n");
+    printf("  boundary = graph vs persistent, per stage.  If it HOLDS or RISES with K,\n");
+    printf("  the graph is NOT overlapping stragglers and the megakernel case stands.\n");
+    printf("  If it COLLAPSES toward the grid-barrier cost as skew grows, then the\n");
+    printf("  6-12x advantage was an artifact of perfectly balanced blocks and the\n");
+    printf("  megakernel must be re-priced -- or closed.\n");
 
     CK(cudaFree(d_flags)); CK(cudaFree(d_bar)); CK(cudaFree(d_sink));
     CK(cudaEventDestroy(ev_a)); CK(cudaEventDestroy(ev_b));

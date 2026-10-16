@@ -31,26 +31,47 @@ not be re-measured it says so.
 | single-stream with triggered speculation, 7-workload average | break-even, 0.96x of the bar (§13.4) |
 | C2 accuracy, re-measured live | **0.0140%** from exact float64 against a 0.1% gate — **PASS**; llama.cpp is 0.2199% from the same reference |
 
-Build reproducibility, **corrected in §13.8**. The claim used to read
-"`make engine` reproduces `build/engine` md5-identical
-(`e3051b18b27b1fb08e0d1f288bed68a0`)". **That was false, and the check that
-appeared to confirm it passed by accident.** Three facts, all measured:
+Build reproducibility: **NOT byte-reproducible, and this took three attempts to
+establish honestly.**
 
-* nvcc/`ptxas` here is fully deterministic: `.text` is byte-identical across
-  repeated full rebuilds (`676bef6064748e665f27f881ca21ec66`, three times).
-* The whole-file md5 was **not** stable, because the linker regenerates a
-  25-byte `.note.gnu.build-id` on every link. `cmp` on two rebuilds found
-  **exactly 25 differing bytes out of 989688**, the first inside that note, with
-  `.text` and `.rodata` identical.
-* The earlier check passed because `make` reused a cached `kernels.o` and never
-  relinked. **A reproducibility test that does not force a relink tests nothing.**
+The claim used to read "`make engine` reproduces `build/engine` md5-identical
+(`e3051b18b27b1fb08e0d1f288bed68a0`)". It does not. Then a second version of the
+claim said the linker's 25-byte `.note.gnu.build-id` was the only cause and that
+`-Wl,--build-id=none` fixed it, "verified by three identical rebuilds". **Both
+were wrong**, and the second was worse, because it was "verified" by running
+`make engine >/dev/null 2>&1` — and `-Wl,` is not nvcc syntax, so **every build
+was failing, the binary was stale, and three identical hashes of an unchanged
+file looked exactly like reproducibility.**
 
-LDFLAGS now carries `-Wl,--build-id=none`, and the claim is true and
-falsifiable: **three consecutive full rebuilds give
-`244f08c71c57149df6185d3d92bc4c32`.** The built engine is also 7/7
-bit-identical in behaviour to the pre-Phase-4z.7 binary (`tools/ab.py`), and the
-FP16-audit hooks of §13.8 compile to *nothing* at `AUDIT=0` — committed tree and
-edited tree produce byte-identical `.text`.
+What is actually true, from two rebuilds whose builds were confirmed to have
+succeeded:
+
+```
+  file size            989688   both
+  host .text           BYTE-IDENTICAL   md5 676bef6064748e665f27f881ca21ec66
+  .nv_fatbin (device)  differs by EXACTLY 1 byte out of 847000
+  .strtab              differs by 4 bytes
+  ------------------------------------------------
+  whole-file md5       differs by 5 bytes out of 989688
+  behaviour            tools/ab.py 7/7 bit-identical; C2 to the digit
+```
+
+So the compiled **code** is deterministic in substance — the host stub exactly,
+the device code to within one byte — but the **file** is not byte-reproducible,
+because something nvcc emits carries a per-invocation value. `-Xlinker
+--build-id=none` (the correct spelling) removes the linker's note and reduces the
+variance from 25 bytes to 5; it does not eliminate it, and no md5 claim should be
+made.
+
+> **The generalised law, and it is the most expensive lesson in this project:
+> never silence a build when the build is the thing under test.** Hiding stderr
+> turned a hard failure into a perfect-looking result, and the result was
+> believed for a full round. Every verification in this document that pipes a
+> build through `>/dev/null` or `2>&1 | grep` should be treated as unverified.
+
+The behavioural claims do hold and are the ones that matter: 7/7 bit-identical
+trajectories, and C2 reproduced to the digit. The FP16-audit hooks of §13.8
+compile to *nothing* at `AUDIT=0`.
 
 Re-measured gates, all PASS: G2 dots 8/8, G2 kernels, G6 attention, G7 normfuse,
 G8 normscale. Bit-identity of the shipped build against the T1-only build: 7/7
@@ -1624,3 +1645,75 @@ different work.
 > The measured design risk is unchanged and real: this project's own law is that
 > a barrier in front of a bandwidth-critical kernel loses (`FUSE_ROUTER`
 > 0.09–0.39%, `T4r` 0.17%, `T2` 1.75% — three attempts, three losses).
+
+### 13.10 THE SKEW PRE-TEST — THE MEGAKERNEL PREMISE SURVIVES IMBALANCE
+
+§13.9 measured a boundary at 1.54–2.03 µs and a grid barrier at 0.06–0.10 µs,
+but with **every block doing identical work**. That is not the engine. A grid
+barrier waits for the *slowest* block; a graph can dispatch the next kernel's
+blocks onto SMs freed by the previous kernel's early finishers, i.e. the graph
+**overlaps stragglers and a barrier cannot**. That is the one mechanism that
+could have erased the 6–12× advantage, so it was measured before any porting.
+
+Block `b` is given `1 + b % K` units of work, with the slab size normalised so
+**total bytes stay constant at 504 MB** across all `K`:
+
+```
+  K  spread   MB tot     graph   m1 BASE   m3 grid |  boundary   gridbar  graph/base
+  1      1x      504     620.2     566.3     569.7 |     1.685     0.107      1.095
+  2      2x      504     712.4     638.3     647.1 |     2.315     0.274      1.116
+  4      4x      504     774.5     713.0     723.6 |     1.920     0.331      1.086
+  8      8x      504     769.4     714.4     725.3 |     1.717     0.341      1.077
+                                                    (us, per stage, vs mode 1)
+```
+
+**The boundary cost does not collapse with skew.** It stays at 1.7–2.3 µs across
+an 8× spread in per-block work, and the graph costs 7.7–11.6% more than the
+un-ordered persistent control at *every* skew. The grid barrier does rise with
+skew — 0.107 → 0.341 µs, exactly the wait-for-the-slowest penalty — but it rises
+to a level still **5× below the boundary it replaces**.
+
+> **VERDICT: the megakernel premise survives skew.** Net of the barrier,
+> 1.72 − 0.34 = **1.38 µs per stage at K=8**, i.e. 343 × 1.38 = 0.473 ms, or
+> `2.266 − 0.473 = 1.793 ms = 555 tok/s`. The honest range stays **489–553**
+> because the engine's own 0.268 ms toll estimate is itself a subtraction, and
+> that has not changed.
+
+The skew sweep also re-confirms the *balanced* numbers from §13.9 on a second,
+independently normalised dataset: boundary 1.685 vs the earlier 1.625 at the
+same 32 KB slab.
+
+### 13.11 ERROR 4 — THE REPRODUCIBILITY CLAIM, RETRACTED TWICE, AND THE LAW IT TAUGHT
+
+Recorded here because it is the most expensive mistake in the project and the
+least visible.
+
+The sequence, in full:
+
+1. §0 claimed `make engine` reproduced `e3051b18` md5-identical. **False.** The
+   check passed because `make` reused a cached `kernels.o` and never relinked.
+2. That was diagnosed as the linker's 25-byte `.note.gnu.build-id`, and
+   `-Wl,--build-id=none` was added to `LDFLAGS` as the fix, "verified" by three
+   identical rebuilds. **Also false.** `-Wl,` is not nvcc syntax; **every CUDA
+   build in the Makefile was failing with `nvcc fatal: Unknown option`**, and
+   because the verification ran `make engine >/dev/null 2>&1` the failures were
+   invisible. Three identical hashes of a binary that never changed looked
+   exactly like reproducibility.
+3. Corrected to `-Xlinker --build-id=none` — which does build — and the truth
+   turned out to be neither of the above: the file differs by **5 bytes out of
+   989688** (1 inside `.nv_fatbin`, 4 inside `.strtab`), with the host `.text`
+   byte-identical. `--build-id=none` reduces the variance from 25 bytes to 5 and
+   does not eliminate it. **No md5 reproducibility claim is made.**
+
+Two laws, both earned:
+
+> **Never silence a build when the build is the thing under test.** A piped
+> `>/dev/null` converts a hard failure into a perfect-looking result. Every
+> verification in this document that hides a build's output should be treated as
+> unverified — and one of them was wrong for a full round.
+
+> **For a CUDA binary, `.text` is the host stub. The device code is in
+> `.nv_fatbin`.** The first section-level analysis checked `.text`, found it
+> identical, and concluded the code was deterministic — while the section that
+> actually contains the kernels was never compared. It was only found by
+> extracting and hashing `.nv_fatbin` directly.

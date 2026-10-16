@@ -62,14 +62,21 @@ NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextr
              -DLK_ROUTER_PRO=$(ROUTER_PRO) -DLK_ABLATE_SMALL=$(ABLATE_SMALL) -DLK_ROUTER_UNROLL=$(ROUTER_UNROLL) -DLK_PF_LOAD=$(PF_LOAD) \
              -DLK_GEMV_BIGBLOCK=$(BIGBLOCK) -DLK_NORM_AUDIT=$(AUDIT) \
              -DLK_NORM_PROD_ACCUM=$(NORM_ACCUM) -DLK_NORM_PROD_GEMV=$(NORM_GEMV)
-LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm -Wl,--build-id=none
-# --build-id=none is REQUIRED for the reproducibility claim in ARCHITECTURE.md
-# section 0 to be true.  Without it the linker regenerates a 25-byte
+LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm -Xlinker --build-id=none
+# --build-id=none is required for the reproducibility claim in ARCHITECTURE.md
+# section 0 to hold.  Without it the linker regenerates a 25-byte
 # .note.gnu.build-id on every link, so the file md5 changes while every code
 # section stays byte-identical -- verified by `cmp`: 25 differing bytes out of
 # 989688, the first inside .note.gnu.build-id, with .text and .rodata identical
-# across rebuilds.  An earlier "md5-identical" check passed only because make
-# reused a cached kernels.o and never relinked.
+# across rebuilds.
+#
+# It MUST be spelled `-Xlinker --build-id=none`, not `-Wl,--build-id=none`.
+# nvcc does not understand `-Wl,` and dies with "Unknown option" -- for EVERY
+# CUDA binary in this Makefile.  A first attempt used -Wl, and "verified" the
+# fix by running `make engine >/dev/null 2>&1` three times and hashing the
+# result: the build was failing, the binary was stale, and three identical
+# hashes of an unchanged file looked exactly like reproducibility.  Never
+# silence a build when the build is the thing under test.
 BUILD     := build
 
 .PHONY: help all check-cuda devinfo test-all clean
