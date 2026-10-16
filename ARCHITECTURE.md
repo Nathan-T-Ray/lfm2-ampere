@@ -1717,3 +1717,61 @@ Two laws, both earned:
 > identical, and concluded the code was deterministic — while the section that
 > actually contains the kernels was never compared. It was only found by
 > extracting and hashing `.nv_fatbin` directly.
+
+### 13.12 G5, THE OCCUPANCY GATE — PASSED. THE MEGAKERNEL IS BUILDABLE.
+
+The go/no-go for the whole persistent-kernel plan is whether a fused kernel can
+hold enough blocks resident to saturate DRAM, because a persistent kernel **must**
+have every block resident or its grid barrier deadlocks. Register pressure is the
+binding constraint, and a fused kernel takes the **max over every stage it
+contains** — so one register-hungry stage poisons all of them.
+
+`ptxas -v` over `src/kernels.cu` (no `cuobjdump` in this CUDA install):
+
+```
+   k_router_dot            127 regs      <-- LIVE, and the outlier
+   k_router_dot_top4       128 regs      retired, never launched
+   k_attention_decode       94 regs   34048 B smem   serial fallback, DEAD PATH
+   k_rmsnorm_q8_1           48 regs    1024 B smem
+   k_gemv_q6_K              48 regs
+   k_moe_down_accum         41 regs     256 B smem
+   k_gemv_q4_0_norm         41 regs    1072 B smem
+   k_gemv_q6_K_dp4a         40 regs
+   k_gemv_q4_0{,_3,_exp2}   39 regs
+   k_attn_split             39 regs    8192 B smem   <-- largest live smem
+   k_gemv_q4_0_prod         37 regs
+   k_swiglu / k_shortconv   24 / 28 regs
+   everything else          <= 30 regs
+```
+
+Occupancy at 256 threads/block (65536 registers per SM, 1536-thread ceiling):
+
+| max regs in the fused kernel | threads/SM | blocks/SM | blocks total |
+|---|---|---|---|
+| 127 (`router_dot` inlined) | 516 | 2 | 168 |
+| 48 (everything else) | 1365 | 5 | **420** |
+| ≤ 42 (forced with `__launch_bounds__(256,6)`) | 1536 | 6 | **504** |
+
+**Verdict: PASS, with one exclusion.**
+
+* **`k_attention_decode` must be excluded by `#if`.** 94 registers *and* 34 KB of
+  static smem (`s_score[LK_ATTN_MAX_SEQ]`), and it is only reached when
+  `LK_ATTN_SPLIT` is disabled. This confirms §1.3 by measurement rather than by
+  reading.
+* **`k_router_dot` should stay a graph node**, at least for the first version.
+  One stage at 127 registers would cut the whole kernel to 168 blocks — a third
+  of the residency — and it is **38 nodes out of 343** (one per MoE layer), so
+  keeping it costs 38 boundaries and buys back 252 blocks. That is a good trade
+  and it can be revisited later by forcing `__launch_bounds__` and accepting
+  spills in a stage that is 0.52 MB of traffic.
+* Without it, the ceiling is **48 registers → 5 blocks/SM → 420 blocks =
+  107 520 threads**, which is 83% of the 504 blocks that `bench_megakernel`
+  measured at 878 GB/s. The `__launch_bounds__(256,6)` variant reaching 504 is
+  worth trying second.
+* Shared memory is **not** a constraint once `k_attention_decode` is out: the
+  largest live stage is `k_attn_split` at 8 KB, and 6 blocks × 8 KB = 48 KB
+  against ~100 KB usable.
+
+**This is the last structural unknown.** The premise is measured (§13.9), it
+survives imbalance (§13.10), and the residency budget closes here. Porting can
+proceed.
