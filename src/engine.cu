@@ -167,6 +167,10 @@ struct Engine {
     // load-bearing, so tests/test_normfuse.cu replays twice.
     float *        norm_partial = nullptr;   // [LK_NORM_PARTIALS]
     unsigned int * norm_ctr = nullptr;       // [1], zeroed at init
+    // Separate counter for the router fusion: sharing one between two fused
+    // epilogues would work only because they are stream-ordered, which is too
+    // subtle a reason to rely on.
+    unsigned int * router_ctr = nullptr;     // [1], zeroed at init
     float *  attn_part = nullptr; // [heads][SPLIT][2 + head_dim] split-K scratch
     block_q8_1 * xq2 = nullptr;  // [368] second scratch: the MoE expert loop needs
                                  //       the hidden-state activation to survive
@@ -209,6 +213,7 @@ static inline int grid_for(int rows) { return (rows + 7) / 8; }   // 8 warps/blo
 
 // Phase 4x: the FFN norm that follows the mixer's output projection, described
 // as an epilogue for that projection to run for free.  See kernels.cuh.
+#if LK_FUSE_NORM
 static inline LKNormEpilogue ffn_norm_epi(Engine & e, const Layer & l) {
     LKNormEpilogue ne;
     ne.w       = P32(e, l.ffn_norm);
@@ -219,6 +224,7 @@ static inline LKNormEpilogue ffn_norm_epi(Engine & e, const Layer & l) {
     ne.ctr     = e.norm_ctr;
     return ne;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 static void load_layers(Engine & e) {
@@ -299,6 +305,8 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     // Must start at zero: the fused epilogue is skipped, silently and with
     // plausible output, if the counter is stale.
     CK(cudaMemset(e->norm_ctr, 0, 4));
+    CK(cudaMalloc(&e->router_ctr, 4));
+    CK(cudaMemset(e->router_ctr, 0, 4));
     CK(cudaMalloc(&e->y,  2 * LK_DENSE_INTER * 4));
     CK(cudaMalloc(&e->inter, LK_DENSE_INTER * 4));
     CK(cudaMalloc(&e->tmp, LK_HIDDEN * 4));
@@ -533,12 +541,17 @@ static void forward(Engine & e, cudaStream_t st) {
             // build_lora_mm runs f32 x f32.  (The experts, by contrast, take
             // the Q8_1-quantised activation.)
             LKP_B("router_dot");
+#if LK_FUSE_ROUTER
+    k_router_dot_top4<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
+                P32(e, l.rbias), e.d_idx, e.d_w, e.router_ctr); LKP_E();
+#else
     k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate); LKP_E();
             LKP_B("router_top4");
     // one lane per expert: the sigmoids are computed cooperatively, so a
     // 32-thread block would leave experts 32..63 uninitialised.
     k_router_top4<<<1, LK_N_EXPERTS, 0, st>>>(e.d_gate, P32(e, l.rbias),
                                     e.d_idx, e.d_w); LKP_E();
+#endif
             if (e.d_routelog) {          // G4b instrumentation (off unless asked)
                 LKP_B("route_log");
     k_route_log<<<1, 32, 0, st>>>(e.d_idx, e.d_pos, il, e.d_routelog); LKP_E();

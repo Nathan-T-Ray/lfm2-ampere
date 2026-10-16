@@ -137,6 +137,35 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 #ifndef LK_FUSE_NORM
 #define LK_FUSE_NORM 0
 #endif
+// Phase 4x Step 3: fold k_router_top4 into k_router_dot.
+//
+// MEASURED AND REJECTED -- default 0.  This was the FAIR test of the
+// last-block mechanism: the selection is ~30 shuffle ops against a ~1.9 us
+// single-block node, so if folding pays anywhere it pays here.  It does not.
+// Interleaved A/B, REPS=3:
+//
+//   ctx      fuse0    fuse1
+//    272     416.16   415.80   -0.09%  (within noise)
+//   2128     406.73   405.19   -0.38%
+//   8128     367.11   365.69   -0.39%
+//
+// The output is BIT-IDENTICAL across all 7 suite cases, so this is purely a
+// cost result.  The 38 router_top4 nodes do vanish, worth 38 x 0.605 = 0.023 ms
+// of dispatch, but k_router_dot's real time goes 0.120 -> 0.155 ms because
+// every one of its 64 blocks now pays a __threadfence plus a contending
+// atomicAdd and the last block's tail is exposed with 63 SMs idle.
+//
+// THE GENERAL RESULT, which is the point of both experiments: a cross-block
+// last-block synchronisation costs ~1.5-2 us on this part, and a graph node
+// costs 0.605 us.  Folding a node into its producer therefore CANNOT pay,
+// whatever the size of the work being folded -- the norm (heavy, 2048-element
+// reduction) and the top-4 (light, ~30 shuffle ops) both lose by about the
+// same amount.  Steps 1, 2, 3 and 5 of the Phase 4x plan are all this
+// mechanism and are all dead.  Only fusions that are purely local within one
+// block can pay, and none of the remaining small kernels is shaped that way.
+#ifndef LK_FUSE_ROUTER
+#define LK_FUSE_ROUTER 0
+#endif
 struct LKNormEpilogue {
     const float * w;              // [n] norm weights, or null to skip the epilogue
     float         eps;
@@ -187,6 +216,14 @@ __global__ void __launch_bounds__(32) k_router_dot(
 __global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out);
+// Phase 4x Step 3: the same selection, folded into the last block of the
+// router dot.  MEASURED AND REJECTED -- see the note at LK_FUSE_ROUTER.
+__global__ void k_router_dot_top4(const float * __restrict__ h,
+                                  const float * __restrict__ gate_inp,
+                                  float * __restrict__ logits,
+                                  const float * __restrict__ bias,
+                                  int * __restrict__ idx_out, float * __restrict__ w_out,
+                                  unsigned int * __restrict__ ctr);
 
 // Single-query decode attention over an fp16 KV cache.
 // The block width was tried at 1024 (with launch bounds) and measured NEUTRAL:

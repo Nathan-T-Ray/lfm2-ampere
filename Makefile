@@ -21,12 +21,13 @@ SPLIT_MIN ?= 8
 # interleaved A/B and is off; see the note in kernels.cuh.  The switch is kept
 # so the negative result stays reproducible with one flag.
 FUSE_NORM ?= 0
+FUSE_ROUTER ?= 0
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
 NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \
              -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
              -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN) \
-             -DLK_FUSE_NORM=$(FUSE_NORM)
+             -DLK_FUSE_NORM=$(FUSE_NORM) -DLK_FUSE_ROUTER=$(FUSE_ROUTER)
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
 BUILD     := build
 

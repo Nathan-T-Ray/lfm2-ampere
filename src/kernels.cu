@@ -498,14 +498,6 @@ __global__ void k_router_top4(const float * __restrict__ logits,
     // exactly p_r.  Ties go to the lower expert index.  Each round is five
     // shfl_xor steps carrying a (value, index) pair.
     static_assert(LK_TOP_K == 4, "four selection rounds assume top-4");
-// The attention split derives its slice count at runtime, so the shared score
-// array must cover the LARGEST chunk that rule can ever ask for.  With
-// slices = clamp(ceil(seq/TARGET_N), SPLIT_MIN, SPLIT), chunk = ceil(seq/slices)
-// is at most TARGET_N provided the cap can cover the whole sequence:
-static_assert(LK_ATTN_SPLIT * LK_ATTN_TARGET_N >= LK_ATTN_MAX_SEQ,
-              "attention split cap too small: chunk can exceed LK_ATTN_CHUNK");
-static_assert(LK_ATTN_CHUNK == LK_ATTN_TARGET_N,
-              "LK_ATTN_CHUNK must equal LK_ATTN_TARGET_N; see the argument in kernels.cuh");
     const int lane = t;
     float v0 = s_sel[lane],      v1 = s_sel[lane + 32];
     const int i0 = lane,         i1 = lane + 32;
@@ -532,6 +524,90 @@ static_assert(LK_ATTN_CHUNK == LK_ATTN_TARGET_N,
         wv[k] = s_sig[ord[k]];             // unbiased sigmoid, computed above
         wsum += wv[k];
     }
+    if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
+#pragma unroll
+    for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = ord[k]; w_out[k] = wv[k] / wsum; }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4x Step 3: k_router_top4 folded into k_router_dot.
+//
+// This is the case the fusion arithmetic actually favours.  The top-4 costs
+// about thirty shuffle-and-compare operations, far below the ~1.9 us a
+// single-block node costs (0.605 us of dispatch plus the rest as kernel
+// start/stop latency), whereas the FFN norm Step 1 tried to fold carries a
+// genuine 2048-element reduction and absorbed almost exactly what it replaced.
+// If folding pays anywhere, it pays here.
+//
+// Same threadfence-reduction pattern as the norm epilogue, over 64 blocks
+// instead of 256, and the counter is reset by the last block so graph replay
+// is safe.  The selection is the SAME code as k_router_top4 -- same sigmoid,
+// same four rounds of butterfly argmax, same tie-break `ov > mv || (ov == mv
+// && oi < mi)`, same unbiased weights renormalised with the same guard -- run
+// on 32 lanes instead of 64, each carrying two candidates.  Any divergence
+// from the standalone kernel is a bug, not a rounding difference.
+__global__ void __launch_bounds__(32) k_router_dot_top4(
+        const float * __restrict__ h, const float * __restrict__ gate_inp,
+        float * __restrict__ logits, const float * __restrict__ bias,
+        int * __restrict__ idx_out, float * __restrict__ w_out,
+        unsigned int * __restrict__ ctr) {
+    const int e = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float * row = gate_inp + (size_t)e * LK_HIDDEN;
+    float acc = 0.0f;
+    for (int base = 0; base < LK_HIDDEN; base += 32 * LK_ROUTER_UNROLL) {
+        float v[LK_ROUTER_UNROLL], hv[LK_ROUTER_UNROLL];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) v[j]  = row[base + j * 32 + lane];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) hv[j] = h[base + j * 32 + lane];
+#pragma unroll
+        for (int j = 0; j < LK_ROUTER_UNROLL; ++j) acc += v[j] * hv[j];
+    }
+    acc = warp_sum(acc);
+
+    __shared__ int s_last;
+    if (lane == 0) {
+        logits[e] = acc;
+        __threadfence();                       // logits[e] visible before the count
+        const unsigned prev = atomicAdd(ctr, 1u);
+        s_last = (prev == (unsigned) gridDim.x - 1u);
+        if (s_last) *ctr = 0u;                 // reset for the next graph replay
+    }
+    __syncthreads();
+    if (!s_last) return;
+
+    // ---- top-4, on this block's 32 lanes, two candidates each -------------
+    __shared__ float s_sel[LK_N_EXPERTS];
+    __shared__ float s_sig[LK_N_EXPERTS];
+    for (int t = lane; t < LK_N_EXPERTS; t += 32) {
+        const float g = 1.0f / (1.0f + expf(-logits[t]));
+        s_sig[t] = g;
+        s_sel[t] = g + bias[t];
+    }
+    __syncthreads();
+    float v0 = s_sel[lane], v1 = s_sel[lane + 32];
+    const int i0 = lane,     i1 = lane + 32;
+    int ord[LK_TOP_K];
+#pragma unroll
+    for (int r = 0; r < LK_TOP_K; ++r) {
+        float mv = (v0 >= v1) ? v0 : v1;
+        int   mi = (v0 >= v1) ? i0 : i1;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, mv, o);
+            const int   oi = __shfl_xor_sync(0xffffffffu, mi, o);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        ord[r] = mi;
+        if (i0 == mi) { v0 = -1e30f; }
+        if (i1 == mi) { v1 = -1e30f; }
+    }
+    if (lane != 0) return;
+    float wsum = 0.0f;
+    float wv[LK_TOP_K];
+#pragma unroll
+    for (int k = 0; k < LK_TOP_K; ++k) { wv[k] = s_sig[ord[k]]; wsum += wv[k]; }
     if (wsum < LK_TOPK_GUARD) wsum = LK_TOPK_GUARD;
 #pragma unroll
     for (int k = 0; k < LK_TOP_K; ++k) { idx_out[k] = ord[k]; w_out[k] = wv[k] / wsum; }
@@ -885,6 +961,14 @@ __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict_
 // That grid was still wrong, and Phase 4v below explains why.
 // LK_ATTN_CHUNK now lives in kernels.cuh, derived from LK_ATTN_TARGET_N.
 #define LK_ATTN_GQA   (LK_N_HEADS / LK_N_KV_HEADS)      // query heads per kv head
+// The attention split derives its slice count at runtime, so the shared score
+// array must cover the LARGEST chunk that rule can ever ask for.  With
+// slices = clamp(ceil(seq/TARGET_N), SPLIT_MIN, SPLIT), chunk = ceil(seq/slices)
+// is at most TARGET_N provided the cap can cover the whole sequence:
+static_assert(LK_ATTN_SPLIT * LK_ATTN_TARGET_N >= LK_ATTN_MAX_SEQ,
+              "attention split cap too small: chunk can exceed LK_ATTN_CHUNK");
+static_assert(LK_ATTN_CHUNK == LK_ATTN_TARGET_N,
+              "LK_ATTN_CHUNK must equal LK_ATTN_TARGET_N; see the argument in kernels.cuh");
 
 // ---------------------------------------------------------------------------
 // Phase 4v: GQA-aware split -- the fix for the context cliff.
