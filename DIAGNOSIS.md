@@ -1688,3 +1688,75 @@ trigger matters.
 Prompt-lookup speculation and batch-4 share the SAME M=4 kernels, so the M=4
 build pays for both.  That makes it the single highest-value piece of work
 outstanding, and it is the recommendation.
+
+
+# Phase 4z.4: prompt-lookup speculation, measured and rejected
+
+With the engine restricted to ONE card, the remaining single-stream lever was
+speculative decoding -- but not the draft-MODEL form this project already
+rejected.  Prompt-lookup (n-gram) drafting costs a host-side search, needs no
+second model, and can be triggered, so a miss costs nothing.
+
+Greedy speculative decoding with exact verification is LOSSLESS: the emitted
+tokens are identical to plain decoding.  ** So its acceptance rate can be
+simulated exactly, offline, from trajectories the engine already generates. **
+`tools/lookup.py` does that -- walks a real greedy trajectory, and at each
+position searches only the text that would exist at generation time for a match
+of the last L tokens, copies the continuation as the draft, and counts how many
+drafted tokens the model actually produced.
+
+M=4 verification costs 2.11x-2.41x a plain token (Phase 4z.3), so break-even is
+E[tokens per pass] = 2.11 .. 2.41.
+
+    minmatch=2   (7 cases, ngen=384)
+        factual    88.6% trigger   E 3.61   661-755 tok/s
+        math       45.7%           E 1.50   275-314
+        code       39.8%           E 1.45   265-303
+        agentic    28.3%           E 1.38   253-289
+        reasoning  48.1%           E 1.53   280-320
+        prose      40.4%           E 1.70   312-357
+        ALL                        E 1.87   -> DOES NOT PAY
+
+    minmatch=4   ALL E 1.75      -> DOES NOT PAY (fewer triggers, not enough
+                                    extra precision to compensate)
+
+** Longest matches do not rescue it: precision rises more slowly than the
+trigger rate falls.  And CODE, which is the case everyone expects lookup to
+win, is among the WORST at E 1.45 -> 265-303 tok/s, i.e. it would make the
+engine 30-40% SLOWER than plain decoding. **
+
+The single case that pays, `factual`, has a visibly repetitive reasoning trace
+that restates the same sentence; E 3.61 there is real but it is one case of
+seven and it is not a workload.
+
+So speculative decoding is closed on measurement, not on argument, and it is
+closed for the same reason as before: there is no cheap source of high-quality
+drafts for this model on this text.  A draft MODEL would still be needed, and
+that is what was rejected in Phase 5.
+
+## Where that leaves batch 1 on one card
+
+    measured now                                        441.4 tok/s
+    ceiling with all 158 small kernels made free        488.9  (Phase 4z.2)
+    ceiling with the launch toll also free              ~563   (streaming only)
+
+The 563 figure is 1466.75 MB at the 825 GB/s the engine actually sustains, with
+every other cost at zero.  So the recoverable overhead is 0.71 ms, and reaching
+500 tok/s needs 0.266 ms of it -- 37%.
+
+That is not obviously impossible, but it requires all three of:
+
+    small kernels   0.221 ms   recover ~50%   = 0.11 ms
+    launch toll     0.268 ms   recover ~30%   = 0.08 ms  (node deletion is
+                                              measured at 0.3-0.45 us/node)
+    streaming ramp  0.220 ms   recover ~30%   = 0.07 ms
+                                              ---------
+                                              0.26 ms  -> 500 tok/s
+
+and every one of those three has already defeated a direct attempt.  The honest
+expectation for a lot of grinding is 475-490, with 500 reachable only if all
+three land at once.
+
+** The reliable route to 500+ on one card is batching, not batch-1 tuning. **
+Batch-4 was estimated at 731-832 tok/s aggregate in Phase 4z.2 from the same
+measured decomposition, and it uses one GPU.
