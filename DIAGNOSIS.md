@@ -1476,3 +1476,107 @@ and `k_gemv_q4_0` are all REGISTER-LIMITED at 1024 threads -- they reach only
 1024 threads/SM against the 1536 cap, and only reach the cap at 512 or 256.  That
 does not change the 64-block kernels (T1, Phase 4y), where block count is what
 limits occupancy and 1024 threads per block is still the right choice.
+
+
+# Phase 4z.2: where the 2.266 ms actually goes, and the batch-1 ceiling
+
+Every earlier decomposition of the step was an ESTIMATE.  This one is measured:
+the non-streaming kernels are emptied out (grids and block sizes kept, so the
+node count and the launch cost are unchanged) and the wall clock difference is
+the execution they were responsible for.
+
+## Method, and the contamination that had to be caught first
+
+`LK_ABLATE_SMALL` makes a group of kernels return immediately while keeping
+their launch.  Garbage propagates downstream, which is fine for timing -- the
+surviving kernels still read the same bytes from the same places.
+
+**Except that they did not, the first time.**  Emptying the router leaves
+`d_idx` holding whatever the buffer held, and `d_idx[k]` is a WEIGHT ADDRESS
+(`base = d_idx[k] * rows_per_expert * bpr`).  With all zeros, `moe_gate_up`
+reads ONE expert four times: 3.5 MB, which fits in the 6 MB L2, so three
+quarters of its DRAM traffic silently disappears.  The first measurement said
+the router cost 28.5% of the step.  It does not; most of that was phantom L2
+reuse in a different kernel.
+
+The guard is to have the ablated `k_router_top4` write four DISTINCT expert
+indices, so the weight traffic is identical to the real thing.  That is also
+why `d_idx` and `d_w` are now zeroed at init in `engine.cu` -- an uninitialised
+buffer feeding an address computation is a latent bug independent of this
+experiment.
+
+    group 1  router_dot + router_top4   76 nodes   contaminated +28.5%   guarded +6.0%
+    group 2  swiglu                     38 nodes                        +1.0%
+    group 3  shortconv (the 3-tap conv) 30 nodes                        +1.1%
+    group 4  the rest (qk_norm_rope,
+             embed, argmax, 1 rmsnorm)  14 nodes                        +1.0%
+    group 5  all of the above          158 nodes   contaminated +36.2%   guarded +10.8%
+
+## The decomposition, measured
+
+    real engine                              2.266 ms   441.4 tok/s
+    all 158 small kernels emptied            2.045 ms   488.9 tok/s
+        --> the small kernels own 0.221 ms = 9.7%, router alone 0.129 ms = 5.7%
+
+Combined with the two earlier measurements (bench_shapes for the toll,
+bench_ovh/Part B for the size-dependent bandwidth), the step is:
+
+    1.557 ms   wire, 1466.75 MB at the 941.8 GB/s MARGINAL rate (never reached
+               in practice -- it is the asymptote, not the operating point)
+    0.220 ms   streaming size inefficiency: 7 MB kernels get ~766 GB/s and
+               14 MB kernels ~829, because each is too small to amortise its
+               own ramp
+    0.268 ms   launch toll: 343 nodes x 0.782 us, measured with an empty-kernel
+               graph carrying the real grids and block sizes
+    0.221 ms   the 158 small kernels: execution plus the dependency stalls they
+               impose on everything behind them
+    ---------
+    2.266 ms
+
+** The batch-1 ceiling is 488.9 tok/s. **  That is not an estimate.  It is what
+the engine does when the 158 small kernels are made free, with their weight
+traffic preserved.  ** 500 tok/s at batch 1 is arithmetically out of reach. **
+Even deleting the entire launch toll as well would only reach 343 nodes worth
+of nothing, and the wire term alone is 1.557 ms = 642 tok/s against a step
+whose non-wire overhead is already 0.71 ms.
+
+## The obvious fix for the router does not work
+
+The router is the largest single item (0.129 ms, 5.7%) and it is grotesquely
+under-parallelised: `k_router_dot` is <<<64,32>>>, i.e. **64 warps for a 524 KB
+read, 0.76 warps per SM**.  The natural hypothesis is that it is starved of
+loads in flight.
+
+`LK_ROUTER_UNROLL` was made a sweepable constant and proved **bit-identical at
+every value** before being swept -- the accumulation runs i = lane, lane+32, ...
+in strictly increasing index order and the groups are contiguous
+([g*32*U, (g+1)*32*U)), so changing U only re-partitions that same sequence and
+never reorders a single add.
+
+    U = 16   441.39 tok/s
+    U = 32   441.36 tok/s
+    U = 64   441.36 tok/s
+
+**Flat.**  The router is not load-limited.  Its cost is kernel latency -- a
+64-warp launch and a <<<1,64>>> launch, each with a full launch-to-completion
+latency that sits on the critical path -- and that is exactly the cost that
+three separate fusion attempts (FUSE_ROUTER, T4r, T2) failed to remove without
+paying more elsewhere.
+
+## What this does to the batching case
+
+Batching amortises the toll AND the small-kernel latencies, because the same
+343 kernels process all M tokens.
+
+    batch-4, four independent sequences
+        bytes      4 x 971.7 = 3886.8 MB
+        at ~900 GB/s effective (bigger kernels ramp better than 7 MB ones)  = 4.32 ms
+        toll       paid once                                              = 0.27 ms
+        small-kernel latency: 0.22 ms if latency-bound, 0.88 ms if work-bound
+        total      4.81 .. 5.47 ms for 4 tokens = 832 .. 731 tok/s aggregate
+        speedup    1.89x .. 1.66x against 4 separate 2.266 ms steps
+
+** So 500 tok/s is comfortably reachable -- at batch 4, not at batch 1. **
+The batch-1 route was closed by measurement rather than by argument, and the
+remaining batch-1 room (0.221 ms of small kernels, 0.268 ms of toll, 0.220 ms
+of streaming ramp) is real but cannot sum to 500.

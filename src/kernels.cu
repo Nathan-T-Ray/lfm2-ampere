@@ -28,6 +28,7 @@ __global__ void k_rmsnorm(const float * __restrict__ x, const float * __restrict
 __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __restrict__ w,
                                int n, float eps, float * __restrict__ y32,
                                __half * __restrict__ y16, block_q8_1 * __restrict__ yq8) {
+    LK_ABL_REST;   // LK_ABLATE_SMALL measurement hook
     __shared__ float s_sq[256];
     extern __shared__ float s_h[];          // generic path only
     const int tid = threadIdx.x;
@@ -454,6 +455,7 @@ __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql1, const uint8_t
 // full-mask shuffles inside quantize_q8_1_warp stay well defined.
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
                          int n, float * __restrict__ out, block_q8_1 * __restrict__ yq8) {
+    LK_ABL_SWIGLU;   // LK_ABLATE_SMALL measurement hook
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const float v = silu_f(gate[i]) * up[i];
         if (out) out[i] = v;
@@ -465,6 +467,7 @@ __global__ void k_swiglu(const float * __restrict__ gate, const float * __restri
 __global__ void k_shortconv(const float * __restrict__ bcx, int t,
                             const float * __restrict__ conv_w, float * __restrict__ hist,
                             float * __restrict__ y, block_q8_1 * __restrict__ yq8) {
+    LK_ABL_SHORTCONV;   // LK_ABLATE_SMALL measurement hook
     // t selects which token of the bcx buffer we are processing
     const float * B = bcx;
     const float * C = bcx + LK_HIDDEN;
@@ -509,12 +512,26 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // the whole decode step, for 1.4% of the bytes.  Sixty-four single-warp blocks
 // put the same read on 64 different SMs, and batching the loads keeps several
 // in flight per warp.
+// LK_ROUTER_UNROLL controls how many loads each router warp keeps in flight.
+//
+// It is a SWEEPABLE CONSTANT AND IT IS BIT-IDENTICAL AT EVERY VALUE: the
+// accumulation runs i = lane, lane+32, lane+64, ... in strictly increasing
+// index order, and groups are contiguous ([g*32*U, (g+1)*32*U)), so changing U
+// only re-partitions that same sequence -- it never reorders a single add.
+//
+// It matters because the router is the most under-parallelised kernel in the
+// engine: 64 warps for a 524 KB read, i.e. 0.76 warps per SM.  With U = 16 each
+// warp exposes HIDDEN/(32*16) = 4 separate memory round trips; the kernel is
+// latency-bound, not bandwidth-bound, and this is the lever.
+#ifndef LK_ROUTER_UNROLL
 #define LK_ROUTER_UNROLL 16
+#endif
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
         float * __restrict__ logits, const float * __restrict__ bias,
         float * __restrict__ sel, float * __restrict__ sig,
         const float * __restrict__ ssq, float eps) {
+    LK_ABL_ROUTER;   // LK_ABLATE_SMALL measurement hook
     const int e = blockIdx.x;
     const int lane = threadIdx.x;
     // Phase 4y: with ffn_norm folded into the mixer output projection, `h` holds
@@ -558,6 +575,19 @@ __global__ void __launch_bounds__(32) k_router_dot(
 __global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out) {
+#if LK_ABLATE_SMALL == 1 || LK_ABLATE_SMALL == 5
+    // CONTAMINATION GUARD.  A bare early return here leaves d_idx at whatever
+    // the buffer holds, and if that is all zeros then moe_gate_up reads ONE
+    // expert four times -- 3.5 MB, which fits in the 6 MB L2, so three quarters
+    // of its DRAM traffic silently disappears and the router looks far more
+    // expensive than it is.  Writing four DISTINCT experts keeps the weight
+    // traffic identical to the real thing, which is the whole point.
+    if (threadIdx.x < LK_TOP_K) {
+        idx_out[threadIdx.x] = threadIdx.x;
+        w_out[threadIdx.x] = 0.25f;
+    }
+    return;
+#endif
     __shared__ float s_sel[LK_N_EXPERTS];
     __shared__ float s_sig[LK_N_EXPERTS];
     const int t = threadIdx.x;
@@ -767,6 +797,7 @@ __global__ void k_attention_decode(const float * __restrict__ q,
 __global__ void k_embed_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                              const int8_t * __restrict__ sc, const __half * __restrict__ d,
                              const int * __restrict__ d_token, float * __restrict__ x) {
+    LK_ABL_REST;   // LK_ABLATE_SMALL measurement hook
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= LK_HIDDEN) return;
     const int token = *d_token;
@@ -784,6 +815,7 @@ __global__ void k_qk_norm_rope(float * __restrict__ qf, float * __restrict__ kf,
                                const float * __restrict__ qn, const float * __restrict__ kn,
                                const int * __restrict__ d_pos,
                                __half * __restrict__ kc, __half * __restrict__ vc) {
+    LK_ABL_REST;   // LK_ABLATE_SMALL measurement hook
     const float pos = (float)(*d_pos);
     __shared__ float s_head[LK_HEAD_DIM];
     __shared__ float s_red[LK_HEAD_DIM];
@@ -863,6 +895,7 @@ __global__ void k_route_log(const int * __restrict__ idx, const int * __restrict
 
 __global__ void k_argmax_part(const float * __restrict__ v,
                               float * __restrict__ pv, int * __restrict__ pi) {
+    LK_ABL_REST;   // LK_ABLATE_SMALL measurement hook
     const int tid  = blockIdx.x * blockDim.x + threadIdx.x;
     const int base = tid * LK_ARGMAX_PER_THREAD;
     float best = -1e30f; int bi = base;
@@ -887,6 +920,7 @@ __global__ void k_argmax_part(const float * __restrict__ v,
 
 __global__ void k_argmax_final(const float * __restrict__ pv, const int * __restrict__ pi,
                                int n, int * __restrict__ d_token, int * __restrict__ d_pos) {
+    LK_ABL_REST;   // LK_ABLATE_SMALL measurement hook
     __shared__ float sv[256];
     __shared__ int   si[256];
     const int tid = threadIdx.x;

@@ -146,6 +146,46 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 #if LK_NORM_PROD_GEMV && !LK_GEMV_BIGBLOCK
 #error "LK_NORM_PROD_GEMV needs LK_GEMV_BIGBLOCK: a block must own a whole Q8_1 block"
 #endif
+// LK_ABLATE_SMALL: empty the NON-streaming kernels, keeping their grids and
+// block sizes, to separate their real EXECUTION from their launch cost (which
+// tests/bench_shapes.cu measures separately at 0.268 ms for all 343 nodes).
+//
+// Value selects a group; 5 is all of them.
+//   1 router_dot + router_top4      (76 nodes)
+//   2 swiglu                        (38 nodes)
+//   3 shortconv (the 3-tap conv)    (30 nodes)
+//   4 the rest                      (14 nodes: qk_norm_rope, embed, argmax,
+//                                    the one remaining rmsnorm)
+//   5 all four groups
+//
+// Garbage propagates downstream, which is fine: the surviving kernels still
+// read the same bytes from the same places, so timing stays valid even though
+// the numbers do not.  Measurement only -- never ship this on.
+#ifndef LK_ABLATE_SMALL
+#define LK_ABLATE_SMALL 0
+#endif
+#define LK_ABL_PICK(grp) ((LK_ABLATE_SMALL == (grp) || LK_ABLATE_SMALL == 5) ? 1 : 0)
+#if LK_ABLATE_SMALL == 1 || LK_ABLATE_SMALL == 5
+#define LK_ABL_ROUTER return
+#else
+#define LK_ABL_ROUTER ((void)0)
+#endif
+#if LK_ABLATE_SMALL == 2 || LK_ABLATE_SMALL == 5
+#define LK_ABL_SWIGLU return
+#else
+#define LK_ABL_SWIGLU ((void)0)
+#endif
+#if LK_ABLATE_SMALL == 3 || LK_ABLATE_SMALL == 5
+#define LK_ABL_SHORTCONV return
+#else
+#define LK_ABL_SHORTCONV ((void)0)
+#endif
+#if LK_ABLATE_SMALL == 4 || LK_ABLATE_SMALL == 5
+#define LK_ABL_REST return
+#else
+#define LK_ABL_REST ((void)0)
+#endif
+
 // T4r: rebuild the top-4 in the consumer's prologue instead of in its own
 // <<<1,64>>> node.  MEASURED AND REJECTED -- 0.17% SLOWER.  The selection work
 // is barrier-free in the Phase 4y sense, but hosting it in k_gemv_q4_0_exp2

@@ -371,6 +371,13 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->d_api, LK_ARGMAX_BLOCKS * 4));
     CK(cudaMalloc(&e->d_idx, LK_TOP_K * 4));
     CK(cudaMalloc(&e->d_w, LK_TOP_K * 4));
+    // d_idx feeds an address computation (base = d_idx[k] * rows_per_expert *
+    // bpr) in the expert GEMVs.  It is written by the router before it is read
+    // on every real path, but leaving it uninitialised means any path that
+    // skips the router -- an ablation build, a future early exit -- reads
+    // arbitrary memory.  Zeroing it costs one call at startup.
+    CK(cudaMemset(e->d_idx, 0, LK_TOP_K * 4));
+    CK(cudaMemset(e->d_w, 0, LK_TOP_K * 4));
     CK(cudaMemset(e->conv_hist, 0, (size_t)30 * LK_HIDDEN * 2 * 4));
     CK(cudaMemset(e->kcache, 0, KV * 2));
     CK(cudaMemset(e->vcache, 0, KV * 2));
