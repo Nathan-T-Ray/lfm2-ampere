@@ -1580,3 +1580,111 @@ Batching amortises the toll AND the small-kernel latencies, because the same
 The batch-1 route was closed by measurement rather than by argument, and the
 remaining batch-1 room (0.221 ms of small kernels, 0.268 ms of toll, 0.220 ms
 of streaming ramp) is real but cannot sum to 500.
+
+
+# Phase 4z.3: the second GPU, measured before being believed
+
+Phase 4z.2 concluded that the single-GPU batch-1 ceiling is 488.9 tok/s.  That
+is a bound on ONE GPU running THIS kernel structure.  It is not a law, and the
+obvious unturned stone is the second card.
+
+## The interconnect decides it, so it was measured first
+
+    nvidia-smi topo -m      GPU0 - GPU1 : PHB   (separate root ports, one host
+                                                bridge, no NVLink)
+    cudaDeviceCanAccessPeer(0->1) = 0
+    cudaDeviceCanAccessPeer(1->0) = 0
+
+**GeForce peer-to-peer is disabled on this platform.**  Everything crossing
+cards stages through host memory.
+
+An earlier version of the probe reported an 18.15 us round trip, which would
+have killed the idea outright.  It was measuring an error path: it passed a
+DEVICE pointer to cudaMemcpyHostToDevice.  Corrected to stage through PINNED
+memory with a cross-device event expressing the dependency:
+
+    bytes     D2H us    H2D us    round trip    x80 per token   (GPU1 idle)
+     2048       1.04      3.26         4.79         0.38 ms      4.79
+     8192       1.19      5.03         6.52         0.52 ms      6.52
+    32768       2.10     12.31        13.78         1.10 ms
+   262144      10.58     81.93        83.39         6.67 ms
+
+Re-measured with the llama.cpp oracle stopped, to rule out PCIe contention:
+**6.52 vs 6.51 us.  Identical.**  The 5 us H2D is real platform behaviour, not
+a busy neighbour.
+
+The hidden state is 2048 floats = 8192 B, so one exchange is 6.52 us.
+
+## What that does to tensor parallelism
+
+Tensor parallelism halves the bytes each card reads (~0.89 ms of streaming
+saved) and costs one exchange per sub-block: 2 per layer x 40 = 80 per token.
+
+    80 x 6.52 us = 0.52 ms of communication, against ~0.89 ms saved
+
+Break-even is 11.1 us per exchange, so at 6.52 us **it wins -- but barely**,
+and the win shrinks further because halving the bytes halves the KERNELS too,
+and a 7 MB read only reaches ~766 GB/s against 829 for 14 MB:
+
+    split everything            per GPU 733 MB at ~766 GB/s = 0.957 ms
+                                + toll 0.268 + small 0.221 + comms 0.520
+                                = 1.966 ms  ->  509 tok/s
+
+    split only where comm is cheap:
+      lm_head  14.7% of traffic, needs ONE exchange per TOKEN, not per layer
+      MoE      55% of traffic,   needs ONE exchange per layer (38)
+      dense    5.5%,             two exchanges
+      ShortConv + attention stay REPLICATED, because for them the 40 exchanges
+      cost more than the traffic they would halve
+                                per GPU 894 MB at ~800 GB/s = 1.117 ms
+                                + toll 0.268 + small 0.221 + comms 0.267
+                                = 1.873 ms  ->  534 tok/s
+
+**So the second GPU is worth 509-534 tok/s single-stream**, at the cost of
+sharding nearly every kernel and keeping the router selection consistent across
+cards.  Real, past 500, and a great deal of work for ~20%.
+
+## The cheaper use of the same card
+
+`lm_head` is 14.7% of the traffic, 10.7% of the step, and -- uniquely -- needs
+**one exchange per token** rather than one per layer, because it is the last
+thing that happens and only the argmax has to cross:
+
+    single GPU   lm_head 215.0 MB, ~232 us + argmax ~10 us
+    split        each card 107.5 MB, ~119 us, then exchange (val, idx)
+                 = 6.5 us of communication
+    net          ~116 us saved = 5.1% of the step, for 0.3% of communication
+
+That is 441 -> ~465 tok/s for a sharding of one kernel and one 8-byte exchange,
+and GPU 1 idles during the 40 layers.  It is the highest ratio of gain to work
+found anywhere in this phase, and it is worth doing even though it does not
+reach 500 on its own.
+
+## The single-stream lever that needs no second card at all
+
+Both Gemini and this project independently reached the same blocker for
+speculative decoding: a draft MODEL costs more than it saves.  **Prompt-lookup
+(or n-gram) drafting is not that.**  It copies the continuation of a match of
+the last k tokens against the context already generated, costs nothing but a
+host-side search, and can be TRIGGERED -- only speculate when a match exists,
+otherwise run the plain M=1 graph at 441.
+
+Verification cost for M=4 consecutive tokens, using the measured streaming rate
+rather than the asymptote:
+
+    bytes  4 x 887.6 = 3550.4 MB  ->  4.30 ms at 825 GB/s
+    + toll 0.268 + small kernels 0.221 .. 0.884
+    = 4.79 .. 5.45 ms for 1 to 4 tokens
+
+    2 of 4 accepted : 2 x 2.266 = 4.53 ms -> LOSES
+    3 of 4 accepted : 6.80 ms -> 1.42 .. 1.25x  ->  553 .. 625 tok/s
+    4 of 4 accepted : 9.06 ms -> 1.89 .. 1.66x  ->  740 .. 834 tok/s
+
+**Break-even is 2.11-2.40 accepted tokens of 4**, so it needs roughly a 75%
+acceptance rate.  On copied identifiers, file paths, JSON keys and repeated
+phrases that is plausible; on novel prose it is not, which is exactly why the
+trigger matters.
+
+Prompt-lookup speculation and batch-4 share the SAME M=4 kernels, so the M=4
+build pays for both.  That makes it the single highest-value piece of work
+outstanding, and it is the recommendation.
