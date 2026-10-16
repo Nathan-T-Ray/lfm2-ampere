@@ -194,7 +194,11 @@ int main(int argc, char ** argv) {
         // a logits tensor, then select.  Calling only the second one (as an
         // earlier revision of this test did after the split) silently tested
         // nothing at all.
-        k_router_dot<<<LK_N_EXPERTS, 32>>>(dh, dgi, dlogits, nullptr, 0.0f);
+        //
+        // k_router_dot gained bias/sel/sig for T4r.  That path is off by
+        // default, so sel and sig are null here and the sigmoid stays in
+        // k_router_top4 where this test can see it.
+        k_router_dot<<<LK_N_EXPERTS, 32>>>(dh, dgi, dlogits, db, nullptr, nullptr, nullptr, 0.0f);
         k_router_top4<<<1, LK_N_EXPERTS>>>(dlogits, db, didx, dw);
         CK(cudaDeviceSynchronize());
         int gi[LK_TOP_K]; float gw[LK_TOP_K];
