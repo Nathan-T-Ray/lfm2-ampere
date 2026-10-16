@@ -164,6 +164,18 @@ bench-norm: $(BUILD)/bench_norm
 bench-small: $(BUILD)/bench_small
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_small
 
+$(BUILD)/bench_ovh: tests/bench_ovh.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
+
+# The per-launch fixed cost, and whether a small grid still saturates DRAM.
+# The engine's profile table shows GB/s falling monotonically with kernel size
+# (925 at 215 MB/call, 728 at 14 MB, 620 at 7 MB, 431 at 3.5 MB, 110 at 0.5 MB).
+# This decides whether that is a real size-dependent efficiency or one constant
+# added per launch -- and therefore whether there is any headroom to recover.
+# It also gates the 64-block x 1024-thread shapes the planned fusions require.
+bench-ovh: $(BUILD)/bench_ovh
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_ovh
+
 # Gate G3: launch cost, event-bracket cost and graph-replay cost.  Run this
 # before believing any per-kernel profile.
 bench-launch: $(BUILD)/bench_launch

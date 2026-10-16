@@ -1035,6 +1035,72 @@ __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict_
     }
 }
 
+// ---------------------------------------------------------------------------
+// T1: k_moe_accum4 folded into k_moe_down.
+//
+// k_moe_accum4 used to be its own graph node: it read the four expert outputs
+// back from global, weighted them, added the residual and ran the Phase 4y norm
+// epilogue -- but k_gemv_q4_0_exp had written those four outputs one node
+// earlier, so the round trip was 4*2048*4 = 32 KB of pure waste per layer, plus
+// a whole node.
+//
+// The barrier this removes is not a cross-block one, it is a kernel launch, and
+// Phase 4x established that a node costs more than the work it carries (a
+// cross-block last-block sync measured 1.5-2.0 us against 0.605 us of dispatch).
+//
+// Grid is LK_HIDDEN/32 x 1024: one thread block owns 32 output rows, which is
+// exactly one Q8_1 block of the next activation, so the 32 values meet in
+// shared memory exactly once and warp 0 quantises them -- the same epilogue
+// shape k_gemv_q4_0_prod uses.
+//
+// Bit-identical to the two kernels it replaces.  The per-expert dot keeps the
+// `j = lane; j < bpr; j += 32` order and the same warp_sum, and the weighted
+// sum runs k = 0,1,2,3 in the order k_moe_accum4 used, so both the dot and the
+// combination round at exactly the same points.
+__global__ void k_moe_down_accum(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, int rows_per_expert, int xq_stride,
+                                 const int * __restrict__ d_idx, const float * __restrict__ d_w,
+                                 float * __restrict__ dst, LKNormProd np) {
+    __shared__ float s_x[32];
+    __shared__ float s_u[32];
+    const int tw   = threadIdx.x >> 5;                 // warp within the block
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * 32 + tw;             // one output row per warp
+
+    if (row < out_rows) {
+        // The four experts are walked one after another rather than issued
+        // together.  Hoisting all four dots above the reductions so their loads
+        // overlap is the obvious-looking move and it measured WORSE (12.77 vs
+        // 12.32 us per layer): four live accumulators plus four sets of row
+        // pointers cost enough registers to lose more latency hiding than the
+        // extra memory-level parallelism returns.
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < LK_TOP_K; ++k) {
+            const size_t base = (size_t) d_idx[k] * rows_per_expert * bpr;
+            const uint4  * qrow = qs + base + (size_t) row * bpr;
+            const __half * drow = d  + base + (size_t) row * bpr;
+            const block_q8_1 * xk = xq + (size_t) k * xq_stride;
+            float acc = 0.0f;
+            for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xk + j);
+            a += d_w[k] * warp_sum(acc);
+        }
+        const float xv = dst[row] + a;
+        dst[row] = xv;
+        const float uv = np.w ? xv * np.w[row] : 0.0f;
+        if (np.h32) np.h32[row] = uv;
+        if (lane == 0) { s_x[tw] = xv; s_u[tw] = uv; }
+    }
+    // Unconditional, and outside every early exit: a divergent __syncthreads
+    // hangs rather than errors.
+    __syncthreads();
+    // One Q8_1 block per kernel block, owned entirely by warp 0.  Pass the BASE
+    // yq8 -- lk_norm_prod_warp indexes by `b` itself.
+    if (np.w && tw == 0)
+        lk_norm_prod_warp(s_x[lane], s_u[lane], lane, np.yq8, np.ssq, blockIdx.x);
+}
+
 
 // ---------------------------------------------------------------------------
 // Split-K attention (FlashDecoding shape).

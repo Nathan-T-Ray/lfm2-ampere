@@ -654,12 +654,12 @@ static void forward(Engine & e, cudaStream_t st) {
             LKP_B("moe_swiglu");
     k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
             
-            // down: each expert consumes its OWN 48-block activation slice
+            // down: each expert consumes its OWN 48-block activation slice.
+            // T1: this node also now does what k_moe_accum4 used to do -- weight
+            // the four expert outputs, add the residual, and produce the NEXT
+            // layer's attn_norm (Phase 4y).  The four outputs never leave the
+            // kernel, so moe_down4 has left the graph entirely.
             LKP_B("moe_down");
-    k_gemv_q4_0_exp<<<dim3(grid_for(LK_HIDDEN), LK_TOP_K), 256, 0, st>>>(
-                PQS(e, l.ed), PD(e, l.ed), e.xq2, LK_HIDDEN, 48, LK_HIDDEN, 48,
-                e.d_idx, e.moe_down4); LKP_E();
-            LKP_B("moe_accum");
     // Phase 4y: layer il's accumulator is also the producer of layer il+1's
     // attn_norm, and of norm_final at the last layer.  `np.w == nullptr` when
     // this layer's successor still has its own norm node (the LK_NORM_PROD_GEMV
@@ -671,7 +671,9 @@ static void forward(Engine & e, cudaStream_t st) {
         np.h32 = nullptr;                 // the router reads the POST-ffn norm
         np.yq8 = e.xq;
         np.ssq = e.norm_ssq;
-        k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN, np); LKP_E();
+    k_moe_down_accum<<<LK_HIDDEN / 32, 1024, 0, st>>>(
+                PQS(e, l.ed), PD(e, l.ed), e.xq2, LK_HIDDEN, 48, LK_HIDDEN, 48,
+                e.d_idx, e.d_w, e.x, np); LKP_E();
     }
         }
     }

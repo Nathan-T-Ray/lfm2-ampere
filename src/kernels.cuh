@@ -547,3 +547,21 @@ __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __
 // half of the fusion that requires no launch-shape change at all.
 __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict__ down4,
                              const float * __restrict__ d_w, int n, LKNormProd np);
+
+// T1: k_moe_accum4 folded into the expert down projection.
+//
+// k_moe_accum4 used to be its own graph node: it read the four expert outputs
+// back from global memory, weighted them, added the residual and ran the Phase
+// 4y norm epilogue -- but moe_down had written those four outputs one node
+// earlier, so the round trip was 32 KB of pure waste per layer.
+//
+// The barrier this removes is not a cross-block one, it is a whole kernel
+// launch, and Phase 4x established that a node costs more than the work it
+// carries.  Grid is LK_HIDDEN/32 x 1024, so one thread block owns 32 output
+// rows == exactly one Q8_1 block of the next activation, and the epilogue is
+// the same shared-memory pattern k_gemv_q4_0_prod uses.
+__global__ void k_moe_down_accum(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, int rows_per_expert, int xq_stride,
+                                 const int * __restrict__ d_idx, const float * __restrict__ d_w,
+                                 float * __restrict__ dst, LKNormProd np);
