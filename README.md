@@ -6,10 +6,10 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 144 | **417.2 tok/s** (3 repeats, deterministic) |
+| decode, ctx 159 | **417.4 tok/s** (3 repeats, sd 1.87) |
 | effective bandwidth | 612 GB/s = **60.7% of the 1008 GB/s spec** |
-| llama.cpp, same GGUF/GPU | 227.07 tok/s |
-| speedup vs llama.cpp | **1.81x** |
+| llama.cpp, same GGUF/GPU, same session | 257.9 tok/s |
+| speedup vs llama.cpp | **1.62x**, and flat at 1.61-1.62x to 3.2k context |
 | speedup vs this engine's own Phase-3 baseline | **3.99x** (102.79 tok/s) |
 | traffic | 1466.75 MB/token, so the bandwidth floor is 1.534 ms = **652 tok/s** |
 
@@ -30,15 +30,24 @@ decode rate is FLAT across the whole range -- which is what exposed the bug
 below, because comparing our numbers only against our own short-context number
 cannot detect a context-dependent defect.
 
-| ctx | llama.cpp | liquid-kernel | ratio |
-|---|---|---|---|
-| 164 | 241.6 | **426.3** | 1.76x |
-| 1064 | 251.8 | **408.7** | 1.62x |
-| 2064 | 246.1 | **400.5** | 1.63x |
-| 4064 | 247.2 | **375.9** | 1.52x |
-| 8064 | 240.6 | **333.8** | 1.39x |
+Both engines were re-measured in the SAME session at the same prompt lengths
+(`tools/oracle_bench.py`, which reads the token count back out of llama.cpp's own
+timing line rather than assuming it).  An earlier version of this table compared
+our fresh numbers against llama.cpp numbers from a different session and reported
+a 1.76x short-context lead; the true figure is 1.62x, and the discrepancy was
+cross-session drift of about 2%, not a difference between the engines.
 
-The context slope fell from 216 ns per context token to 82.
+| ctx | llama.cpp | liquid-kernel | ratio | our GB/s | % of 1008 peak |
+|---|---|---|---|---|---|
+| 159 | 257.9 | **417.4** | 1.62x | 612 | 60.7% |
+| 872 | 254.2 | **412.1** | 1.62x | 604 | 60.0% |
+| 1647 | 251.6 | **406.5** | 1.62x | 596 | 59.2% |
+| 3228 | 247.4 | **398.6** | 1.61x | 585 | 58.0% |
+| 6390 | 244.9 | **377.9** | 1.54x | 554 | 55.0% |
+
+The context slope fell from 216 ns per context token to **40 ns** (llama.cpp's is
+33 ns), and the short-context lead is now constant out to 3.2k rather than
+decaying immediately.
 
 ### The bug that flat llama.cpp exposed
 
@@ -177,6 +186,34 @@ was measured dead above. The realistic maximum is ~450-480 tok/s.
    Compute the exact answer from the weights; here it costs one float64 GEMM.
 4. **Measure the gate before building what it gates.** See Phase 5 above.
 
+## Why 550 is out of reach at batch 1, and what would reach it
+
+At batch 1 this workload is neither compute-bound nor bandwidth-bound.  It is
+**fixed-cost-bound**, and that is what bounds the lead over llama.cpp:
+
+| | tok/s | effective GB/s | % of the 956 GB/s achievable |
+|---|---|---|---|
+| llama.cpp | 257.9 | 378 | 40% |
+| liquid-kernel | 417.4 | 612 | 64% |
+| roofline (100% of achievable) | 652 | 956 | 100% |
+
+Both engines must stream the same 1466.75 MB per token -- that is the format, not
+an implementation choice, and we already read only the 4 of 64 experts the router
+selects (807 MB of the 1466.75).  So the only thing an implementation can win at
+batch 1 is bandwidth efficiency, and the largest possible multiple over llama.cpp
+is 956/378 = 2.5x, of which 1.62x is taken.
+
+The 0.68 ms between our 2.40 ms step and the 1.53 ms bandwidth floor is itemised:
+0.27 ms launching 461 kernels at ~0.6 us each, 0.30 ms inside 80 normalisation
+kernels and the router that each reduce 2048 numbers in a single block and cannot
+be made wider, 0.11 ms of compute-only kernels.  None of it is bandwidth.
+
+The way past it is batching, which amortises every weight byte across the tokens
+in the batch.  MoE reuse is the constraint, and G4b measured it: a batch of 4
+tokens draws 11.22 distinct experts out of 16 slots, a 1.43x saving.  At batch 4
+that puts 0.73 GB/token on the wire instead of 1.47 -- about 2x, or ~830 tok/s at
+today's bandwidth efficiency.
+
 ## Architecture ground truth
 
 Extracted from llama.cpp `src/models/lfm2.cpp` (which `lfm2moe.cpp` aliases):
@@ -269,7 +306,10 @@ inside a graph capture), `LK_DEBUG_STEPS`, `LK_DUMP_LAYERS`, `LK_LOGIT_DUMP`,
 - [x] **G3/C1** greedy parity: factual bit-identical 66/66
 - [x] **G3/C2** perplexity 0.0402% from exact (target 0.1%) — **PASS**
 - [x] **G4b** routing skew measured; speculative decoding **rejected on evidence**
-- [ ] **G4/C4** 390.3 tok/s vs the 550 target — **not met, and shown unreachable
-      for this weight format** (bandwidth floor 1.534 ms + 0.308 ms dispatch =
-      543 tok/s ceiling with perfect bandwidth)
+- [x] **G6** attention equivalence against both the serial kernel and exact
+      float64 — **PASS**, and it caught a real bug (see Phase 4v)
+- [ ] **G4/C4** 417.4 tok/s vs the 550 target — **not met, and shown unreachable
+      at batch 1 for this weight format**.  The roofline is 652 tok/s and the
+      practical ceiling with the current kernel structure is ~450.  See
+      "Why 550 is out of reach here, and what would reach it" below
 - [ ] **G5** speculative decoding — cancelled by G4b
