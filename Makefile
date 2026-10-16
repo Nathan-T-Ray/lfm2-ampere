@@ -242,6 +242,19 @@ $(BUILD)/test_megakernel: tests/test_megakernel.cu src/megakernel.cuh $(BUILD)/k
 test-megakernel: $(BUILD)/test_megakernel
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_megakernel
 
+# PHASE 5, CAMPAIGN 2.  The first verdict closed the megakernel on a barrier that
+# was measured with three confounds (false sharing on one 128B line, a memset
+# launch charged inside the timed region, and a barrier cadence of exactly one
+# per stage) at the ONE stage size where a kernel boundary is cheapest.  This
+# instrument gives the barrier a fair trial, one factor at a time, and then asks
+# the question the first one never asked: is there ANY stage size where a
+# persistent kernel beats a graph?  158 of the engine's 343 nodes are small.
+$(BUILD)/bench_mkbar: tests/bench_mkbar.cu src/mkbar.cuh src/megakernel.cuh $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_mkbar.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+bench-mkbar: $(BUILD)/bench_mkbar
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_mkbar
+
 # --- gates ------------------------------------------------------------------
 # C1  greedy parity vs llama.cpp
 # C1a step-1 top-1 agreement + full-vocabulary correlation

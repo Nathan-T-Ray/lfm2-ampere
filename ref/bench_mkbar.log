@@ -1,0 +1,118 @@
+device: NVIDIA GeForce RTX 3090 Ti  SMs=84  maxThreadsPerSM=1536  L2=6 MB
+
+k_probe_b occupancy 6 blocks/SM -> NB = 504 resident blocks (1536 threads/SM, 100% of the 1536 ceiling)
+
+shape BIG: 12288 rows x 64     31 stages x 14.16 MB = 439 MB
+shape SML: 2048 rows x 64     130 stages x 2.36 MB = 307 MB
+
+(6) BIT-IDENTITY, every variant, 8 stages, memcmp
+    V0 legacy unpadded 2fence ns64    BIT-IDENTICAL
+    V1 unpadded +acquire ns64         BIT-IDENTICAL
+    V2 PADDED 2fence ns64             BIT-IDENTICAL
+    V3 PADDED 2fence ns0              BIT-IDENTICAL
+    V4 PADDED 2fence ns32             BIT-IDENTICAL
+    V5 PADDED 2fence ns128            BIT-IDENTICAL
+    V6 PADDED 2fence ns256            BIT-IDENTICAL
+    V7 PADDED PTX ns64                BIT-IDENTICAL
+    V8 PADDED PTX ns0                 BIT-IDENTICAL
+    V9 PADDED PTX ns32                BIT-IDENTICAL
+    V10 TREE G=4                       BIT-IDENTICAL
+    V11 TREE G=8                       BIT-IDENTICAL
+    V12 TREE G=16                      BIT-IDENTICAL
+    V13 TREE G=84                      BIT-IDENTICAL
+    -> 14/14 variants bit-identical
+
+(1) BARRIER SHOOTOUT, counters reset OUTSIDE the timing
+    shape BIG, 31 stages of 14.16 MB
+    variant                          us/stage   bar cost
+------------------------------------------------------------------
+    separate launches (graph)          17.201          -
+    NO barrier (cost control)          16.007      0.000
+    LAUNCH BOUNDARY (ref-nobar)         1.194      1.194
+    legacy unpadded 2fence ns64        18.524      2.517   +1.323 vs boundary
+    unpadded +acquire ns64             19.013      3.006   +1.812 vs boundary
+    PADDED 2fence ns64                 18.524      2.516   +1.323 vs boundary
+    PADDED 2fence ns0                  19.119      3.112   +1.918 vs boundary
+    PADDED 2fence ns32                 18.544      2.537   +1.343 vs boundary
+    PADDED 2fence ns128                18.571      2.563   +1.369 vs boundary
+    PADDED 2fence ns256                18.538      2.530   +1.336 vs boundary
+    PADDED PTX ns64                    18.504      2.497   +1.303 vs boundary
+    PADDED PTX ns0                     18.861      2.854   +1.660 vs boundary
+    PADDED PTX ns32                    18.504      2.497   +1.303 vs boundary
+    TREE G=4                           18.564      2.557   +1.363 vs boundary
+    TREE G=8                           18.617      2.610   +1.416 vs boundary
+    TREE G=16                          18.609      2.602   +1.408 vs boundary
+    TREE G=84                          18.649      2.642   +1.448 vs boundary
+
+(2) SAME SHOOTOUT, counters reset INSIDE the timing (the published
+    instrument).  Delta vs part (1) = the hidden memset launch.
+    variant                          reset in  reset out     hidden
+----------------------------------------------------------------------
+    legacy unpadded 2fence ns64        18.655     18.524      0.130
+    unpadded +acquire ns64             19.172     19.013      0.158
+    PADDED 2fence ns64                 18.669     18.524      0.145
+    PADDED 2fence ns0                  19.238     19.119      0.119
+    PADDED 2fence ns32                 18.709     18.544      0.165
+    PADDED 2fence ns128                18.675     18.571      0.104
+    PADDED 2fence ns256                18.676     18.538      0.139
+    PADDED PTX ns64                    18.630     18.504      0.126
+    PADDED PTX ns0                     19.000     18.861      0.139
+    PADDED PTX ns32                    18.630     18.504      0.126
+    TREE G=4                           18.769     18.564      0.205
+    TREE G=8                           18.709     18.617      0.092
+    TREE G=16                          18.610     18.609      0.001
+    TREE G=84                          18.618     18.649     -0.031
+
+(3) SHOOTOUT at a shape where MOST BLOCKS IDLE (rows=2048)
+    separate launches (graph)           4.726
+    NO barrier (cost control)           2.563
+    LAUNCH BOUNDARY                     2.163      2.163
+    legacy unpadded 2fence ns64         5.138      2.575
+    unpadded +acquire ns64              5.150      2.588
+    PADDED 2fence ns64                  5.140      2.578
+    PADDED 2fence ns0                   5.599      3.036
+    PADDED 2fence ns32                  5.153      2.590
+    PADDED 2fence ns128                 5.145      2.582
+    PADDED 2fence ns256                 5.147      2.584
+    PADDED PTX ns64                     6.191      3.628
+    PADDED PTX ns0                     11.122      8.559
+    PADDED PTX ns32                     6.193      3.630
+    TREE G=4                            5.144      2.581
+    TREE G=8                            5.144      2.581
+    TREE G=16                           5.140      2.578
+    TREE G=84                           5.142      2.579
+
+(4) CADENCE SWEEP, flat (V2) vs tree (V11), shape BIG
+    MEASURED TWICE, round-robin.  A cadence sweep that is only measured
+    once cannot tell a cadence effect from drift: the first version of
+    this table read 23.9 us at cad=1 where parts (1) and the published
+    test both read 18.5, and there was no way to see which was wrong.
+    `per node` is the column that decides it: it is the barrier's cost
+    divided over the stages it covers, and it must beat the boundary.
+     cad |   flat r1   flat r2   per nod |   tree r1   tree r2   per nod
+----------------------------------------------------------------------------
+       1 |    18.505    18.513     2.506 |    18.505    18.505     2.497
+       2 |    17.514    17.507     2.906 |    17.507    17.509     2.909
+       4 |    16.959    16.926     3.558 |    16.979    16.959     3.686
+       8 |    16.703    16.695     5.325 |    16.721    16.676     5.184
+      16 |    16.485    16.505     7.709 |    16.496    16.516     7.885
+      32 |    16.358    16.331    10.035 |    16.364    16.344    10.445
+    boundary for reference: 1.194 us PER NODE
+
+(5) SMALL-STAGE SWEEP.  graph of N launches vs 1 persistent + N barriers
+        stage      KB      NST graph us/s persist us/s     ratio
+--------------------------------------------------------------
+           8K     8.0      400      1.334      2.054    0.649x
+          32K    32.0      400      1.451      2.054    0.707x
+         128K   128.0      400      1.470      2.054    0.716x
+         512K   512.0      400      1.901      2.907    0.654x
+        2048K  2048.0      400      3.855      4.312    0.894x
+        8192K  8192.0      400     11.784     12.284    0.959x
+
+VERDICT LOGIC
+  part 1 says what a handoff really costs; part 2 says how much of the
+  published 2.17 us was a memset; part 4 says whether fewer barriers are
+  cheaper; part 5 says whether there is ANY stage size where a persistent
+  kernel beats a graph.  If part 5 shows a crossover, the megakernel is
+  not refuted -- it is simply not applicable at batch 1's large stages.
+EXIT=0
