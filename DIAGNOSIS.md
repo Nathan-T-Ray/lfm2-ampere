@@ -1760,3 +1760,53 @@ three land at once.
 ** The reliable route to 500+ on one card is batching, not batch-1 tuning. **
 Batch-4 was estimated at 731-832 tok/s aggregate in Phase 4z.2 from the same
 measured decomposition, and it uses one GPU.
+
+
+# Phase 4z.5: the power limit, measured
+
+The last suggestion was that the card is power-capped at 350 W instead of 450 W
+and that lifting it would help.  It is a good hypothesis for this engine,
+because 0.71 ms of the 2.266 ms step is LATENCY-bound work -- 158 small kernels,
+343 launch gaps, per-kernel ramps -- and latency-bound work scales with SM
+clock.  So it was worth measuring rather than dismissing.
+
+    nvidia-smi -q -d POWER        Current Power Limit : 450.00 W
+                                  Requested Power Limit: 450.00 W
+                                  Default Power Limit : 450.00 W
+                                  Max Power Limit     : 450.00 W
+    nvidia-smi -pl 450            "Insufficient Permissions" -- but it is
+                                  already at the maximum, so there is nothing
+                                  to raise
+
+Sampled every 250 ms DURING a 3000-token run (426.3 tok/s at ctx 3008):
+
+    SM clock       2055 MHz   against a 2100 MHz maximum   = 97.9%
+    Memory clock  10501 MHz   against a 10501 MHz maximum  = 100%
+    Power draw      362.7 W   against a 450 W limit        = 80.6%
+    Throttle reasons under load:
+        SW Power Cap           Not Active   (counter: 0 us)
+        HW Slowdown            Not Active
+        HW Thermal Slowdown    Not Active
+        SW Thermal Slowdown    Not Active
+    utilization.gpu  100%      utilization.memory  82% during streaming
+
+**The card is not throttled and there is nothing to unlock.**  It boosts to
+2055 MHz, which is ABOVE the 3090 Ti's ~1860 MHz stock boost, holds the memory
+at its full 21 Gbps, and never draws more than 363 W of its 450 W budget.
+
+The reason is structural rather than accidental: this is a memory-bound
+workload, so the SMs spend their time stalled on loads rather than issuing
+arithmetic, and stalled SMs do not draw power.  A 450 W budget with 87 W unused
+is the signature of a kernel that is waiting, not computing.  Raising the limit
+would change nothing because the limit is not being reached.
+
+Two smaller readings worth keeping:
+
+  * 2.1% of SM clock remains (2055 -> 2100 MHz) and it is not reachable without
+    an overclock, which needs root and nvidia-settings.  Even if it were, it
+    would only touch the latency-bound third of the step, so under 1% overall.
+  * `utilization.memory` sits at 82% while streaming, which independently
+    reproduces the 825 GB/s of 956 GB/s (86%) the engine sustains.  The memory
+    subsystem really is idle for roughly a sixth of the token, and that idle
+    time is the launch toll and the per-kernel ramps -- the same 0.71 ms, seen
+    from the hardware counter instead of from a timer.
