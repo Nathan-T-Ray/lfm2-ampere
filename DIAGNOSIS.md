@@ -1183,3 +1183,187 @@ common-mode shift that cancels in the softmax -- which is why the nll moves by
 0.02% while individual logits move by 1%.  The GEMV half adds 42 more sites and
 moves the median to 0.133, i.e. it behaves exactly like the half already
 accepted, which is the strongest evidence available that it is not broken.
+
+
+# Phase 4z: the profiler's fixed cost, and where node deletion stops paying
+
+Phase 4z set out to delete ~148 graph nodes on the strength of the exchange rate
+Phase 4y measured (1.29-1.81 us per deleted norm node).  Two of the four planned
+fusions were built, measured and rejected, and the exchange rate turned out to
+be three to four times smaller than assumed.  The reason is worth more than the
+transformations were.
+
+## The profile table's GB/s column is not comparable across kernel sizes
+
+Every streaming kernel in the report showed a different bandwidth, falling
+monotonically as the kernel got smaller:
+
+    lm_head       215.04 MB/call   925.1 GB/s
+    moe_gate_up    14.16 MB/call   727.8 GB/s
+    moe_down        7.08 MB/call   619.9 GB/s
+    attn_qkv        3.54 MB/call   431.3 GB/s
+    router_dot      0.52 MB/call   110.0 GB/s
+
+A least-squares fit of time = a + bytes/BW over all eleven streaming kernels
+gives **BW = 941.8 GB/s with a = 4.12 us, and every residual inside +-1.03 us**.
+941.8 GB/s is the measured achievable figure (956 GB/s, bandwidth_probe).  So
+every one of those kernels was already at peak marginal bandwidth and the whole
+spread was one constant.
+
+`tests/bench_ovh.cu` measures it directly rather than inferring it.  Sweeping a
+cold 7.078 MB read (the exact per-call traffic of moe_down and shortconv_in):
+
+    grid x block      un-bracketed        with the engine's LKP_B/LKP_E bracket
+    (64, 1024)          9.59 us  737.9     11.09 us  638.5     T1/T3 candidate
+    (768, 256)          9.42 us  751.0     10.89 us  650.1     shortconv_in today
+    (1024, 256)         9.45 us  749.3     10.91 us  649.0     moe_down today
+    (1536, 256)         9.40 us  752.8     10.91 us  649.0     moe_gate_up today
+    (2048, 256)         9.40 us  752.9     10.80 us  655.1     many small blocks
+    (4096, 256)        10.37 us  682.8     11.82 us  598.9     oversubscribed
+
+Two results.  First, **the bracket costs a flat 1.40-1.49 us**, independent of
+size -- which is exactly why it costs 123 GB/s of apparent bandwidth at 3.4 MB
+and only 19.7 GB/s at 54 MB.  Second, **all of the engine's own shapes land
+within 2% of each other** (737.9 to 752.9), while the profile table showed a 17%
+spread between them.  The spread was instrument, not silicon.
+
+The buffer is 768 MB and every repetition reads a different window, so each
+measurement is cold; without that a 7 MB read is partly L2-resident and
+overstates bandwidth.  A graph replay of the same kernel saves 0.6 us/node
+against a direct launch, consistent with tests/bench_launch.cu.
+
+**RETRACTED.**  Phase 4y's report listed a "0.060 ms unexplained gap" between
+moe_down (619.9 GB/s) and moe_gate_up (727.8 GB/s) at the same shape.  There is
+no gap.  Three separate proposals were made to explain it -- that bpr = 48
+leaves lanes 16-31 idle on the second loop pass, and that the 96-byte d-plane
+row stride splits cache lines -- and both are wrong:
+
+  * `shortconv_in` is the control.  It has bpr = 64, no half-empty iteration,
+    the same 7.078 MB per call, and reports the SAME 622.7 GB/s.  If bpr = 48
+    cost 17%, shortconv_in would have been at 728.
+  * 96 bytes is 3 x 32-byte sectors, so every row of the d plane is exactly
+    sector-aligned.  There is nothing to split.
+
+## The exchange rate for deleting a node is 0.3-0.45 us, not 1.5 us
+
+Two transformations were built and both were measured with the interleaved A/B,
+the second one three ways in a single session so the comparison could not be
+confounded by clock drift.
+
+**T1 -- k_moe_accum4 folded into the expert down projection.  ACCEPTED, +0.69%.**
+k_moe_accum4 was its own node: it read the four expert outputs back from global,
+weighted them, added the residual and ran the Phase 4y epilogue -- but
+moe_down had written them one node earlier, so the round trip was 32 KB of waste
+per layer.  The fused kernel is <<<LK_HIDDEN/32, 1024>>>: one thread block owns
+32 output rows == exactly one Q8_1 block of the next activation, so the epilogue
+is the same shared-memory pattern k_gemv_q4_0_prod already uses.
+
+    ctx 272   439.48 -> 442.43 tok/s   +0.67%   spread 0.09% / 0.15%
+    ctx 8128  383.18 -> 385.31 tok/s   +0.56%   spread 0.62% / 0.76%
+
+BIT-IDENTICAL 7/7.  Graph nodes 381 -> 343.
+
+Also tried and rejected inside T1: hoisting all four expert dots above their
+reductions so the loads overlap.  Measured 12.77 vs 12.32 us per layer -- four
+live accumulators and four row pointers cost more registers than the extra
+memory-level parallelism returns.
+
+**T4r -- the router top-4 rebuilt in the consumer's prologue.  REJECTED, -0.17%.**
+k_router_top4 is a <<<1,64>>> node carrying ~70 instructions, measured at
+1.769 us/node in a graph (tests/bench_small.cu).  T4r rebuilds the selection in
+every block of moe_gate_up from two 64-float arrays that k_router_dot now emits
+(d_sel = sigmoid + bias for RANKING, d_sig = unbiased sigmoid for the WEIGHTS),
+with no cross-block communication and no counter.  The sigmoid deliberately
+stays in k_router_dot: moving it into a consumer that runs in 1536 blocks would
+cost 1536 x 64 = 98k expf, about 3.3 us per layer.
+
+    pre4z      438.31 tok/s
+    T1 only    441.32   (+0.69%)
+    T1 + T4r   440.90   (-0.17% vs T1 only)   spread 0.03% / 0.05%
+
+The mechanism is sound and the result is still negative, because of placement:
+hosting the selection in moe_gate_up puts a __syncthreads in front of the weight
+stream of the hottest kernel in the engine.  Kept behind ROUTER_PRO (default 0).
+
+**T2 -- SwiGLU folded into the gate/up GEMV.  REJECTED, -1.75%.**
+Reshaping k_gemv_q4_0_exp2 from <<<(192,8),256>>> to <<<(48,4),1024>>> so each
+warp computes both the gate and the up projection and the block quantises its
+own 32 results into one Q8_1 block.  BIT-IDENTICAL 7/7, and still:
+
+    ctx 272   441.69 -> 433.96 tok/s   -1.75%   spread 0.25% / 0.06%
+    ctx 8128  385.64 -> 379.44 tok/s   -1.61%   spread 0.25% / 0.27%
+
+moe_gate_up went from 19.36 to 22.00 us.  Keeping silu(gate)*up inside one warp
+forces each warp to own one row of BOTH projections, which drops the grid from
+12288 warps to 3072.  There is no shape that avoids this: a 1024-thread block
+has 32 warps, the Q8_1 block is 32 rows, and both projections of a row must meet
+before the non-linearity.
+
+This also required a dedicated `moe_act` buffer.  k_swiglu could write xq2
+because it ran as its own node, after gate/up had finished reading it; a fused
+kernel has some blocks writing xq2 while others are still reading it, which is
+the Phase 4y aliasing bug exactly.
+
+## The generalisable result
+
+**Fusing into moe_gate_up loses.**  Both failures have the same root cause, and
+it is not the fusion mechanism -- both were bit-identical and both were
+barrier-free in the Phase 4y sense.  It is that moe_gate_up is the engine's
+bandwidth-critical kernel (24% of the step, 14.16 MB per call) and its shape is
+at a local optimum: 12288 warps, 256-thread blocks, one row per warp.  Any
+transformation that reduces its warp count (T2) or puts a synchronisation point
+ahead of its first weight load (T4r) costs more than the node it removes.
+
+The distinction that survives is *where* a barrier sits.  At the END of a kernel
+it serialises only the epilogue -- which is why Phase 4y's epilogue in
+k_gemv_q4_0_prod pays, and why the T1 epilogue in k_moe_down_accum pays.  At the
+START it gates the critical path, which is why T4r does not.
+
+Delete-a-node is worth the dispatch plus whatever execution was not already
+hidden, and for the small nodes the profiler flatters (moe_accum4 at 3.82 us
+profiled, router_top4 at 4.03 us) that execution is nearly all hidden already.
+Hence 0.3-0.45 us, not the 1.5 us Phase 4y's norm kernels suggested -- those
+carried a real 2048-element reduction that the fused form eliminated.
+
+## A gate that can see residual-stream error
+
+C2 recomputes lm_head in float64 from the residual stream the engine DUMPED, so
+it bounds lm_head's error GIVEN a residual, not the residual's own error.  The
+557-token end-to-end nll that covers that has SE ~ 11%, far too coarse.
+
+`tools/paired.py` replaces it with a **paired** per-token comparison.
+`LK_PPL_DUMP` already wrote one line per position (index, nll, argmax, target);
+because `ppl` mode is teacher-forced, both builds score the identical token
+stream by construction, so differencing per position cancels token difficulty:
+
+    sd(nll)      2.3775 nats   -> unpaired se 0.1420
+    sd(delta)    0.2358 nats   -> paired   se 0.00999     pairing sharpens 14.2x
+
+Controls: the same binary twice gives delta EXACTLY 0.000000, and the known
+Phase 4y difference is detected.  Two robust readings are reported alongside the
+mean because the delta has a heavy tail at the positions where the top-1
+prediction flips -- for the 4y comparison the mean says -0.0101 nats (t = -1.01)
+while the median is +0.000072 and the sign test is 281 up / 276 down (z = +0.21),
+i.e. a wash.
+
+Note the honest bound: this resolves **2.0% of perplexity** on 557 tokens, not
+the 0.08% that was predicted for it.  The prediction assumed sd(delta) would be
+tiny; it is 0.236 nats, a 10x reduction rather than a 1000x one, and sqrt(557)
+does the rest.
+
+## Not attempted
+
+T3 (fold the ShortConv conv into shortconv_in) and T5 (fold qk_norm_rope into
+attn_qkv) were planned and are not done.
+
+T5 is **dropped as specified**: its premise is false.  k_gemv_q4_0_3 gives each
+warp one row and each 256-thread BLOCK eight rows, so a 64-dim head spans eight
+blocks, not one.  Fusing the per-head RMSNorm(64) + RoPE would force
+<<<48,2048>>>, leaving 36 of 84 SMs idle.
+
+T3 remains plausible -- shortconv_in is not the bandwidth-critical kernel, its
+epilogue would sit at the END, and bench_ovh measured the required (64,1024)
+shape at 737.9 GB/s against 751.0 for the shape it would replace, a 2% penalty
+on a 0.6% prize.  But T2's failure is evidence that a 3x warp-count drop is not
+free even when the pure-read probe says it is, and shortconv_in would drop from
+6144 warps to 2048.  Left undone deliberately, with that reasoning recorded.
