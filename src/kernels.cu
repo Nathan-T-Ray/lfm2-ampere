@@ -402,6 +402,14 @@ __global__ void k_router_top4(const float * __restrict__ logits,
     // exactly p_r.  Ties go to the lower expert index.  Each round is five
     // shfl_xor steps carrying a (value, index) pair.
     static_assert(LK_TOP_K == 4, "four selection rounds assume top-4");
+// The attention split derives its slice count at runtime, so the shared score
+// array must cover the LARGEST chunk that rule can ever ask for.  With
+// slices = clamp(ceil(seq/TARGET_N), SPLIT_MIN, SPLIT), chunk = ceil(seq/slices)
+// is at most TARGET_N provided the cap can cover the whole sequence:
+static_assert(LK_ATTN_SPLIT * LK_ATTN_TARGET_N >= LK_ATTN_MAX_SEQ,
+              "attention split cap too small: chunk can exceed LK_ATTN_CHUNK");
+static_assert(LK_ATTN_CHUNK == LK_ATTN_TARGET_N,
+              "LK_ATTN_CHUNK must equal LK_ATTN_TARGET_N; see the argument in kernels.cuh");
     const int lane = t;
     float v0 = s_sel[lane],      v1 = s_sel[lane + 32];
     const int i0 = lane,         i1 = lane + 32;
@@ -777,115 +785,238 @@ __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict_
 // contiguous and the combine is ordered, the only difference from the serial
 // kernel is where the rounding happens -- which does change the result, and is
 // the reason this is measured against the parity gate rather than assumed.
-#define LK_ATTN_CHUNK ((LK_ATTN_MAX_SEQ + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT)
+//
+// That grid was still wrong, and Phase 4v below explains why.
+// LK_ATTN_CHUNK now lives in kernels.cuh, derived from LK_ATTN_TARGET_N.
+#define LK_ATTN_GQA   (LK_N_HEADS / LK_N_KV_HEADS)      // query heads per kv head
 
-__global__ void k_attn_split(const float * __restrict__ q,
-                             const __half * __restrict__ kc, const __half * __restrict__ vc,
-                             const int * __restrict__ d_pos, float * __restrict__ part) {
+// ---------------------------------------------------------------------------
+// Phase 4v: GQA-aware split -- the fix for the context cliff.
+//
+// The Phase 4u grid was (32 query heads x SPLIT), and each block fetched its
+// own kv_head's K and V for its slice.  Four query heads share every kv_head,
+// so the context was streamed from DRAM FOUR TIMES OVER.  That was invisible
+// while this was "just an optimisation": the kernel measured 870 GB/s at 8k
+// context against a 956 GB/s ceiling, i.e. it already looked like it was at the
+// wall, and 870 GB/s of *useful* data is really 4 x 870 = 3480 GB/s of pages,
+// which is impossible.  The traffic was the bug.
+//
+// The grid is now (8 kv_heads x SPLIT).  One block loads a kv_head's slice
+// ONCE and computes all four query heads that share it, so DRAM sees each K
+// and V byte exactly once.  Context traffic drops by exactly 4x:
+//
+//     before   32 heads x SPLIT x (seq/SPLIT) x 128 B x 2 (K,V) = seq * 4096 B
+//     after     8 kvh  x SPLIT x (seq/SPLIT) x 128 B x 2 (K,V) = seq * 1024 B
+//
+// and 8k context costs 164.5 MB instead of 658 MB per layer-token.
+//
+// Bit-exactness: for each head, dims are still accumulated d = 0..63 in order
+// and tokens still accumulate t = 0..n-1 in order, with the same 256-lane
+// halving tree for both reductions.  The max is exact under fmaxf regardless of
+// order.  So with LK_ATTN_SPLIT unchanged this kernel must produce BIT-IDENTICAL
+// partials to the Phase 4u kernel -- which is a testable claim, not a hope.
+//
+// The partial buffer layout is unchanged: part[head][sp][2 + 64], so
+// k_attn_combine is untouched.
+__global__ void __launch_bounds__(256)
+k_attn_split(const float * __restrict__ q,
+             const __half * __restrict__ kc, const __half * __restrict__ vc,
+             const int * __restrict__ d_pos, float * __restrict__ part) {
     const int seq_len = *d_pos + 1;
-    const int head = blockIdx.x;
-    const int sp   = blockIdx.y;
-    const int kv_head = head / (LK_N_HEADS / LK_N_KV_HEADS);
-    __shared__ float s_q[LK_HEAD_DIM];
-    __shared__ float s_score[LK_ATTN_CHUNK];
-    __shared__ float s_m[256];
-    if (threadIdx.x < LK_HEAD_DIM) s_q[threadIdx.x] = q[head * LK_HEAD_DIM + threadIdx.x];
+    const int kv_head = blockIdx.x;
+    const int sp      = blockIdx.y;
+    const int head0   = kv_head * LK_ATTN_GQA;
+    // DIM-major q: the four heads that share this kv_head are contiguous for a
+    // given dim, so one float4 shared load fetches all four q values.  Head-major
+    // (the obvious layout) needs four separate shared loads per dim, i.e. 256
+    // floating-point shared transactions per token against 64 -- and it was that
+    // shared traffic plus the 4-way dot product's live registers that pushed this
+    // kernel to 255 registers with spills, which in turn stopped the V loop
+    // unrolling and cost it the memory-level parallelism it needs.  Registers
+    // and shared traffic here are the same problem.
+    __shared__ __align__(16) float s_q[LK_HEAD_DIM * LK_ATTN_GQA];
+    __shared__ float s_score[LK_ATTN_GQA][LK_ATTN_CHUNK];
+    __shared__ float s_m[LK_ATTN_GQA][256];
+    {
+        const int d = threadIdx.x & (LK_HEAD_DIM - 1);
+        const int g = threadIdx.x >> 6;                 // 0..3
+        s_q[d * LK_ATTN_GQA + g] = q[(head0 + g) * LK_HEAD_DIM + d];
+    }
     __syncthreads();
 
-    float * P = part + ((size_t) head * LK_ATTN_SPLIT + sp) * LK_ATTN_PARTW;
-    const int chunk = (seq_len + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT;
+    const int nslices = lk_attn_slices(seq_len);
+    const int chunk = (seq_len + nslices - 1) / nslices;
     const int t0 = sp * chunk;
     const int t1 = (t0 + chunk < seq_len) ? (t0 + chunk) : seq_len;
-    if (t0 >= t1) {                       // this slice owns no tokens
-        if (threadIdx.x == 0) { P[0] = -1e30f; P[1] = 0.0f; }
-        for (int d = threadIdx.x; d < LK_HEAD_DIM; d += blockDim.x) P[2 + d] = 0.0f;
-        return;
-    }
+    // Blocks past the live slice count own no tokens and write NOTHING: at short
+    // context most of the grid is in this state, and having them store 4 x 66
+    // sentinel floats each cost a megabyte of pointless global traffic per
+    // layer.  k_attn_combine derives the same boundary and skips them.
+    if (t0 >= t1) return;
     const int n = t1 - t0;
-    float m = -1e30f;
+    float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const __half * k = kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
-        float acc = 0.0f;
-        // The 64 dims of one token are 128 contiguous bytes -- exactly one cache
-        // line -- and the loop below used to fetch them with 64 separate 2-byte
-        // loads.  At a fixed dim the 32 lanes of a warp are on 32 different
-        // lines (one token each), so that is 32 lines touched per instruction,
-        // 64 times over: 2048 L1 accesses per warp per 32 tokens where 256 will
-        // do.  Loading the line as 8 x uint4 cuts the instruction count 8x.
-        //
-        // Dims are still accumulated d = 0,1,2,...,63 in that exact order, so
-        // the result is bit-identical.  k is 128-byte aligned (one token's row),
-        // so the uint4 loads are aligned.
-#pragma unroll
-        for (int q = 0; q < LK_HEAD_DIM / 8; ++q) {
-            const uint4 w = ((const uint4 *) k)[q];
-            const __half2 * h2 = (const __half2 *) &w;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int d = q * 8 + i * 2;
-                acc += s_q[d]     * __half2float(__low2half(h2[i]));
-                acc += s_q[d + 1] * __half2float(__high2half(h2[i]));
-            }
+        const __half2 * k2 = (const __half2 *)
+            (kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#if LK_ATTN_ABLATE == 2 || LK_ATTN_ABLATE == 3
+        if (k2) { a0 = (float) j; }        // ABLATION: no K read, no dot
+#else
+        // 32 half2 loads = the token's 64 dims = one 128-byte cache line.  The
+        // uint4 form used before also read one line, but a uint4 shared load for
+        // q cannot be expressed against it; half2 is the granularity at which
+        // both sides can be 128-bit.  Unroll 4 keeps 4 lines in flight, which is
+        // what the register budget allows; the 8-way unroll this replaced was
+        // the single biggest consumer of registers in the kernel.
+#pragma unroll 4
+        for (int i = 0; i < LK_HEAD_DIM / 2; ++i) {
+            const __half2 w = k2[i];
+            const float v0 = __half2float(__low2half(w));
+            const float v1 = __half2float(__high2half(w));
+            const float4 qa = ((const float4 *) s_q)[2 * i];
+            const float4 qb = ((const float4 *) s_q)[2 * i + 1];
+            a0 += qa.x * v0; a0 += qb.x * v1;
+            a1 += qa.y * v0; a1 += qb.y * v1;
+            a2 += qa.z * v0; a2 += qb.z * v1;
+            a3 += qa.w * v0; a3 += qb.w * v1;
         }
-        acc *= LK_ATTN_SCALE;
-        s_score[j] = acc;
-        m = fmaxf(m, acc);
+#endif
+        a0 *= LK_ATTN_SCALE; a1 *= LK_ATTN_SCALE;
+        a2 *= LK_ATTN_SCALE; a3 *= LK_ATTN_SCALE;
+        s_score[0][j] = a0; s_score[1][j] = a1;
+        s_score[2][j] = a2; s_score[3][j] = a3;
+        m0 = fmaxf(m0, a0); m1 = fmaxf(m1, a1);
+        m2 = fmaxf(m2, a2); m3 = fmaxf(m3, a3);
     }
-    s_m[threadIdx.x] = m;
+    // fmaxf is exact and associative, so this tree's shape cannot change the
+    // result; only the sum tree below is order-sensitive.
+    s_m[0][threadIdx.x] = m0; s_m[1][threadIdx.x] = m1;
+    s_m[2][threadIdx.x] = m2; s_m[3][threadIdx.x] = m3;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if ((int) threadIdx.x < o) s_m[threadIdx.x] = fmaxf(s_m[threadIdx.x], s_m[threadIdx.x + o]);
+        if ((int) threadIdx.x < o) {
+            s_m[0][threadIdx.x] = fmaxf(s_m[0][threadIdx.x], s_m[0][threadIdx.x + o]);
+            s_m[1][threadIdx.x] = fmaxf(s_m[1][threadIdx.x], s_m[1][threadIdx.x + o]);
+            s_m[2][threadIdx.x] = fmaxf(s_m[2][threadIdx.x], s_m[2][threadIdx.x + o]);
+            s_m[3][threadIdx.x] = fmaxf(s_m[3][threadIdx.x], s_m[3][threadIdx.x + o]);
+        }
         __syncthreads();
     }
-    const float mglobal = s_m[0];
+    const float M0 = s_m[0][0], M1 = s_m[1][0], M2 = s_m[2][0], M3 = s_m[3][0];
     __syncthreads();
 
-    float lsum = 0.0f;
+    float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const float p = __expf(s_score[j] - mglobal);
-        s_score[j] = p;
-        lsum += p;
+        const float p0 = __expf(s_score[0][j] - M0); s_score[0][j] = p0; l0 += p0;
+        const float p1 = __expf(s_score[1][j] - M1); s_score[1][j] = p1; l1 += p1;
+        const float p2 = __expf(s_score[2][j] - M2); s_score[2][j] = p2; l2 += p2;
+        const float p3 = __expf(s_score[3][j] - M3); s_score[3][j] = p3; l3 += p3;
     }
-    s_m[threadIdx.x] = lsum;
+    s_m[0][threadIdx.x] = l0; s_m[1][threadIdx.x] = l1;
+    s_m[2][threadIdx.x] = l2; s_m[3][threadIdx.x] = l3;
     __syncthreads();
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
-        if ((int) threadIdx.x < o) s_m[threadIdx.x] += s_m[threadIdx.x + o];
+        if ((int) threadIdx.x < o) {
+            s_m[0][threadIdx.x] += s_m[0][threadIdx.x + o];
+            s_m[1][threadIdx.x] += s_m[1][threadIdx.x + o];
+            s_m[2][threadIdx.x] += s_m[2][threadIdx.x + o];
+            s_m[3][threadIdx.x] += s_m[3][threadIdx.x + o];
+        }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { P[0] = mglobal; P[1] = s_m[0]; }
+    if (threadIdx.x < LK_ATTN_GQA) {
+        float * P = part + ((size_t)(head0 + threadIdx.x) * LK_ATTN_SPLIT + sp) * LK_ATTN_PARTW;
+        P[0] = (threadIdx.x == 0) ? M0 : (threadIdx.x == 1) ? M1
+             : (threadIdx.x == 2) ? M2 : M3;
+        P[1] = s_m[threadIdx.x][0];
+    }
 
-    // NOTE: batching the V-scan loads was tried twice (8 and 32 tokens per
-    // thread) and is WORSE both times -- 334 -> 302 tok/s at 8k context.  The
-    // 64 threads do read each line cooperatively, so coalescing was never the
-    // problem, and the extra live registers cost more than the added overlap
-    // buys.  The score loop above is a different case: there each lane is on
-    // its OWN line, which is why 8 x uint4 helped and 64 x 2-byte loads did not.
-    for (int d = threadIdx.x; d < LK_HEAD_DIM; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            const __half * v = vc + ((size_t)(t0 + t) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
-            acc += s_score[t] * __half2float(v[d]);
+    // V scan.
+    //
+    // The pre-4v kernel had 64 live threads and 192 idle ones, because there was
+    // only one head to compute.  With 4 heads there are 4 x 64 = 256 outputs and
+    // a naive (head, dim) map uses every thread -- but it issues a 2-byte load
+    // per FMA and a warp only covers 64 bytes, half a cache line.  This is the
+    // shape that measured best of the ones tried:
+    //
+    //   tid -> (half, head, pair)  =  (tid>>7, (tid>>5)&3, tid&31)
+    //
+    // so a warp covers all 32 half2 pairs of ONE head = 128 contiguous bytes =
+    // exactly one cache line, and each thread carries TWO dims for the price of
+    // one 4-byte load and one shared broadcast.  The slice is split in two over
+    // t, which halves the dependent FMA chain and halves the number of iterations
+    // -- the loads per byte drop from 1 per 2 bytes to 1 per 4, and the bytes in
+    // flight at a given unroll double.  The two half-sums are added once at the
+    // end, which is a different rounding from the single chain (measured against
+    // the float64 reference by make test-attn, not assumed).
+    {
+        const int half = threadIdx.x >> 7;
+        const int g    = (threadIdx.x >> 5) & (LK_ATTN_GQA - 1);
+        const int i    = threadIdx.x & 31;           // half2 index: dims 2i, 2i+1
+        const int tlo  = half ? (n >> 1) : 0;
+        const int thi  = half ? n : (n >> 1);
+        const __half2 * v2 = (const __half2 *)
+            (vc + ((size_t) t0 * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM) + i;
+        const float * sc = s_score[g];
+        float acc0 = 0.0f, acc1 = 0.0f;
+#if LK_ATTN_ABLATE == 1 || LK_ATTN_ABLATE == 3
+        if (v2 && tlo < thi) { acc0 = sc[tlo]; }
+#else
+#pragma unroll 8
+        for (int t = tlo; t < thi; ++t) {
+            const __half2 w = v2[(size_t) t * LK_N_KV_HEADS * (LK_HEAD_DIM / 2)];
+            const float w0 = __half2float(__low2half(w));
+            const float w1 = __half2float(__high2half(w));
+            const float p = sc[t];
+            acc0 += p * w0;
+            acc1 += p * w1;
         }
-        P[2 + d] = acc;                   // unnormalised partial
+#endif
+        __shared__ float2 s_v[2][LK_ATTN_GQA][32];
+        s_v[half][g][i] = make_float2(acc0, acc1);
+        __syncthreads();
+        if (half == 0) {
+            const float2 o = make_float2(s_v[0][g][i].x + s_v[1][g][i].x,
+                                         s_v[0][g][i].y + s_v[1][g][i].y);
+            float * P = part + ((size_t)(head0 + g) * LK_ATTN_SPLIT + sp) * LK_ATTN_PARTW + 2;
+            P[2 * i]     = o.x;
+            P[2 * i + 1] = o.y;
+        }
     }
 }
 
-__global__ void k_attn_combine(const float * __restrict__ part, float * __restrict__ out,
+__global__ void k_attn_combine(const float * __restrict__ part, const int * __restrict__ d_pos,
+                               float * __restrict__ out,
                                block_q8_1 * __restrict__ yq8) {
     const int head = blockIdx.x;
     const int d = threadIdx.x;            // 64 threads, one per head dim
+    const int seq_len = *d_pos + 1;
+    const int nslices = lk_attn_slices(seq_len);
+    const int chunk = (seq_len + nslices - 1) / nslices;
     const float * P = part + (size_t) head * LK_ATTN_SPLIT * LK_ATTN_PARTW;
     __shared__ float s_m[LK_ATTN_SPLIT];
     __shared__ float s_l[LK_ATTN_SPLIT];
-    if (d < LK_ATTN_SPLIT) {
-        s_m[d] = P[d * LK_ATTN_PARTW + 0];
-        s_l[d] = P[d * LK_ATTN_PARTW + 1];
+    // Stride the staging loop by the block.  The previous version used
+    // `if (d < LK_ATTN_SPLIT)` with d = threadIdx.x and a 64-thread block, which
+    // silently only worked while LK_ATTN_SPLIT <= 64: above that it left
+    // s_m[64..SPLIT-1] uninitialised and the whole attention output became
+    // garbage (parity 0/825, every logit NaN).  Found by make test-attn, which
+    // exists precisely because this class of thing is invisible in a benchmark.
+    //
+    // Slices that hold no tokens are given the same (-1e30, 0) sentinel the old
+    // split kernel used to write, so exp(s_m - mf) is exactly 0 for them and
+    // they contribute nothing to either the denominator or the numerator.
+    // k_attn_split no longer writes them, so this is the only place that knows.
+    for (int s = threadIdx.x; s < nslices; s += blockDim.x) {
+        const bool empty = (s * chunk >= seq_len);
+        s_m[s] = empty ? -1e30f : P[s * LK_ATTN_PARTW + 0];
+        s_l[s] = empty ? 0.0f   : P[s * LK_ATTN_PARTW + 1];
     }
     __syncthreads();
     float mf = -1e30f;
-    for (int s = 0; s < LK_ATTN_SPLIT; ++s) mf = fmaxf(mf, s_m[s]);
+    for (int s = 0; s < nslices; ++s) mf = fmaxf(mf, s_m[s]);
     float lf = 0.0f, acc = 0.0f;
-    for (int s = 0; s < LK_ATTN_SPLIT; ++s) {
+    for (int s = 0; s < nslices; ++s) {
         const float w = __expf(s_m[s] - mf);
         lf  += s_l[s] * w;
         acc += P[s * LK_ATTN_PARTW + 2 + d] * w;

@@ -70,6 +70,10 @@ static double lk_prof_bytes(const char * t) {
     struct Row { const char * n; double b; };
     static const Row T[] = {
         {"embed",           1680.0}, {"norm_attn",     16384.0},
+        // shortconv_out was silently dropped when four quantise entries were
+        // removed on a previous pass, which made it look like a compute-bound
+        // kernel instead of a 70 MB/token stream at 674 GB/s.
+        {"shortconv_out", 2359296.0},
         {"shortconv_in", 7077888.0}, {"shortconv_conv", 24576.0},
                 {"attn_qkv",     3538944.0}, {"qk_norm_rope",       0.0},
         {"attention",          0.0}, {"attn_split",         0.0},
@@ -423,10 +427,10 @@ static void forward(Engine & e, cudaStream_t st) {
         k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK, 0, st>>>(
                     e.qv, kc, vc, e.d_pos, e.tmp, e.xq);
     } else {
-        k_attn_split<<<dim3(LK_N_HEADS, LK_ATTN_SPLIT), 256, 0, st>>>(
+        k_attn_split<<<dim3(LK_N_KV_HEADS, LK_ATTN_SPLIT), 256, 0, st>>>(
                     e.qv, kc, vc, e.d_pos, e.attn_part);
         k_attn_combine<<<LK_N_HEADS, LK_HEAD_DIM, 0, st>>>(
-                    e.attn_part, e.tmp, e.xq);
+                    e.attn_part, e.d_pos, e.tmp, e.xq);
     }
     LKP_E();
             

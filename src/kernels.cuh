@@ -143,12 +143,70 @@ __global__ void k_router_top4(const float * __restrict__ logits,
 // token-major and the V loop needs a token split -- so the remaining lever is
 // split-K, not more warps.  Kept at 256 so the reduction order is unchanged.
 #define LK_ATTN_BLOCK   256
-#define LK_ATTN_SPLIT  8
+// ---------------------------------------------------------------------------
+// Attention context split (Phase 4w).
+//
+// The grid is (8 kv_heads x slices).  How many slices is worth having depends
+// on the context length, and the dependence is real and measured:
+//
+//   seq      best slices   tok/s at that setting   tok/s at 8 slices
+//    272          16              419.1                 418.5
+//   2128          32              408.5                 389.4
+//   4128          32              394.7                 372.6
+//   8128         128              373.3                 352.6
+//
+// so a compile-time constant is wrong at one end or the other.  The rule that
+// reproduces every measured optimum is "aim for LK_ATTN_TARGET_N tokens per
+// slice", floored and capped:
+//
+//     slices = clamp(ceil(seq / TARGET_N), SPLIT_MIN, SPLIT)
+//
+// LK_ATTN_SPLIT is now the CAP (it sizes the grid and the partial buffer), not
+// the operating point.  Every block still launches -- CUDA graphs need fixed
+// launch dimensions -- and blocks past the live slice count exit immediately.
+//
+// The cap makes LK_ATTN_CHUNK a constant: with TARGET_N = 64 and SPLIT_MIN = 8,
+// chunk = ceil(seq/slices) is at most 64 for every seq (below 512 the floor of
+// 8 dominates and gives chunk <= 64; above it, slices >= seq/64 forces
+// chunk <= 64).  LK_ATTN_TARGET_N is therefore both the tuning knob and the
+// exact shared-memory requirement.
+//
+// An earlier attempt set SPLIT=224 as a single global constant on the strength
+// of a sweep that turned out to be measuring a kernel producing NaN.  The
+// numbers above are all post-fix.
+#ifndef LK_ATTN_SPLIT
+#define LK_ATTN_SPLIT      128
+#endif
+#ifndef LK_ATTN_TARGET_N
+#define LK_ATTN_TARGET_N   64
+#endif
+#ifndef LK_ATTN_SPLIT_MIN
+#define LK_ATTN_SPLIT_MIN  8
+#endif
+#define LK_ATTN_CHUNK      LK_ATTN_TARGET_N
+// The number of slices that actually hold tokens, as a function of position.
+// Both attention kernels derive it the same way from d_pos, so they always
+// agree; k_attn_combine uses it to avoid reading partials that were never
+// written.
+__device__ __forceinline__ int lk_attn_slices(int seq_len) {
+    int s = (seq_len + LK_ATTN_TARGET_N - 1) / LK_ATTN_TARGET_N;
+    if (s < LK_ATTN_SPLIT_MIN) s = LK_ATTN_SPLIT_MIN;
+    if (s > LK_ATTN_SPLIT)     s = LK_ATTN_SPLIT;
+    return s;
+}
+// Ablation switch for the attention kernel, ONLY for finding which of its two
+// loops owns the time.  Any non-zero value produces WRONG output.
+//   0 = off (the committed configuration)
+//   1 = skip the V scan     2 = skip the score dot     3 = skip both
+#ifndef LK_ATTN_ABLATE
+#define LK_ATTN_ABLATE 0
+#endif
 #define LK_ATTN_PARTW  (2 + LK_HEAD_DIM)
 __global__ void k_attn_split(const float * __restrict__ q,
                              const __half * __restrict__ kc, const __half * __restrict__ vc,
                              const int * __restrict__ d_pos, float * __restrict__ part);
-__global__ void k_attn_combine(const float * __restrict__ part, float * __restrict__ out,
+__global__ void k_attn_combine(const float * __restrict__ part,
+                               const int * __restrict__ d_pos, float * __restrict__ out,
                                block_q8_1 * __restrict__ yq8);
 __global__ void k_attention_decode(const float * __restrict__ q,     // [32*64]
                                    const __half * __restrict__ kc,   // [max_seq, 8, 64]
