@@ -232,6 +232,16 @@ $(BUILD)/bench_megakernel: tests/bench_megakernel.cu $(BUILD)/flags.stamp | $(BU
 bench-megakernel: $(BUILD)/bench_megakernel
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_megakernel
 
+# PHASE 5 ACCEPTANCE TEST.  Ports the most-executed stage shape in the model
+# (Q4_0 x Q8_1 GEMV) into the persistent-kernel form and compares the output
+# with the shipped kernel using memcmp -- bit-for-bit, because the megakernel's
+# entire case rests on it being a pure scheduling change.  Also prices it.
+$(BUILD)/test_megakernel: tests/test_megakernel.cu src/megakernel.cuh $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/test_megakernel.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+test-megakernel: $(BUILD)/test_megakernel
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_megakernel
+
 # --- gates ------------------------------------------------------------------
 # C1  greedy parity vs llama.cpp
 # C1a step-1 top-1 agreement + full-vocabulary correlation

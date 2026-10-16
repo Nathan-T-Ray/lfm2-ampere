@@ -1,0 +1,25 @@
+shape: 12288 rows x 64 Q8_1 blocks   Q4_0 weights 14.16 MB
+k_mk_probe occupancy: 6 blocks/SM -> NB = 504 resident blocks (1536 threads/SM, 100% of the 1536 ceiling)
+
+(1) BIT-IDENTITY after 8 stages (reference = 8 separate launches, port = 1 launch + 8 barriers)
+    ALL 12288 ROWS BIT-IDENTICAL
+    sample: ref[0]=-43.4854202 port[0]=-43.4854202   ref[12287]=-42.9151154 port[12287]=-42.9151154
+
+(2) SCALE PATH (ssq non-null) after 8 stages
+    ALL 12288 ROWS BIT-IDENTICAL
+    sample: ref[0]=-86.9691086 port[0]=-86.9691086
+
+(3) cold staging: 31 x 14.16 MB = 439 MB of weight slabs
+(3) PRICE, 31 stages of the real stage shape:
+     31 separate launches        :    533.2 us  (17.201 us/stage)
+    1 launch, 31 grid barriers    :    574.9 us  (18.544 us/stage)
+    1 launch, NO barrier (cost ctl):    507.4 us  (16.369 us/stage)
+    ------------------------------------------------------------
+    LAUNCH BOUNDARY  (ref - nobar)/N :    0.833 us
+    GRID BARRIER     (bar - nobar)/N :    2.176 us
+    NET              (ref - bar)/N   :   -1.343 us
+    1 launch, barrier with ONE fence:    572.8 us  (18.478 us/stage)
+    GRID BARRIER     (1-fence - nobar)/N :    2.110 us
+    --> ratio (1-fence)              :    0.931x
+
+VERDICT: THE PORT IS BIT-IDENTICAL, both scale paths.  The rule holds on a real stage.

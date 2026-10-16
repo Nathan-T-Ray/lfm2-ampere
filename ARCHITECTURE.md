@@ -1638,7 +1638,10 @@ synthetic workload has no straggler skew, so both the boundary *and* the handoff
 here are **lower bounds** — in the engine a consumer waits on a producer doing
 different work.
 
-> **VERDICT: the megakernel premise survives, and designing it is justified.**
+> **VERDICT: superseded by §13.13, which BUILT it and refuted it.** The
+> paragraph below was the conclusion at the time and is kept for the record.
+>
+> ~~**VERDICT: the megakernel premise survives, and designing it is justified.**~~
 > The toll alone lands at 489–553; clearing 500 robustly needs the persistent
 > kernel to also hide part of the 0.221 ms of small-kernel execution — which is
 > precisely what a single persistent kernel makes possible and a graph cannot.
@@ -1673,7 +1676,9 @@ un-ordered persistent control at *every* skew. The grid barrier does rise with
 skew — 0.107 → 0.341 µs, exactly the wait-for-the-slowest penalty — but it rises
 to a level still **5× below the boundary it replaces**.
 
-> **VERDICT: the megakernel premise survives skew.** Net of the barrier,
+> **VERDICT: superseded by §13.13.** The skew result holds — the boundary does
+> not collapse under imbalance — but the boundary figure it was compared against
+> was itself a synthetic artifact. ~~**The megakernel premise survives skew.**~~ Net of the barrier,
 > 1.72 − 0.34 = **1.38 µs per stage at K=8**, i.e. 343 × 1.38 = 0.473 ms, or
 > `2.266 − 0.473 = 1.793 ms = 555 tok/s`. The honest range stays **489–553**
 > because the engine's own 0.268 ms toll estimate is itself a subtraction, and
@@ -1775,3 +1780,72 @@ Occupancy at 256 threads/block (65536 registers per SM, 1536-thread ceiling):
 **This is the last structural unknown.** The premise is measured (§13.9), it
 survives imbalance (§13.10), and the residency budget closes here. Porting can
 proceed.
+
+### 13.13 ERROR 5 — THE MEGAKERNEL IS REFUTED, ON A REAL STAGE, BY BUILDING IT
+
+§13.9 measured a kernel boundary at 1.54–2.03 µs and a grid barrier at
+0.06–0.10 µs, and §13.10 showed the gap survives imbalance. On that basis Phase 5
+was planned. **Both numbers were wrong, and the synthetic instrument was missing
+the one thing that mattered.**
+
+`tests/test_megakernel.cu` ports the most-executed shape in the model (Q4_0 x Q8_1
+GEMV) into the persistent form — `src/megakernel.cuh`, grid-stride over rows, grid
+barrier between stages — and compares it against the shipped kernel with
+`memcmp`. Cold staging: 31–130 separate weight slabs so nothing is L2-resident.
+
+```
+                                                 2048 rows    12288 rows
+  separate launches                              4.881        17.190
+  one launch + N grid barriers                   5.169        18.544
+  one launch, NO barrier (pure execution)        2.606        16.364
+  ------------------------------------------------ us per stage
+  LAUNCH BOUNDARY   (ref - nobar)/N              2.275         0.826
+  GRID BARRIER      (bar - nobar)/N              2.563         2.180
+  NET               (ref - bar)/N               -0.288        -1.354
+  --> ratio                                      0.948x        0.929x
+```
+
+**The grid barrier costs 2.14–2.18 µs. The kernel launch it replaces costs
+0.78–0.83 µs. Replacing launches with barriers makes the engine 6–8% SLOWER.**
+
+Two things fall out of this, and both are corrections to §13.9:
+
+1. **The launch boundary in a real dependent chain is 0.78–0.83 µs — not 1.54–2.03.**
+   The large-shape figure, 0.826 µs, reproduces the engine's own independently
+   measured 0.781 µs/node toll (`bench_shapes` mode 0) to within 6%. §13.9's
+   1.54–2.03 µs was an artifact of the synthetic graph, and the document's own
+   0.268 ms was right all along.
+2. **The barrier is not 0.06–0.10 µs — it is ~2.1 µs, 20x more.** The synthetic
+   test's stages were **independent**: stage s read slab s, so the barrier ordered
+   *nothing* and the blocks merely touched the same counter. Here every stage
+   writes `y` and the next stage reads it, so the barrier carries a real
+   producer→consumer ordering through global memory. **A cross-block handoff that
+   has nothing to order is free; one that has to order 12 288 rows of stores is
+   not.** That was the missing ingredient, and it is the whole cost.
+
+Falsified hypotheses, recorded so they are not retried:
+
+* **A contended spin.** The first version spun on `atomicAdd(&bar[1],0)`; that was
+  fixed to a volatile load with `__nanosleep` backoff, and the barrier stayed at
+  ~2.1 µs.
+* **The redundant second `__threadfence()`.** Removing it moved the barrier from
+  2.180 to 2.140 µs — 0.04 µs. Not the cost.
+
+> **VERDICT: the megakernel is CLOSED.** Not "risky" — measured, on the real
+> stage shape, bit-identical and slower. This is also the mechanism behind the
+> three earlier barrier losses (`FUSE_ROUTER` 0.09–0.39%, `T4r` 0.17%, `T2`
+> 1.75%): the project's own law that *a barrier in front of a bandwidth-critical
+> kernel loses* now has a number attached, and it was never about the barrier
+> being in front of the kernel. It is about what the barrier has to order.
+
+**What survives from Phase 5, and it is not nothing.** The porting rule of §13.6 is
+**verified on real hardware**: 2048/2048 and 12288/12288 rows bit-identical, on
+both the plain and the Phase-4y scale path. Any future fusion or multi-token
+kernel can use it with confidence, and `tools/ab.py` remains the gate. The
+`LK_GEMV_ROWS`-style grid-stride rewrite is safe; the persistence is not.
+
+**What this leaves for single-stream >500:** nothing that is currently measured.
+The 443 tok/s wall stands, the batch-1 ceiling inside the graph stands at 488.9,
+and the two remaining levers are **batch-4 (682–827 tok/s aggregate)** and
+**triggered speculation (695–849 tok/s on copy-heavy text)**, both of which were
+measured before this phase and are unaffected by it.
