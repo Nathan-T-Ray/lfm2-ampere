@@ -6,15 +6,16 @@ number in this file measured on the machine rather than estimated.
 
 | | |
 |---|---|
-| decode, ctx 272 | **442.4 tok/s** (interleaved A/B, 5 rounds, spread 0.09%) |
-| before Phase 4z | 439.5 tok/s |
+| decode, ctx 272 | **443.2 tok/s** (interleaved A/B, 5 rounds, spread 0.03%) |
+| before Phase 4z | 438.8 tok/s |
 | before Phase 4y | 414.7 tok/s |
-| effective bandwidth | 649 GB/s = **64.4% of the 1008 GB/s spec** |
+| effective bandwidth | 650 GB/s = **64.5% of the 1008 GB/s spec** |
 | llama.cpp, same GGUF/GPU, same session | 257.9 tok/s |
 | speedup vs llama.cpp | **1.72x**, and 1.67-1.72x to 3.2k context |
 | speedup vs this engine's own Phase-3 baseline | **4.27x** (102.79 tok/s) |
 | traffic | 1466.75 MB/token, so the bandwidth floor is 1.534 ms = **652 tok/s** |
 | CUDA graph | **343 nodes**, replayed per token |
+| measured batch-1 ceiling | **488.9 tok/s** (all 158 small kernels made free, weight traffic preserved) |
 | node deletion is worth | ~0.3-0.45 us each, NOT the 1.5 us Phase 4y measured (see DIAGNOSIS) |
 
 ## Correctness
