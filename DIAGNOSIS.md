@@ -904,3 +904,113 @@ that killed the traffic theory -- 87% of peak is not a traffic problem -- took o
 line and was available four rounds earlier.  A four-fold traffic reduction was
 implemented, benchmarked, and reported as a win before anyone checked whether the
 kernel was bandwidth-bound at all.
+
+---
+
+# Phase 4x: the launch-fusion plan, measured and rejected
+
+The proposal was to reclaim most of the ~0.68 ms of per-token fixed cost by
+folding small kernels into their producers with a "last block turns out the
+lights" epilogue -- a threadfence plus an atomic counter, no grid sync.  Three
+fusions were specified in detail and projected to take batch-1 decode from
+417 to 525-550 tok/s.
+
+Two of them were implemented and measured.  Both lose.
+
+## What was measured first
+
+`tests/bench_launch.cu` was extended before any fusion was written, because the
+whole projection scales with one number that had been assumed rather than
+measured: what a node costs when it is added to a stream that is already busy.
+
+    empty node, grid 1                       0.605 us
+    empty node, grid 8                       0.618
+    empty node, grid 64                      0.672
+    empty node, grid 256                     0.823
+    empty node, grid 768                     1.154
+    empty node, grid 1536                    1.644
+    norm-shaped kernel, isolated in a graph  2.661
+    norm-shaped kernel BEHIND a busy stream  3.814   <-- the governing number
+
+Two things fall out.  A node's cost grows with its grid, so "451 launches x
+0.606 us" was always an undercount.  And a norm node is not 0.6 us of dispatch
+plus 2 us of absorbable work: 1.15 us of its 3.81 is the stall waiting for the
+preceding kernel's last wave to drain, and that stall belongs to the
+dependency, not to the kernel.
+
+## Step 1: the FFN norm into its producing projection
+
+Interleaved A/B, REPS=3, same session:
+
+    ctx      fuse0    fuse1
+     272     417.02   410.39    -1.6%
+    2128     406.71   399.25    -1.8%
+    8128     367.26   361.68    -1.5%
+
+The 40 norm nodes did vanish -- `norm_ffn` 0.185 -> 0.054 ms -- but the
+producers absorbed almost exactly the same time back:
+
+    shortconv_out  0.186 -> 0.282   (+0.096 ms over 30 calls = +3.2 us each)
+    attn_out       0.063 -> 0.094   (+0.031 ms over 10 calls = +3.1 us each)
+
++3.2 us absorbed against a 3.3 us node removed.  Folding a single-block
+reduction into its producer does not delete the serial tail, it inherits it,
+and then pays for a fence and 256 contending atomics on top.
+
+## Step 3: the top-4 router selection into the router dot
+
+Step 1 folded ~2 us of genuine work; Step 3 folds ~30 shuffle operations.  The
+two bracket the whole range, and Step 3 was chosen as the fair test.
+
+    ctx      fuse0    fuse1
+     272     416.16   415.80    -0.09%  (within noise)
+    2128     406.73   405.19    -0.38%
+    8128     367.11   365.69    -0.39%
+
+Output is BIT-IDENTICAL on all 7 suite cases, so this is purely cost.  Removing
+the node is worth 38 x 0.605 us = 0.023 ms of dispatch; adding the epilogue
+costs more, because all 64 router blocks now pay a `__threadfence` and a
+contending `atomicAdd`, and the last block's tail is exposed with 63 SMs idle.
+Real `router_dot` time goes 0.120 -> 0.155 ms net of profiler brackets.
+
+## The general result
+
+**A cross-block last-block synchronisation costs ~1.5-2 us on this part.  A
+graph node costs 0.605 us.**  Folding therefore cannot pay, whatever the size
+of the folded work -- the heavy case and the light case both lose by about the
+same amount.  This closes Steps 1, 2, 3 and 5 of the plan; they are all this
+mechanism.  Only a fusion that is purely local within one block can pay, and
+none of the remaining small kernels (norms, top-4, `moe_accum`,
+`shortconv_conv`, `qk_norm_rope`) is shaped that way.  Step 4 (`moe_swiglu`
+into `moe_gate_up` by reshaping the grid so gate and up land in the same block)
+is local and is the one survivor, worth ~1.7% on its own arithmetic.
+
+## Where the budget actually is
+
+Ablation-free accounting at ctx 159, 2.398 ms per token:
+
+    1.721 ms   the eight streaming GEMVs, moving 1444.8 MB at 840 GB/s
+               = 88% of the 956 GB/s measured achievable
+    0.453 ms   small kernels (81 norms, router, swiGLU, accum, conv, attention)
+    0.225 ms   dispatch
+
+The streaming kernels are at 88% of achievable; at 100% they would take 1.511 ms,
+so there is only 0.21 ms of headroom there.  The 0.453 ms of small kernels is
+single-block latency, which Phase 4x has now shown cannot be moved.  That puts
+the practical batch-1 ceiling near 445-460 tok/s, not 525-550, and the honest
+reading is that single-stream is close to exhausted.
+
+## Method note
+
+The profiler over-reports node removal.  Deleting a node also deletes its event
+bracket, and each bracket pair costs ~2.7 us of measured time, so the raw
+profile credited Step 3 with 0.155 ms of "savings" when 0.103 ms of that was
+instrument.  Every conclusion above is from the interleaved end-to-end A/B; the
+profiler was used only to explain a result the A/B had already established.
+
+## What is left
+
+Batching.  It amortises the weight bytes across the tokens in a batch, which is
+the only lever that moves the 1.4668 GB/token floor.  Both switches stay in the
+tree, defaulted off, with their numbers recorded, so the negative results remain
+reproducible in one flag.
