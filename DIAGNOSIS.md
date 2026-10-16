@@ -1014,3 +1014,153 @@ Batching.  It amortises the weight bytes across the tokens in a batch, which is
 the only lever that moves the 1.4668 GB/token floor.  Both switches stay in the
 tree, defaulted off, with their numbers recorded, so the negative results remain
 reproducible in one flag.
+
+---
+
+# Phase 4y: the scale-invariant Q8_1 norm split
+
+Phase 4x concluded that no producer-side fusion can pay, because a cross-block
+last-block barrier costs 1.5-2.0 us while a graph node costs 0.605 us.  That
+conclusion is correct and this phase does not contradict it: it removes the
+barrier instead of paying for it.
+
+## The mechanism
+
+An RMSNorm multiplies all 2048 activations by one positive scalar, and the next
+kernel quantises the result to Q8_1.  ggml's block_q8_1 stores
+
+    ds.x = d   = amax/127
+    ds.y = SUM = the RAW FP32 SUM of the 32 activations      (NOT d*sum)
+
+and its dot product is `d4*(d8*sumi - 8*SUM)` with `sumi` an integer dp4a.  Both
+ds fields are therefore LINEAR in a positive scalar applied to the whole vector,
+while the int8 quants -- and hence sumi -- are invariant to it:
+
+    q_i = round(u_i*127/amax_u) = round(y_i*127/amax_y)      y = inv*u
+    dot(y) = inv * dot(u)
+
+So the norm splits across the kernel boundary with NO synchronisation at all:
+
+    producer: quantise the RAW x*w and emit 64 sum-of-squares partials
+    consumer: ONE multiply per output row
+
+The producer never needs the global inverse RMS and the consumer never needs a
+per-block scale.  The only shared state is 64 floats, and the producer
+overwrites all of them every call, so there is no counter and nothing to reset.
+
+Two details the outside proposal got wrong, both of which would have cost us:
+
+  * It proposed rescaling the 64 ds half2 values in the consumer, which rounds
+    `d` through fp16 TWICE -- once unscaled, once after scaling.  Multiplying
+    the accumulator instead rounds once.  Measured: this keeps the residual to
+    0.9-1.3 fp16 ulp.
+  * It assumed a `__shared__ block_q8_1 s_x[64]` staging buffer exists in the
+    GEMV.  It does not; xq is read per warp from L2.  The consumer therefore
+    reads the 64 partials itself, 2 floats per lane, which costs 256 B of L2
+    against the 2304 B of xq the same warp already reads and needs no barrier --
+    which matters, because these kernels contain none and a __syncthreads()
+    would DEADLOCK wherever a warp exits early via `if (row >= out_rows)`.
+
+## The shape constraint
+
+A Q8_1 block is 32 CONSECUTIVE channels.  `k_moe_accum4` runs `<<<8,256>>>` with
+thread i owning element i, so warp w owns exactly Q8_1 block w and the epilogue
+is pure warp arithmetic.  The 2048-row GEMVs do not: at the default shape a
+block owns 8 rows, so a Q8_1 block spans FOUR blocks.  LK_GEMV_BIGBLOCK moves
+them to `<<<rows/32, 1024>>>`, where block b owns exactly Q8_1 block b.  That
+reshape was measured standalone, with no epilogue, BEFORE any fusion was built
+on it, and it is bit-identical on all 7 trajectory cases.
+
+## Two bugs, and what caught them
+
+  1. `k_gemv_q4_0_prod` read its activation from `xq` and wrote its quantised
+     output to `xq` as well, one block per thread block, so block 0 overwrote
+     activations every other block was still reading.  Symptom: the model
+     repeated a single token forever.  Caught by tools/ab.py.
+  2. The same kernel was called as `lk_norm_prod_warp(..., np.yq8 + blockIdx.x,
+     ..., blockIdx.x)`, but the helper indexes yq8 by its last argument, so it
+     wrote `yq8 + 2*blockIdx.x` and left every odd activation block stale.
+     Caught by the same check.
+
+Both were found by the trajectory A/B, which is cheap and is run before every
+benchmark.  The follow-up diagnosis used LK_LOGIT_DUMP to compare the full 128k
+logit vector directly, which is far more informative than a token trajectory and
+should be the first tool reached for next time.
+
+## Measurements
+
+Interleaved A/B, REPS=5, vs the unmodified build.  LK_NORM_PROD_ACCUM alone
+fuses 38 of the 81 norm nodes (attn_norm for layers 3..39 and norm_final), all
+of them the free `k_moe_accum4` sites:
+
+    ctx 272    415.22 -> 424.15 tok/s   +2.15%
+    ctx 2128   404.65 -> 412.89 tok/s   +2.04%
+    ctx 8128   365.21 -> 372.30 tok/s   +1.94%
+
+**This re-calibrates the exchange rate for deleting a node.**  38 nodes bought
+2.05% of 2.4 ms, i.e. 1.29 us per node -- not the 2.5 us the profiler implies
+(0.605 dispatch + ~1.9 execution) and not the 3.5 us of gross profile time.
+The profiler's "execution" figure for a small kernel in the un-graphed path
+carries the launch gap and the event bracket with it.
+
+## Gate G8 (tests/test_normscale.cu)
+
+Four inputs, three live and one all-zero, each checked against
+k_rmsnorm_q8_1 + a plain GEMV, with:
+
+  * a NEGATIVE CONTROL that re-runs the consumer with ssq = nullptr.  It must be
+    WRONG, and it is: 0.71-0.74 relative.  Without this, a tolerance check on a
+    mechanism that did nothing at all would pass.
+  * an exact recomputation of the sum of squares on the host, in double.  The
+    partials match to the last digit.
+  * a diagnostic that EXPLAINS the residual rather than merely bounding it:
+    the int8 payload is bit-identical to the reference (0 flips in 2048
+    elements), every scale field reconstructs to within one ulp, and ~78% of
+    them bit-exactly.  The other ~22% are one ulp out, which is the signature of
+    two fp16 roundings not commuting -- exactly the predicted mechanism.
+
+An earlier draft of this gate asserted the scale fields would match EXACTLY and
+used a 2e-4 tolerance.  Both were guesses made before any measurement; 2e-4 is
+below fp16's own relative precision of 4.9e-4, so it was unachievable by
+construction.  The bound is now set from the format, not from the reading.
+
+## Accuracy, honestly
+
+    C2 (lm_head vs exact float64, given the same residual stream)
+        baseline        0.0013%
+        ACCUM           0.0067%
+        GEMV half       0.0137%
+        both            0.0140%
+    gate: <= 0.1%
+
+    interleaved A/B, REPS=5, both halves (80 of the 81 norm nodes removed)
+        ctx 272    414.73 -> 438.78 tok/s   +5.80%
+        ctx 2128   404.53 -> 426.07 tok/s   +5.33%
+        ctx 8128   364.78 -> 383.20 tok/s   +5.05%
+
+    end-to-end nll, 557-token natural corpus
+        baseline 1.890377 | ACCUM 1.903387 | GEMV 1.888308 | both 1.880269
+    engine-vs-oracle ppl distance on the same corpus
+        baseline 1.5421% | GEMV 1.3322% | both 0.5209%
+
+The fused builds are 5-10x further from exact on C2 but 7x inside the gate, and
+the end-to-end loss moves by less than the corpus can resolve (SE ~11% on 557
+tokens).  Top-1 agreement against llama.cpp on the same 557 positions IMPROVES,
+93.72% -> 95.51% for the GEMV half -- which this project has already learned NOT
+to treat as evidence of correctness, so it is recorded, not relied on.
+
+**A gap in C2 that this phase exposed.**  C2 recomputes the lm_head in float64
+from the residual stream THE ENGINE DUMPED.  It therefore bounds the lm_head's
+error given a residual stream, not the residual stream's own error.  A fusion
+that perturbs the residual stream is only weakly constrained by it.  The
+end-to-end nll table above is the check that actually covers that, and it should
+be promoted into the gate.
+
+**Where the residual actually goes.**  Comparing the full 128k logit vector
+between the baseline and the ACCUM build: median |diff| 0.110, max 0.892,
+correlation 0.99747.  That is ~1000x more than a naive rounding-drift estimate
+predicts, and it is the honest number to quote.  It is dominated by a
+common-mode shift that cancels in the softmax -- which is why the nll moves by
+0.02% while individual logits move by 1%.  The GEMV half adds 42 more sites and
+moves the median to 0.133, i.e. it behaves exactly like the half already
+accepted, which is the strongest evidence available that it is not broken.

@@ -194,7 +194,7 @@ int main(int argc, char ** argv) {
         // a logits tensor, then select.  Calling only the second one (as an
         // earlier revision of this test did after the split) silently tested
         // nothing at all.
-        k_router_dot<<<LK_N_EXPERTS, 32>>>(dh, dgi, dlogits);
+        k_router_dot<<<LK_N_EXPERTS, 32>>>(dh, dgi, dlogits, nullptr, 0.0f);
         k_router_top4<<<1, LK_N_EXPERTS>>>(dlogits, db, didx, dw);
         CK(cudaDeviceSynchronize());
         int gi[LK_TOP_K]; float gw[LK_TOP_K];

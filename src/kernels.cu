@@ -158,11 +158,21 @@ __device__ __forceinline__ void k_gemv_q4_0_t(const uint4 * __restrict__ qs,
                               const __half * __restrict__ d,
                               const block_q8_1 * __restrict__ xq,
                               int out_rows, int bpr, float * __restrict__ y, int add_residual,
-                              LKNormEpilogue ne) {
+                              LKNormEpilogue ne,
+                              const float * __restrict__ ssq, float eps) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     const int row0 = warp * LK_GEMV_ROWS;
     if (row0 >= out_rows) return;
+
+    // Phase 4y: when the preceding RMSNorm was fused into its producer, `xq`
+    // holds the RAW x*w and the true activation is inv*(x*w).  The whole dot is
+    // linear in inv (see kernels.cuh), so ONE multiply per output row restores
+    // it -- no per-block scale, no barrier.  Issued here rather than after the
+    // loop so the two loads are in flight alongside the first weight loads.
+    // `ssq` is uniform across the grid, so the branch costs nothing.
+    float ninv = 1.0f;
+    if (ssq) ninv = lk_norm_inv(ssq, lane, eps);
 
     float acc[LK_GEMV_ROWS];
 #pragma unroll
@@ -185,7 +195,7 @@ __device__ __forceinline__ void k_gemv_q4_0_t(const uint4 * __restrict__ qs,
         const int row = row0 + r;
         v[r] = 0.0f;
         if (row < out_rows) {
-            const float a = warp_sum(acc[r]);
+            const float a = warp_sum(acc[r]) * ninv;
             if (NORM_EPILOGUE) {
                 // warp_sum returns the total to every lane, so all 32 lanes
                 // compute the same v and the sum of squares can be formed
@@ -256,25 +266,75 @@ __device__ __forceinline__ void k_gemv_q4_0_t(const uint4 * __restrict__ qs,
 
 __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
-                            int out_rows, int bpr, float * __restrict__ y, int add_residual) {
-    k_gemv_q4_0_t<false>(qs, d, xq, out_rows, bpr, y, add_residual, LKNormEpilogue{});
+                            int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                            const float * __restrict__ ssq, float eps) {
+    k_gemv_q4_0_t<false>(qs, d, xq, out_rows, bpr, y, add_residual, LKNormEpilogue{},
+                         ssq, eps);
+}
+
+// Phase 4y producer.  Requires the LK_GEMV_BIGBLOCK launch shape: 1024 threads,
+// so block b owns rows 32b..32b+31 -- exactly Q8_1 block b, one row per warp.
+//
+// The 32 values of a Q8_1 block therefore live one-per-warp and cannot be
+// shuffled across; they meet in shared memory exactly once.  That is the whole
+// reason this needs a shape change while k_moe_accum4 does not.
+//
+// The barrier is unconditional and outside every early-exit: with 2048 rows and
+// 64 blocks of 32 warps the grid is exact, but a divergent __syncthreads() would
+// hang rather than merely be wrong, so it is not placed behind a guard.
+__global__ void k_gemv_q4_0_prod(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                                 LKNormProd np) {
+    __shared__ float s_x[32];
+    __shared__ float s_u[32];
+    const int tw   = threadIdx.x >> 5;                 // warp within the block
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * 32 + tw;             // one output row per warp
+
+    if (row < out_rows) {
+        float acc = 0.0f;
+        for (int k = lane; k < bpr; k += 32)
+            acc += dot_q4_0_q8_1(qs + (size_t)row * bpr + k, d + (size_t)row * bpr + k, 0, xq + k);
+        acc = warp_sum(acc);
+        if (lane == 0) {
+            const float xv = add_residual ? (y[row] + acc) : acc;
+            y[row] = xv;
+            const float uv = np.w ? xv * np.w[row] : 0.0f;
+            if (np.h32) np.h32[row] = uv;
+            s_x[tw] = xv;
+            s_u[tw] = uv;
+        }
+    }
+    __syncthreads();
+    // One Q8_1 block per kernel block, owned entirely by warp 0.
+    // NOTE: lk_norm_prod_warp indexes yq8 and ssq by `b` itself -- pass the BASE
+    // pointer, not a pre-offset one.  (Offsetting here as well writes every
+    // odd-numbered activation block and leaves the rest stale.)
+    if (np.w && tw == 0)
+        lk_norm_prod_warp(s_x[lane], s_u[lane], lane, np.yq8, np.ssq, blockIdx.x);
 }
 
 __global__ void k_gemv_q4_0_norm(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                                  const block_q8_1 * __restrict__ xq,
                                  int out_rows, int bpr, float * __restrict__ y, int add_residual,
                                  LKNormEpilogue ne) {
-    k_gemv_q4_0_t<true>(qs, d, xq, out_rows, bpr, y, add_residual, ne);
+    k_gemv_q4_0_t<true>(qs, d, xq, out_rows, bpr, y, add_residual, ne, nullptr, 0.0f);
 }
 
 // ---------------------------------------------------------------------------
 __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                             const int8_t * __restrict__ sc, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
-                            int out_rows, int sbpr, float * __restrict__ y) {
+                            int out_rows, int sbpr, float * __restrict__ y,
+                            const float * __restrict__ ssq, float eps) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= out_rows) return;
+    // Phase 4y: norm_final is produced by k_moe_accum4, so `xq` here is the raw
+    // x*w and the true activation is inv*(x*w).  One multiply per output row.
+    float inv = 1.0f;
+    if (ssq) inv = lk_norm_inv(ssq, lane, eps);
     // 8 super-blocks per 2048-dim row.  The loop bound is a runtime argument,
     // so nvcc cannot unroll it and the warp pays a full ~500-cycle HBM round
     // trip per super-block -- 8 serialised stalls per row, which measured as
@@ -298,7 +358,7 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
         }
     }
     acc = warp_sum(acc);
-    if (lane == 0) y[warp] = acc;
+    if (lane == 0) y[warp] = acc * inv;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,10 +393,14 @@ __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __r
 __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql1, const uint8_t * __restrict__ qh1,
                                  const int8_t * __restrict__ sc1, const __half * __restrict__ d1,
                                  const block_q8_1 * __restrict__ xq,
-                                 int out_rows, int sbpr, float * __restrict__ y) {
+                                 int out_rows, int sbpr, float * __restrict__ y,
+                                 const float * __restrict__ ssq, float eps) {
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= out_rows) return;
+    // Phase 4y: see k_gemv_q6_K.
+    float ninv = 1.0f;
+    if (ssq) ninv = lk_norm_inv(ssq, lane, eps);
 
     // ---- per-lane geometry: constant across all superblocks -----------------
     const int s        = 8 * (lane & 15);   // element offset inside the 128-half
@@ -377,7 +441,7 @@ __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql1, const uint8_t
         acc += __half2float(d1[sblk]) * (d8 * (float) (a * scv));
     }
     acc = warp_sum(acc);
-    if (lane == 0) y[warp] = acc;
+    if (lane == 0) y[warp] = acc * ninv;
 }
 
 // Produces the SwiGLU activation and, optionally, its Q8_1 form.
@@ -448,9 +512,16 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 #define LK_ROUTER_UNROLL 16
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
-        float * __restrict__ logits) {
+        float * __restrict__ logits, const float * __restrict__ ssq, float eps) {
     const int e = blockIdx.x;
     const int lane = threadIdx.x;
+    // Phase 4y: with ffn_norm folded into the mixer output projection, `h` holds
+    // the RAW x*w and the true activation is inv*(x*w).  The router's dot is
+    // linear in that scalar for the same reason the Q4_0 dot is, so one multiply
+    // on the logit restores it.  This is the only consumer that needs the f32
+    // form rather than the quantised one.
+    float ninv = 1.0f;
+    if (ssq) ninv = lk_norm_inv(ssq, lane, eps);
     const float * row = gate_inp + (size_t)e * LK_HIDDEN;
     float acc = 0.0f;
     for (int base = 0; base < LK_HIDDEN; base += 32 * LK_ROUTER_UNROLL) {
@@ -463,7 +534,7 @@ __global__ void __launch_bounds__(32) k_router_dot(
         for (int j = 0; j < LK_ROUTER_UNROLL; ++j) acc += v[j] * hv[j];
     }
     acc = warp_sum(acc);
-    if (lane == 0) logits[e] = acc;
+    if (lane == 0) logits[e] = acc * ninv;
 }
 
 // The selection half: sigmoid + bias ranking, top-4, renormalised.  Byte for
@@ -863,9 +934,14 @@ __global__ void k_gemv_q4_0_3(const uint4 * __restrict__ qs0, const __half * __r
                               int rows1, float * __restrict__ y1,
                               const uint4 * __restrict__ qs2, const __half * __restrict__ d2,
                               int rows2, float * __restrict__ y2,
-                              const block_q8_1 * __restrict__ xq, int bpr) {
+                              const block_q8_1 * __restrict__ xq, int bpr,
+                              const float * __restrict__ ssq, float eps) {
     const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
+    // Phase 4y.  The grid is exact here (3072 warps for 2048+512+512 rows), so
+    // there is no early exit and the shuffles below are always full-mask.
+    float inv = 1.0f;
+    if (ssq) inv = lk_norm_inv(ssq, lane, eps);
     const uint4  * qs; const __half * d; float * y; int row;
     if (gw < rows0) {
         row = gw;            qs = qs0; d = d0; y = y0;
@@ -879,7 +955,7 @@ __global__ void k_gemv_q4_0_3(const uint4 * __restrict__ qs0, const __half * __r
     float acc = 0.0f;
     for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xq + j);
     acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) y[row] = acc * inv;
 }
 
 __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half * __restrict__ d_a,
@@ -888,7 +964,8 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
                                  int out_rows, int bpr, int rows_per_expert,
                                  int xq_stride,
                                  const int * __restrict__ d_idx,
-                                 float * __restrict__ y_a, float * __restrict__ y_b) {
+                                 float * __restrict__ y_a, float * __restrict__ y_b,
+                                 const float * __restrict__ ssq, float eps) {
     const int half = blockIdx.y >> 2;               // 0 = gate, 1 = up
     const int k    = blockIdx.y & (LK_TOP_K - 1);   // which of the 4 experts
     const uint4  * qs = half ? qs_b : qs_a;
@@ -897,6 +974,11 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
     if (warp >= out_rows) return;
+    // Phase 4y.  The grid is exact here (blockIdx.x*8 warps covers out_rows, and
+    // rows_per_expert == out_rows for this model), so no warp exits early and
+    // the full-mask shuffles below are well defined.
+    float ninv = 1.0f;
+    if (ssq) ninv = lk_norm_inv(ssq, lane, eps);
     const size_t base = (size_t) d_idx[k] * rows_per_expert * bpr;
     const uint4  * qrow = qs + base + (size_t) warp * bpr;
     const __half * drow = d  + base + (size_t) warp * bpr;
@@ -904,7 +986,7 @@ __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half *
     const block_q8_1 * xq_k = xq + (size_t) k * xq_stride;
     for (int j = lane; j < bpr; j += 32) acc += dot_q4_0_q8_1(qrow, drow, j, xq_k + j);
     acc = warp_sum(acc);
-    if (lane == 0) y[(size_t) k * out_rows + warp] = acc;
+    if (lane == 0) y[(size_t) k * out_rows + warp] = acc * ninv;
 }
 
 __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,
@@ -929,12 +1011,27 @@ __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __
 
 // ---------------------------------------------------------------------------
 __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict__ down4,
-                             const float * __restrict__ d_w, int n) {
+                             const float * __restrict__ d_w, int n, LKNormProd np) {
+    const int lane = threadIdx.x & 31;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float a = 0.0f;
 #pragma unroll
         for (int k = 0; k < LK_TOP_K; ++k) a += d_w[k] * down4[(size_t)k * n + i];
-        dst[i] += a;
+        const float xv = dst[i] + a;
+        dst[i] = xv;
+        // Phase 4y.  Thread i owns element i, so warp w owns elements
+        // 32w..32w+31 -- exactly Q8_1 block w.  The quantisation and the
+        // sum-of-squares are both pure warp ops: no shared memory, no barrier,
+        // no counter, and nothing to reset between replays.
+        //
+        // The launch is <<<8,256>>> for n == 2048, so every lane is active on
+        // the single grid-stride iteration and the full-mask shuffles inside
+        // lk_norm_prod_warp are well defined.
+        if (np.w) {
+            const float uv = xv * np.w[i];
+            if (np.h32) np.h32[i] = uv;
+            lk_norm_prod_warp(xv, uv, lane, np.yq8, np.ssq, i >> 5);
+        }
     }
 }
 

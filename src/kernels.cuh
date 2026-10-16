@@ -96,6 +96,90 @@ __global__ void k_quantize_q8_1(const float * __restrict__ x,
 // blocks of 256 threads (8 warps) needed to cover `rows` output rows
 #define LK_GEMV_BLOCKS(rows) ((((rows) / LK_GEMV_ROWS) + 7) / 8)
 
+// ---------------------------------------------------------------------------
+// Phase 4y: an alternative launch SHAPE for the three GEMVs that produce the
+// residual stream (shortconv_out, attn_out, dense_down).
+//
+// A Q8_1 activation block is 32 CONSECUTIVE channels.  A warp owns one output
+// row, and at the default shape a block owns 8 consecutive rows, so a Q8_1
+// block spans FOUR blocks -- which means those GEMVs cannot quantise their own
+// output without a cross-block barrier.  With 1024 threads a block owns
+// 32 consecutive rows, which is exactly one Q8_1 block.
+//
+// The warp->row map is unchanged (warp = global warp id, row0 = warp*ROWS), so
+// the arithmetic is bit-identical; only blockDim and the grid change.  The same
+// 2048 warps result, but as 64 blocks of 1024 instead of 256 blocks of 256:
+// 64 SMs carry one block each instead of 256 blocks spreading 3 per SM.
+//
+// This is a FALSIFICATION TEST and defaults off.  LK_GEMV_ROWS=4 also yields 64
+// blocks for a 2048-row GEMV and measured WORSE, twice -- but it differs in
+// warps per block (8 vs 32), so it does not settle this.  Only a measurement
+// does, and it must come before any fusion is built on the shape.
+#ifndef LK_GEMV_BIGBLOCK
+#define LK_GEMV_BIGBLOCK 0
+#endif
+#if LK_GEMV_BIGBLOCK
+#define LK_GEMV_WBLOCKS(rows) ((rows) / 32)
+#define LK_GEMV_WTHREADS 1024
+#else
+#define LK_GEMV_WBLOCKS(rows) LK_GEMV_BLOCKS(rows)
+#define LK_GEMV_WTHREADS 256
+#endif
+
+// Phase 4y, in two independent halves so they can be measured separately.
+//
+// ACCUM folds attn_norm(L) for L >= 3 into k_moe_accum4(L-1).  Free: that
+// kernel's warp w already owns exactly Q8_1 block w, so the epilogue is pure
+// warp arithmetic with no barrier and no counter.
+//
+// GEMV folds the remaining 42 sites (the 40 ffn_norms, whose producer is
+// shortconv_out/attn_out, and attn_norm for L = 1,2, whose producer is
+// dense_down).  All three of those are 2048-row GEMVs, so a block owns only 8
+// rows at the default shape and a Q8_1 block spans four blocks -- this half
+// requires LK_GEMV_BIGBLOCK.
+#ifndef LK_NORM_PROD_ACCUM
+#define LK_NORM_PROD_ACCUM 0
+#endif
+#ifndef LK_NORM_PROD_GEMV
+#define LK_NORM_PROD_GEMV 0
+#endif
+#if LK_NORM_PROD_GEMV && !LK_GEMV_BIGBLOCK
+#error "LK_NORM_PROD_GEMV needs LK_GEMV_BIGBLOCK: a block must own a whole Q8_1 block"
+#endif
+#if LK_NORM_PROD_GEMV && LK_FUSE_ROUTER
+#error "LK_FUSE_ROUTER is superseded by LK_NORM_PROD_GEMV; the two cannot be combined"
+#endif
+
+// attn_norm(L) is produced by layer L-1's channel mixer.  Which kernel that is
+// depends on whether layer L-1 is dense or MoE, and the two producers sit in
+// different halves of the fusion:
+//   L = 0        embedding        never fused
+//   L = 1, 2     dense_down(L-1)  GEMV half  (layers 0 and 1 are dense)
+//   L >= 3       moe_accum4(L-1)  ACCUM half (layers 2..39 are MoE)
+//   L = 40       moe_accum4(39)   ACCUM half, this is norm_final
+// The two sets are disjoint, and each producer site asks for its own half, so
+// the split cannot silently disagree with itself.
+#if LK_NORM_PROD_ACCUM
+#define LK_FUSE_ATTN_NORM_A(il) ((il) >= 3)
+#else
+#define LK_FUSE_ATTN_NORM_A(il) 0
+#endif
+#if LK_NORM_PROD_GEMV
+#define LK_FUSE_ATTN_NORM_G(il) ((il) == 1 || (il) == 2)
+#else
+#define LK_FUSE_ATTN_NORM_G(il) 0
+#endif
+// What a CONSUMER of attn_norm(il) must believe.
+#define LK_FUSE_ATTN_NORM(il) (LK_FUSE_ATTN_NORM_A(il) || LK_FUSE_ATTN_NORM_G(il))
+
+// ffn_norm(L) is produced by this layer's own mixer output projection, for
+// every layer.
+#if LK_NORM_PROD_GEMV
+#define LK_FUSE_FFN_NORM(l) 1
+#else
+#define LK_FUSE_FFN_NORM(l) 0
+#endif
+
 // Generic Q4_0 x Q8_1 GEMV: LK_GEMV_ROWS output rows per warp.
 //
 // Phase 4x: an optional RMSNorm epilogue.  Every FFN norm in a token is
@@ -175,24 +259,113 @@ struct LKNormEpilogue {
     unsigned int * ctr;           // one counter, reset by the last block
 };
 
+// ---------------------------------------------------------------------------
+// Phase 4y: the scale-invariant Q8_1 norm split.
+//
+// An RMSNorm multiplies all 2048 activations by one positive scalar, inv, and
+// the next kernel quantises the result to Q8_1.  ggml's block_q8_1 stores
+//     ds.x = d   = amax/127
+//     ds.y = SUM = the RAW FP32 SUM of the 32 activations    (see quant.cuh)
+// and its dot product is d4*(d8*sumi - 8*SUM) with sumi an integer dp4a.
+//
+// Write u = x*w for the raw product and y = inv*u for the true activation.
+// The int8 quants are invariant to inv --
+//     q_i = round(u_i*127/amax_u) = round(y_i*127/amax_y)
+// -- and BOTH ds fields are linear in it, so
+//     dot(y) = inv * dot(u)
+// up to where the fp32 multiply lands.  The norm therefore splits across the
+// kernel boundary with NO synchronisation at all:
+//     producer: quantise the RAW x*w         (never needs inv)
+//     consumer: ONE multiply per output row  (never needs a per-block scale)
+// the only shared state being 64 sum-of-squares partials.
+//
+// The obvious alternative -- producer emits amax/127, consumer rescales the 64
+// ds half2 values -- additionally rounds d through fp16 TWICE, once unscaled and
+// once after scaling, for ~5e-4 relative error on every block of every layer.
+// This form rounds once.
+//
+// Residual difference from running the norm as its own kernel: (x*inv)*w versus
+// inv*(x*w) reassociate at ~1e-7, which flips an int8 rint in roughly one call
+// in fifty.  C2 adjudicates; C1 will move and that is expected, not a failure.
+//
+// Rejected alternatives, with reasons:
+//   * reduce the partials in shared memory and broadcast -- introduces the only
+//     __syncthreads() into kernels that have none, and DEADLOCKS wherever a warp
+//     can leave early via `if (row >= out_rows) return`.
+//   * atomicAdd the partials -- non-deterministic, so replay is not reproducible.
+//   * warp 0 reduces while the others stream -- warp 0 also owns an output row,
+//     so it lands on the block's critical path anyway.
+#define LK_NORM_BLOCKS (LK_HIDDEN / 32)     // 64 Q8_1 blocks in 2048 elements
+static_assert(LK_NORM_BLOCKS == 64, "lk_norm_inv reads ssq[lane] and ssq[lane+32]");
+
+// Producer-side descriptor.  `w == nullptr` disables the epilogue entirely, so
+// the same kernel serves both the converted and the unconverted layers.
+struct LKNormProd {
+    const float * __restrict__ w;      // norm weights to apply, or null
+    float * __restrict__ h32;          // raw x*w in f32 for the router, or null
+    block_q8_1 * __restrict__ yq8;     // quantised RAW activation
+    float * __restrict__ ssq;          // [LK_NORM_BLOCKS] sum-of-squares partials
+};
+
+// One warp owns exactly one Q8_1 block: 32 consecutive channels, one per lane.
+__device__ __forceinline__ void lk_norm_prod_warp(float xv, float uv, int lane,
+                                                  block_q8_1 * __restrict__ yq8,
+                                                  float * __restrict__ ssq, int b) {
+    quantize_q8_1_warp(uv, yq8 + b, lane);
+    // Sum of squares is of the RESIDUAL, not of x*w: ggml_rms_norm reduces
+    // sum(x^2)/n and applies w afterwards.
+    float sq = xv * xv;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    if (lane == 0) ssq[b] = sq;
+}
+
+// Consumer side: recover inv from the 64 partials.
+//
+// Every consumer WARP reads the partials itself -- two floats per lane -- rather
+// than staging them through shared memory.  That is 256 B of L2 per warp against
+// the 2304 B of xq the same warp already reads, and it needs no barrier.
+//
+// The summation order differs from k_rmsnorm_q8_1's tree, so the result differs
+// at ~1e-7.  It is deterministic, which is what the graph replay needs.
+__device__ __forceinline__ float lk_norm_inv(const float * __restrict__ ssq,
+                                             int lane, float eps) {
+    float s = __ldg(ssq + lane) + __ldg(ssq + lane + 32);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    return rsqrtf(s * (1.0f / (float) LK_HIDDEN) + eps);
+}
+
 __global__ void k_gemv_q4_0(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
-                            int out_rows, int bpr, float * __restrict__ y, int add_residual);
+                            int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                            const float * __restrict__ ssq, float eps);
 __global__ void k_gemv_q4_0_norm(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                                  const block_q8_1 * __restrict__ xq,
                                  int out_rows, int bpr, float * __restrict__ y, int add_residual,
                                  LKNormEpilogue ne);
+// Phase 4y producer: writes the residual AND quantises it.  Requires the
+// LK_GEMV_BIGBLOCK shape (1024 threads), which makes block b own rows
+// 32b..32b+31 -- exactly Q8_1 block b, one row per warp.  The 32 values of a
+// Q8_1 block therefore live one-per-warp and cannot be shuffled; they meet in
+// shared memory exactly once.
+__global__ void k_gemv_q4_0_prod(const uint4 * __restrict__ qs, const __half * __restrict__ d,
+                                 const block_q8_1 * __restrict__ xq,
+                                 int out_rows, int bpr, float * __restrict__ y, int add_residual,
+                                 LKNormProd np);
 
 // Generic Q6_K x Q8_1 GEMV: one warp per output row; each super-block consumes
 // 8 consecutive Q8_1 blocks.
 __global__ void k_gemv_q6_K(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                             const int8_t * __restrict__ sc, const __half * __restrict__ d,
                             const block_q8_1 * __restrict__ xq,
-                            int out_rows, int sbpr, float * __restrict__ y);
+                            int out_rows, int sbpr, float * __restrict__ y,
+                            const float * __restrict__ ssq, float eps);
 __global__ void k_gemv_q6_K_dp4a(const uint8_t * __restrict__ ql, const uint8_t * __restrict__ qh,
                                  const int8_t * __restrict__ sc, const __half * __restrict__ d,
                                  const block_q8_1 * __restrict__ xq,
-                                 int out_rows, int sbpr, float * __restrict__ y);
+                                 int out_rows, int sbpr, float * __restrict__ y,
+                                 const float * __restrict__ ssq, float eps);
 
 // SwiGLU: out[i] = silu(gate[i]) * up[i]
 __global__ void k_swiglu(const float * __restrict__ gate, const float * __restrict__ up,
@@ -212,7 +385,7 @@ __global__ void k_shortconv(const float * __restrict__ bcx, int t,
 // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID path.
 __global__ void __launch_bounds__(32) k_router_dot(
         const float * __restrict__ h, const float * __restrict__ gate_inp,
-        float * __restrict__ logits);
+        float * __restrict__ logits, const float * __restrict__ ssq, float eps);
 __global__ void k_router_top4(const float * __restrict__ logits,
                               const float * __restrict__ bias,
                               int * __restrict__ idx_out, float * __restrict__ w_out);
@@ -346,14 +519,16 @@ __global__ void k_gemv_q4_0_3(const uint4 * __restrict__ qs0, const __half * __r
                               int rows1, float * __restrict__ y1,
                               const uint4 * __restrict__ qs2, const __half * __restrict__ d2,
                               int rows2, float * __restrict__ y2,
-                              const block_q8_1 * __restrict__ xq, int bpr);
+                              const block_q8_1 * __restrict__ xq, int bpr,
+                              const float * __restrict__ ssq, float eps);
 __global__ void k_gemv_q4_0_exp2(const uint4 * __restrict__ qs_a, const __half * __restrict__ d_a,
                                  const uint4 * __restrict__ qs_b, const __half * __restrict__ d_b,
                                  const block_q8_1 * __restrict__ xq,
                                  int out_rows, int bpr, int rows_per_expert,
                                  int xq_stride,
                                  const int * __restrict__ d_idx,
-                                 float * __restrict__ y_a, float * __restrict__ y_b);
+                                 float * __restrict__ y_a, float * __restrict__ y_b,
+                                 const float * __restrict__ ssq, float eps);
 __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __restrict__ d,
                                 const block_q8_1 * __restrict__ xq,
                                 int out_rows, int bpr, int rows_per_expert,
@@ -364,5 +539,11 @@ __global__ void k_gemv_q4_0_exp(const uint4 * __restrict__ qs, const __half * __
 
 // dst[i] += sum_k w[k] * down4[k*n + i]  -- keeps the router weights on device,
 // which removes the per-MoE-layer cudaStreamSynchronize host round-trip.
+//
+// Phase 4y: this is also the producer for the NEXT layer's attn_norm (and for
+// norm_final at layer 39).  Thread i owns element i and warp w owns elements
+// 32w..32w+31, which is exactly Q8_1 block w -- so the epilogue needs no
+// cross-warp communication, no barrier, and no counter.  This is the 38-site
+// half of the fusion that requires no launch-shape change at all.
 __global__ void k_moe_accum4(float * __restrict__ dst, const float * __restrict__ down4,
-                             const float * __restrict__ d_w, int n);
+                             const float * __restrict__ d_w, int n, LKNormProd np);

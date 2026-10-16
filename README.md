@@ -210,10 +210,23 @@ kernels and the router that each reduce 2048 numbers in a single block and canno
 be made wider, 0.11 ms of compute-only kernels.  None of it is bandwidth.
 
 The way past it is batching, which amortises every weight byte across the tokens
-in the batch.  MoE reuse is the constraint, and G4b measured it: a batch of 4
-tokens draws 11.22 distinct experts out of 16 slots, a 1.43x saving.  At batch 4
-that puts 0.73 GB/token on the wire instead of 1.47 -- about 2x, or ~830 tok/s at
-today's bandwidth efficiency.
+in the batch.  MoE reuse is the constraint, and the number depends on a
+distinction that is easy to get wrong in the optimistic direction: G4b measured
+K *consecutive* tokens (the speculative-decoding question), but a batch holds B
+tokens from B *different* sequences, which share only the static marginal expert
+skew.  `tools/g4c.py` measures both from the same router trace.
+
+    B    consecutive   independent   uniform baseline
+    4    11.22 (1.65x) 12.89 (1.51x) 14.56 (1.39x)
+    8    17.91 (2.04x) 21.07 (1.83x) 25.81 (1.60x)
+
+Batching uses the **independent** row: 971.7 MB/token at B=4 and 799.6 MB/token
+at B=8, against 1447.9 at B=1.  Those are byte floors, before any loss of
+bandwidth efficiency at larger working sets, so the realistic gain at batch 4 is
+**~1.35-1.45x** rather than the 2x an earlier revision of this file claimed from
+the consecutive-token figure.  The uniform row is the floor of what is even
+theoretically available, and the measurement beats it, which is the whole reason
+the MoE is worth exploiting.
 
 ## Architecture ground truth
 

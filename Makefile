@@ -22,12 +22,24 @@ SPLIT_MIN ?= 8
 # so the negative result stays reproducible with one flag.
 FUSE_NORM ?= 0
 FUSE_ROUTER ?= 0
+# Phase 4y: reshape the three residual-producing GEMVs to one Q8_1 block per
+# block.  Off by default; see the note in kernels.cuh.  This is a falsification
+# test -- it changes the launch shape only, and no arithmetic.
+BIGBLOCK  ?= 0
+# Phase 4y: fold RMSNorm into the kernel that produces its input, via the
+# scale-invariance of Q8_1 (see kernels.cuh).  Two halves, measured separately:
+#   ACCUM  attn_norm(L>=3) into k_moe_accum4  -- needs no shape change
+#   GEMV   the other 42 sites                 -- requires BIGBLOCK=1
+NORM_ACCUM ?= 0
+NORM_GEMV  ?= 0
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
 NVFLAGS   := -O3 -std=c++17 -lineinfo $(ARCH) -Xcompiler -Wall -Xcompiler -Wextra \
              -I$(CURDIR)/src -DLK_ATTN_SPLIT=$(SPLIT) -DLK_ATTN_ABLATE=$(ABLATE) \
              -DLK_ATTN_TARGET_N=$(TARGET_N) -DLK_ATTN_SPLIT_MIN=$(SPLIT_MIN) \
-             -DLK_FUSE_NORM=$(FUSE_NORM) -DLK_FUSE_ROUTER=$(FUSE_ROUTER)
+             -DLK_FUSE_NORM=$(FUSE_NORM) -DLK_FUSE_ROUTER=$(FUSE_ROUTER) \
+             -DLK_GEMV_BIGBLOCK=$(BIGBLOCK) \
+             -DLK_NORM_PROD_ACCUM=$(NORM_ACCUM) -DLK_NORM_PROD_GEMV=$(NORM_GEMV)
 LDFLAGS   := -L$(CUDA_HOME)/lib64 -lcudart -lm
 BUILD     := build
 
@@ -96,6 +108,12 @@ $(BUILD)/test_normfuse: tests/test_normfuse.cu $(BUILD)/kernels.o $(BUILD)/flags
 test-normfuse: $(BUILD)/test_normfuse
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_normfuse
 
+$(BUILD)/test_normscale: tests/test_normscale.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_normscale.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+test-normscale: $(BUILD)/test_normscale
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_normscale
+
 $(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
 
@@ -159,7 +177,7 @@ gate-c1a: engine oracle-tools
 gate-c2: engine oracle-tools
 > @python3 tools/perplexity.py ppl_natural.bin 200
 
-all: devinfo test_quant test_kernels test_attn test_normfuse engine oracle-tools
+all: devinfo test_quant test_kernels test_attn test_normfuse test_normscale engine oracle-tools
 
 # Gate G2: every kernel primitive verified against an independent reference.
 test-all: test-quant test-kernels

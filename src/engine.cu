@@ -171,6 +171,11 @@ struct Engine {
     // epilogues would work only because they are stream-ordered, which is too
     // subtle a reason to rely on.
     unsigned int * router_ctr = nullptr;     // [1], zeroed at init
+    // Phase 4y: sum-of-squares partials handed from a producer kernel to the
+    // kernel that consumes its activation.  No counter and nothing to reset --
+    // the producer overwrites all LK_NORM_BLOCKS entries on every call, so a
+    // stale value is impossible by construction (unlike norm_ctr above).
+    float *        norm_ssq = nullptr;       // [LK_NORM_BLOCKS]
     float *  attn_part = nullptr; // [heads][SPLIT][2 + head_dim] split-K scratch
     block_q8_1 * xq2 = nullptr;  // [368] second scratch: the MoE expert loop needs
                                  //       the hidden-state activation to survive
@@ -210,6 +215,25 @@ static inline const uint4 *   PQS(const Engine & e, const LKTensor * t) { return
 static inline const __half *  PD (const Engine & e, const LKTensor * t) { return (const __half *)P(e, t, 1); }
 
 static inline int grid_for(int rows) { return (rows + 7) / 8; }   // 8 warps/block
+
+// Phase 4y: descriptor for the mixer output projection, which is also the
+// producer of this layer's ffn_norm.  h32 is the router's input and exists only
+// on MoE layers; the router is the one consumer that needs f32 rather than Q8_1.
+#if LK_NORM_PROD_GEMV
+static inline LKNormProd ffn_prod(Engine & e, const Layer & l) {
+    LKNormProd np;
+    np.w   = LK_FUSE_FFN_NORM(l) ? P32(e, l.ffn_norm) : nullptr;
+    np.h32 = (LK_FUSE_FFN_NORM(l) && l.is_moe) ? e.h : nullptr;
+    // xq2, NOT xq.  This kernel reads its activation from xq and writes its
+    // quantised output one block per thread block, so targeting xq would let
+    // block 0 overwrite a block of activations that every other block is still
+    // reading.  That race is silent, localised, and produced a model that
+    // repeated one token forever -- caught by tools/ab.py, not by any gate.
+    np.yq8 = e.xq2;
+    np.ssq = e.norm_ssq;
+    return np;
+}
+#endif
 
 // Phase 4x: the FFN norm that follows the mixer's output projection, described
 // as an epilogue for that projection to run for free.  See kernels.cuh.
@@ -301,6 +325,9 @@ static Engine * engine_create(const char * pack_path, int max_seq) {
     CK(cudaMalloc(&e->xq,  368 * sizeof(block_q8_1)));
     CK(cudaMalloc(&e->xq2, 368 * sizeof(block_q8_1)));
     CK(cudaMalloc(&e->norm_partial, LK_NORM_PARTIALS * 4));
+    // Phase 4y: fully overwritten by every producer call, so it needs no
+    // initialisation and has no reset hazard.
+    CK(cudaMalloc(&e->norm_ssq, LK_NORM_BLOCKS * 4));
     CK(cudaMalloc(&e->norm_ctr, 4));
     // Must start at zero: the fused epilogue is skipped, silently and with
     // plausible output, if the counter is stale.
@@ -365,6 +392,27 @@ static void forward(Engine & e, cudaStream_t st) {
     int conv_i = 0, attn_i = 0;
     for (int il = 0; il < LK_N_LAYERS; ++il) {
         const Layer & l = e.L[il];
+        // Phase 4y: layer il's attn_norm is folded into layer il-1's moe_accum4,
+        // which is the kernel that writes the residual it would reduce.  Layers
+        // 0..2 keep their norm node: 0 comes from the embedding and 1..2 from
+        // the dense_down GEMV, which needs the LK_GEMV_BIGBLOCK shape to own a
+        // whole Q8_1 block and is not converted yet.
+        // Phase 4y.  attn_norm_ssq is non-null exactly when layer il's
+        // attn_norm was folded into the kernel that produced this residual.
+        const float * attn_norm_ssq = LK_FUSE_ATTN_NORM(il) ? e.norm_ssq : nullptr;
+        const float * ffn_norm_ssq  = LK_FUSE_FFN_NORM(l)  ? e.norm_ssq : nullptr;
+#if LK_NORM_PROD_GEMV
+        // The mixer's output projection quantises its own output, and it cannot
+        // write into the xq it is still reading, so the POST-mixer activation
+        // lives in xq2 and everything downstream of the mixer shares it: the
+        // FFN gate/up, the expert/dense intermediate, and the down projection.
+        // They are strictly sequential, and the norm's output is dead the
+        // moment gate_up has read it.
+        block_q8_1 * const ffn_xq = e.xq2;
+#else
+        // norm_ffn is a node and writes xq itself; nothing aliases.
+        block_q8_1 * const ffn_xq = e.xq;
+#endif
         if (dumpf) {   // residual stream BEFORE layer il
             float buf[LK_HIDDEN];
             // cudaMemcpy is only ordered against the DEFAULT stream; our kernels
@@ -376,12 +424,14 @@ static void forward(Engine & e, cudaStream_t st) {
         }
 
         // ---- sequence mixer -------------------------------------------
+        if (!attn_norm_ssq) {
         LKP_B("norm_attn");
     // dead outputs: nothing reads the f32 or fp16 form of the PRE-mixer norm
     // (the router consumes the POST-ffn_norm one), so skip 12 KB of stores per
     // call.  The kernel already branches on null.
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, l.attn_norm), LK_HIDDEN, LK_EPS,
                                               nullptr, nullptr, e.xq); LKP_E();
+        }
         LK_STEP("mixer-norm");
 
         if (!l.is_attn) {
@@ -389,7 +439,8 @@ static void forward(Engine & e, cudaStream_t st) {
             ++conv_i;
             LKP_B("shortconv_in");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(6144), 256, 0, st>>>(
-                PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0); LKP_E();
+                PQS(e, l.sc_in), PD(e, l.sc_in), e.xq, 6144, 64, e.y, 0,
+                attn_norm_ssq, LK_EPS); LKP_E();
             if (il == 0 && getenv("LK_DUMP_L0")) {   // bisect layer 0 tensors
                 const char * dp = getenv("LK_DUMP_L0");
                 FILE * df = fopen(dp, "wb");
@@ -427,15 +478,23 @@ static void forward(Engine & e, cudaStream_t st) {
             // raw projection can be compared in isolation (debug only).
             const int ar = (il == 0 && getenv("LK_NO_RESIDUAL")) ? 0 : 1;
             LKP_B("shortconv_out");
-#if LK_FUSE_NORM
-    // This GEMV produces exactly the 2048 residual values the FFN norm then
-    // reduces, so the norm runs inside it -- see kernels.cuh.
+#if LK_NORM_PROD_GEMV
+    // Phase 4y: this GEMV writes exactly the 2048 residual values that this
+    // layer's ffn_norm reduces, so it quantises them itself.  No barrier, no
+    // counter -- see kernels.cuh.
+    k_gemv_q4_0_prod<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar,
+                ffn_prod(e, l)); LKP_E();
+#elif LK_FUSE_NORM
+    // Superseded by LK_NORM_PROD_GEMV, which gets the same result without the
+    // last-block barrier.  Kept so the negative result stays reproducible.
     k_gemv_q4_0_norm<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar,
                 ffn_norm_epi(e, l)); LKP_E();
 #else
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar); LKP_E();
+    k_gemv_q4_0<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.sc_out), PD(e, l.sc_out), e.xq, LK_HIDDEN, 64, e.x, ar,
+                nullptr, 0.0f); LKP_E();
 #endif
             if (il == 0 && getenv("LK_DUMP_L0X")) {   // immediately after the GEMV
                 const char * dp = getenv("LK_DUMP_L0X");
@@ -454,7 +513,7 @@ static void forward(Engine & e, cudaStream_t st) {
                 PQS(e, l.wq), PD(e, l.wq), LK_HIDDEN, e.qv,
                 PQS(e, l.wk), PD(e, l.wk), 512, e.kv,
                 PQS(e, l.wv), PD(e, l.wv), 512, e.vv,
-                e.xq, 64); LKP_E();
+                e.xq, 64, attn_norm_ssq, LK_EPS); LKP_E();
             __half * kc = e.kcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             __half * vc = e.vcache + (size_t)al * e.max_seq * LK_N_KV_HEADS * LK_HEAD_DIM;
             LKP_B("qk_norm_rope");
@@ -475,19 +534,24 @@ static void forward(Engine & e, cudaStream_t st) {
     LKP_E();
             
             LKP_B("attn_out");
-#if LK_FUSE_NORM
+#if LK_NORM_PROD_GEMV
+    k_gemv_q4_0_prod<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1,
+                ffn_prod(e, l)); LKP_E();
+#elif LK_FUSE_NORM
     k_gemv_q4_0_norm<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
                 PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1,
                 ffn_norm_epi(e, l)); LKP_E();
 #else
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1); LKP_E();
+    k_gemv_q4_0<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.wo), PD(e, l.wo), e.xq, LK_HIDDEN, 64, e.x, 1,
+                nullptr, 0.0f); LKP_E();
 #endif
             LK_STEP("attention");
         }
 
         // ---- channel mixer --------------------------------------------
-#if LK_FUSE_NORM
+#if (LK_FUSE_NORM || LK_NORM_PROD_GEMV)
         // The norm already ran inside whichever projection produced e.x
         // (shortconv_out or attn_out, above).  LK_STEP is kept so the phase
         // still appears in the timing breakdown.
@@ -504,12 +568,14 @@ static void forward(Engine & e, cudaStream_t st) {
         if (!l.is_moe) {
             LKP_B("dense_gate");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
-                PQS(e, l.ffn_gate), PD(e, l.ffn_gate), e.xq, LK_DENSE_INTER, 64, e.y, 0); LKP_E();
+                PQS(e, l.ffn_gate), PD(e, l.ffn_gate), ffn_xq, LK_DENSE_INTER, 64, e.y, 0,
+                ffn_norm_ssq, LK_EPS); LKP_E();
             LKP_B("dense_up");
     k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_DENSE_INTER), 256, 0, st>>>(
-                PQS(e, l.ffn_up), PD(e, l.ffn_up), e.xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0); LKP_E();
+                PQS(e, l.ffn_up), PD(e, l.ffn_up), ffn_xq, LK_DENSE_INTER, 64, e.y + LK_DENSE_INTER, 0,
+                ffn_norm_ssq, LK_EPS); LKP_E();
             LKP_B("dense_swiglu");
-    k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter, e.xq); LKP_E();
+    k_swiglu<<<64, 256, 0, st>>>(e.y, e.y + LK_DENSE_INTER, LK_DENSE_INTER, e.inter, ffn_xq); LKP_E();
             if (il == 0 && getenv("LK_DUMP_FFN")) {   // dense-FFN intermediates
                 const char * dp = getenv("LK_DUMP_FFN");
                 FILE * df = fopen(dp, "wb");
@@ -532,8 +598,25 @@ static void forward(Engine & e, cudaStream_t st) {
             }
             
             LKP_B("dense_down");
-    k_gemv_q4_0<<<LK_GEMV_BLOCKS(LK_HIDDEN), 256, 0, st>>>(
-                PQS(e, l.ffn_down), PD(e, l.ffn_down), e.xq, LK_HIDDEN, 368, e.x, 1); LKP_E();
+#if LK_NORM_PROD_GEMV
+    // Also the producer of attn_norm(il+1) -- for layers 0 and 1, whose
+    // successor's norm would otherwise be a node.  Dense layers have no router,
+    // so no f32 h32 output is needed here.
+    {
+        LKNormProd np;
+        np.w   = LK_FUSE_ATTN_NORM_G(il + 1) ? P32(e, e.L[il + 1].attn_norm) : nullptr;
+        np.h32 = nullptr;
+        np.yq8 = e.xq;
+        np.ssq = e.norm_ssq;
+        k_gemv_q4_0_prod<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.ffn_down), PD(e, l.ffn_down), ffn_xq, LK_HIDDEN, 368, e.x, 1,
+                np); LKP_E();
+    }
+#else
+    k_gemv_q4_0<<<LK_GEMV_WBLOCKS(LK_HIDDEN), LK_GEMV_WTHREADS, 0, st>>>(
+                PQS(e, l.ffn_down), PD(e, l.ffn_down), ffn_xq, LK_HIDDEN, 368, e.x, 1,
+                nullptr, 0.0f); LKP_E();
+#endif
             LK_STEP("dense-ffn");
         } else {
             // The router consumes the POST-ffn_norm hidden state in FP32:
@@ -545,7 +628,8 @@ static void forward(Engine & e, cudaStream_t st) {
     k_router_dot_top4<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
                 P32(e, l.rbias), e.d_idx, e.d_w, e.router_ctr); LKP_E();
 #else
-    k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate); LKP_E();
+    k_router_dot<<<LK_N_EXPERTS, 32, 0, st>>>(e.h, P32(e, l.router), e.d_gate,
+                                              ffn_norm_ssq, LK_EPS); LKP_E();
             LKP_B("router_top4");
     // one lane per expert: the sigmoids are computed cooperatively, so a
     // 32-thread block would leave experts 32..63 uninitialised.
@@ -562,9 +646,9 @@ static void forward(Engine & e, cudaStream_t st) {
             const int GU = LK_TOP_K * LK_MOE_INTER;
             LKP_B("moe_gate_up");
     k_gemv_q4_0_exp2<<<dim3(grid_for(LK_MOE_INTER), 2 * LK_TOP_K), 256, 0, st>>>(
-                PQS(e, l.eg), PD(e, l.eg), PQS(e, l.eu), PD(e, l.eu), e.xq,
+                PQS(e, l.eg), PD(e, l.eg), PQS(e, l.eu), PD(e, l.eu), ffn_xq,
                 LK_MOE_INTER, 64, LK_MOE_INTER, 0,
-                e.d_idx, e.moe_gu, e.moe_gu + GU); LKP_E();
+                e.d_idx, e.moe_gu, e.moe_gu + GU, ffn_norm_ssq, LK_EPS); LKP_E();
             LKP_B("moe_swiglu");
     k_swiglu<<<48, 256, 0, st>>>(e.moe_gu, e.moe_gu + GU, GU, nullptr, e.xq2); LKP_E();
             
@@ -574,7 +658,19 @@ static void forward(Engine & e, cudaStream_t st) {
                 PQS(e, l.ed), PD(e, l.ed), e.xq2, LK_HIDDEN, 48, LK_HIDDEN, 48,
                 e.d_idx, e.moe_down4); LKP_E();
             LKP_B("moe_accum");
-    k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN); LKP_E();
+    // Phase 4y: layer il's accumulator is also the producer of layer il+1's
+    // attn_norm, and of norm_final at the last layer.  `np.w == nullptr` when
+    // this layer's successor still has its own norm node (the LK_NORM_PROD_GEMV
+    // half is off, so only MoE -> MoE transitions fuse).
+    {
+        const LKTensor * nw = (il + 1 < LK_N_LAYERS) ? e.L[il + 1].attn_norm : e.out_norm;
+        LKNormProd np;
+        np.w   = LK_FUSE_ATTN_NORM_A(il + 1) ? P32(e, nw) : nullptr;
+        np.h32 = nullptr;                 // the router reads the POST-ffn norm
+        np.yq8 = e.xq;
+        np.ssq = e.norm_ssq;
+        k_moe_accum4<<<8, 256, 0, st>>>(e.x, e.moe_down4, e.d_w, LK_HIDDEN, np); LKP_E();
+    }
         }
     }
 
@@ -587,9 +683,14 @@ static void forward(Engine & e, cudaStream_t st) {
     }
 
     // ---- final norm + tied Q6_K lm_head + argmax ----------------------
+    // Phase 4y: norm_final is produced by the last layer's k_moe_accum4, so the
+    // node disappears for the same reason attn_norm's does.
+    if (!LK_FUSE_ATTN_NORM(LK_N_LAYERS)) {
     LKP_B("norm_final");
     k_rmsnorm_q8_1<<<1, 256, LK_HIDDEN * 4, st>>>(e.x, P32(e, e.out_norm), LK_HIDDEN, LK_EPS,
                                           nullptr, nullptr, e.xq); LKP_E();
+    }
+    const float * final_ssq = LK_FUSE_ATTN_NORM(LK_N_LAYERS) ? e.norm_ssq : nullptr;
     LKP_B("lm_head");
     // LK_Q6K_SCALAR keeps the original scalar kernel reachable so the two can be
     // compared on real weights without a rebuild.
@@ -597,12 +698,12 @@ static void forward(Engine & e, cudaStream_t st) {
         k_gemv_q6_K<<<grid_for(LK_VOCAB), 256, 0, st>>>(
             (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
             (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-            e.xq, LK_VOCAB, 8, e.logits);
+            e.xq, LK_VOCAB, 8, e.logits, final_ssq, LK_EPS);
     else
         k_gemv_q6_K_dp4a<<<grid_for(LK_VOCAB), 256, 0, st>>>(
             (const uint8_t *)P(e, e.embd, 0), (const uint8_t *)P(e, e.embd, 1),
             (const int8_t *)P(e, e.embd, 2), (const __half *)P(e, e.embd, 3),
-            e.xq, LK_VOCAB, 8, e.logits);
+            e.xq, LK_VOCAB, 8, e.logits, final_ssq, LK_EPS);
     LKP_E();
     LKP_B("argmax_part");
     k_argmax_part<<<LK_ARGMAX_BLOCKS, 256, 0, st>>>(e.logits, e.d_apv, e.d_api); LKP_E();

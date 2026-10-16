@@ -24,7 +24,9 @@ import numpy as np
 ROOT   = pathlib.Path(__file__).resolve().parent.parent
 REF    = pathlib.Path(os.environ.get("LK_REF", ROOT / "ref"))
 SYS    = ROOT / "tools"
-ENGINE = ROOT / "build" / "engine"
+# LK_ENGINE lets a variant binary be scored without rebuilding over build/engine
+# -- the same convention tools/parity.py and tools/sweep.py already use.
+ENGINE = pathlib.Path(os.environ.get("LK_ENGINE", ROOT / "build" / "engine"))
 ORACLE = ROOT / "build" / "oracle_ppl"
 GGUF   = os.environ.get("LK_MODEL", "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf")
 NL, H  = 41, 2048
