@@ -766,11 +766,22 @@ int main(int argc, char ** argv) {
     const char * pack = getenv("LK_PACK");
     const char * mode = (argc > 1) ? argv[1] : "gen";
     if (!pack) { fprintf(stderr, "LK_PACK not set\n"); return 1; }
-    // The objective is single-stream decode at up to 8k context and
-    // LK_ATTN_MAX_SEQ (the shared-memory bound in k_attention_decode) is already
-    // 8192, but the KV cache was sized for 2048 -- anything longer addressed
-    // past the end of the allocation.  Overridable for experiments.
-    const int max_seq = getenv("LK_MAX_SEQ") ? atoi(getenv("LK_MAX_SEQ")) : 8192;
+    // KV-cache capacity, in tokens.  THIS IS THE ONLY THING THAT SIZES THE KV
+    // CACHE.  LK_ATTN_MAX_SEQ in kernels.cuh is a compile-time dimension for the
+    // split-K scratch and allocates nothing; the comment here used to imply the
+    // two were the same thing, which is exactly how a reader concludes that
+    // raising LK_ATTN_MAX_SEQ buys capacity.  It does not.
+    //
+    // Defaults to the model's full trained context (the GGUF says
+    // lfm2moe.context_length = 131072) so the engine can be driven exactly as
+    // far as llama.cpp can be.  FP16 K and V for that is 2.68 GB.  Overridable
+    // to cut the allocation when only short context is being measured.
+    const int max_seq = getenv("LK_MAX_SEQ") ? atoi(getenv("LK_MAX_SEQ")) : LK_ATTN_MAX_SEQ;
+    if (max_seq > LK_ATTN_MAX_SEQ) {
+        fprintf(stderr, "FATAL: LK_MAX_SEQ=%d exceeds the compiled split-K limit %d\n",
+                max_seq, LK_ATTN_MAX_SEQ);
+        return 1;
+    }
 
     g_debug_steps = getenv("LK_DEBUG_STEPS") ? atoi(getenv("LK_DEBUG_STEPS")) : 0;
     Engine * e = engine_create(pack, max_seq);
@@ -902,13 +913,54 @@ int main(int argc, char ** argv) {
     if (strcmp(mode, "gen") != 0) { fprintf(stderr, "unknown mode %s\n", mode); return 1; }
     std::vector<int> toks;
     for (int i = 2; i < argc; ++i) toks.push_back(atoi(argv[i]));
-    if (toks.empty()) { fprintf(stderr, "usage: %s gen TOKEN_ID...\n", argv[0]); return 1; }
+    // A 131072-token prompt CANNOT be passed through argv: at ~6 bytes of text
+    // plus an 8-byte pointer per token that is 1.84 MB against a 2 MB ARG_MAX
+    // which also has to hold the environment, so execve fails with E2BIG before
+    // main ever runs and the failure looks like "the engine crashed at long
+    // context" rather than "the command line was too long".
+    //
+    // LK_PROMPT_BIN reads the same little-endian int32 token blob that
+    // tools/sweep.py and tools/perplexity.py already write, so a long-context
+    // run needs no argument list at all.  Appended to any argv tokens.
+    if (const char * pb = getenv("LK_PROMPT_BIN")) {
+        FILE * pf = fopen(pb, "rb");
+        if (!pf) { fprintf(stderr, "LK_PROMPT_BIN: cannot open %s\n", pb); return 1; }
+        if (fseek(pf, 0, SEEK_END) != 0) { fprintf(stderr, "LK_PROMPT_BIN: seek\n"); fclose(pf); return 1; }
+        const long nb = ftell(pf);
+        rewind(pf);
+        if (nb <= 0 || (nb % 4) != 0) {
+            fprintf(stderr, "LK_PROMPT_BIN: %s is %ld bytes, not a non-empty int32 blob\n", pb, nb);
+            fclose(pf); return 1;
+        }
+        const size_t cnt = (size_t) nb / 4;
+        std::vector<int> pbuf(cnt);
+        if (fread(pbuf.data(), 4, cnt, pf) != cnt) {
+            fprintf(stderr, "LK_PROMPT_BIN: short read on %s\n", pb); fclose(pf); return 1;
+        }
+        fclose(pf);
+        toks.insert(toks.end(), pbuf.begin(), pbuf.end());
+    }
+    if (toks.empty()) {
+        fprintf(stderr, "usage: %s gen TOKEN_ID...   or set LK_PROMPT_BIN=file.bin\n", argv[0]);
+        return 1;
+    }
     const int ngen = getenv("LK_NGEN") ? atoi(getenv("LK_NGEN")) : 32;
     const bool bench = getenv("LK_BENCH") != nullptr;
 
     // prefill: feed each prompt token; the graph advances d_pos itself
+    //
+    // TIMED SEPARATELY, AND IT IS NOT A DETAIL.  There is no batched prefill:
+    // every prompt token costs one full decode step, so ingesting a 131072-token
+    // system prompt costs 131072 sequential steps at whatever the engine does at
+    // that context.  llama.cpp evaluates the prompt in parallel batches and is
+    // orders of magnitude faster at this.  Reporting only tok_s made the engine
+    // look uniformly good at long context while hiding the cost that a serving
+    // workload actually pays first.
+    auto tp0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < toks.size(); ++i) { feed(toks[i]); run(); }
     CK(cudaStreamSynchronize(st));
+    auto tp1 = std::chrono::steady_clock::now();
+    const double psec = std::chrono::duration<double>(tp1 - tp0).count();
     int next = take();
 
     if (!bench) printf("out:");
@@ -943,9 +995,12 @@ int main(int argc, char ** argv) {
     const double sec = std::chrono::duration<double>(t1 - t0).count();
     const double tps = done / sec;
     const double BYTES_PER_TOKEN = 1466751488.0;
-    printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f\n",
+    printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f "
+           "prompt_n=%d prefill_s=%.4f prefill_tok_s=%.2f\n",
            (int)toks.size() + done, done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
-           100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0);
+           100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0,
+           (int)toks.size(), psec,
+           psec > 0.0 ? (double)toks.size() / psec : 0.0);
 
 #if LK_NORM_AUDIT
     // ARCHITECTURE.md 9.1 / REBRIEF A6.  Phase 4y's scale invariance is exact in

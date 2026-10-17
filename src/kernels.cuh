@@ -77,10 +77,27 @@ __global__ void k_rmsnorm_q8_1(const float * __restrict__ x, const float * __res
 __global__ void k_quantize_q8_1(const float * __restrict__ x,
                                 block_q8_1 * __restrict__ y, int nblocks);
 
-// Attention scratch capacity (scores live in shared memory in Phase 3).  The
-// host asserts seq_len <= this; a proper Split-K online softmax lands in
-// Phase 4 to lift the limit to the full 131072 context.
-#define LK_ATTN_MAX_SEQ 8192
+// Attention scratch capacity.  THIS IS NOT THE KV-CACHE SIZE.  The KV cache is
+// sized at runtime by LK_MAX_SEQ in engine_create; raising this constant does
+// not allocate one byte of it.  What this constant declares is the longest
+// sequence the SPLIT-K PATH is dimensioned for, and it does exactly two jobs:
+// it bounds the shared score array of k_attention_decode (the SERIAL fallback,
+// dead in the default build -- see LK_ATTN_DECODE_MAX_SEQ), and it fixes
+// LK_ATTN_CHUNK below.
+//
+// Phase 4 lifted the split-K limit from 8192 to the model's full trained
+// context.  The GGUF metadata says lfm2moe.context_length = 131072, and the
+// FP16 KV cache for that is 10 * 131072 * 8 * 64 * 2 bytes * 2 (K and V) =
+// 2.68 GB, which fits inside the 10.4 GB the weights leave free.
+#define LK_ATTN_MAX_SEQ 131072
+// The serial fallback keeps a WHOLE SEQUENCE of fp32 scores in one block's
+// shared memory: `__shared__ float s_score[LK_ATTN_DECODE_MAX_SEQ]`.  At the
+// 131072 above, that array alone is 512 KB and the kernel simply does not
+// compile -- sm_86 permits 48 KB of STATIC shared memory per block.  So the
+// dead path keeps its own, much smaller ceiling and the two constants are
+// deliberately not the same.  Anyone reviving the serial path for long context
+// must fix that array; do not "fix" it by lowering LK_ATTN_MAX_SEQ.
+#define LK_ATTN_DECODE_MAX_SEQ 8192
 // k_attention_decode runs ONE block per query head, and every one of its loops
 // is limited by outstanding memory requests rather than by bandwidth or issue
 // slots: the score loop gives each thread all 64 dims of a single token, so a
@@ -570,17 +587,32 @@ __global__ void k_router_dot_top4(const float * __restrict__ h,
 // the operating point.  Every block still launches -- CUDA graphs need fixed
 // launch dimensions -- and blocks past the live slice count exit immediately.
 //
-// The cap makes LK_ATTN_CHUNK a constant: with TARGET_N = 64 and SPLIT_MIN = 8,
-// chunk = ceil(seq/slices) is at most 64 for every seq (below 512 the floor of
-// 8 dominates and gives chunk <= 64; above it, slices >= seq/64 forces
-// chunk <= 64).  LK_ATTN_TARGET_N is therefore both the tuning knob and the
-// exact shared-memory requirement.
+// The cap makes LK_ATTN_CHUNK a compile-time constant, but NOT LK_ATTN_TARGET_N
+// -- and believing it was TARGET_N is the error the 131072 change exposed.
+// chunk = ceil(seq/slices) is bounded by the LARGER of two things:
+//
+//   * TARGET_N, while the slice count is NOT capped.  Then
+//     slices = ceil(seq/TARGET_N), so chunk = ceil(seq/ceil(seq/TARGET_N))
+//     <= TARGET_N.
+//   * ceil(MAX_SEQ/SPLIT), once the cap DOES bind, because then slices = SPLIT
+//     and chunk = ceil(seq/SPLIT).
+//
+// So the shared score array must be sized max(TARGET_N, ceil(MAX_SEQ/SPLIT)),
+// which is exactly LK_ATTN_CHUNK below.  At the original 8192/128/64 that is
+// max(64, 64) = 64 -- identical to the old definition, so nothing about the
+// short-context path changes.  At 131072 it is max(64, 512) = 512, i.e. the
+// score array grows from 1 KB to 8 KB per block and the kernel still fits.
+//
+// SPLIT is 256 rather than 128 so that the cap does not bind until seq=16384:
+// every context up to 16384 keeps the slice count it was TUNED with, and the
+// measured table above (16 slices at 272, 128 at 8128) is reproduced exactly.
+// attn_part grows from 1.08 MB to 2.16 MB per layer as the price.
 //
 // An earlier attempt set SPLIT=224 as a single global constant on the strength
 // of a sweep that turned out to be measuring a kernel producing NaN.  The
 // numbers above are all post-fix.
 #ifndef LK_ATTN_SPLIT
-#define LK_ATTN_SPLIT      128
+#define LK_ATTN_SPLIT      256
 #endif
 #ifndef LK_ATTN_TARGET_N
 #define LK_ATTN_TARGET_N   64
@@ -588,7 +620,9 @@ __global__ void k_router_dot_top4(const float * __restrict__ h,
 #ifndef LK_ATTN_SPLIT_MIN
 #define LK_ATTN_SPLIT_MIN  8
 #endif
-#define LK_ATTN_CHUNK      LK_ATTN_TARGET_N
+#define LK_ATTN_CHUNK_CAP  ((LK_ATTN_MAX_SEQ + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT)
+#define LK_ATTN_CHUNK      (LK_ATTN_TARGET_N > LK_ATTN_CHUNK_CAP \
+                            ? LK_ATTN_TARGET_N : LK_ATTN_CHUNK_CAP)
 // The number of slices that actually hold tokens, as a function of position.
 // Both attention kernels derive it the same way from d_pos, so they always
 // agree; k_attn_combine uses it to avoid reading partials that were never

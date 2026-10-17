@@ -774,13 +774,17 @@ __global__ void k_attention_decode(const float * __restrict__ q,
     const int head = blockIdx.x;
     const int kv_head = head / (LK_N_HEADS / LK_N_KV_HEADS);
     __shared__ float s_q[LK_HEAD_DIM];
-    __shared__ float s_score[LK_ATTN_MAX_SEQ];
+    __shared__ float s_score[LK_ATTN_DECODE_MAX_SEQ];
     if (threadIdx.x < LK_HEAD_DIM) s_q[threadIdx.x] = q[head * LK_HEAD_DIM + threadIdx.x];
     __syncthreads();
 
-    if (seq_len > LK_ATTN_MAX_SEQ) {          // host asserts this; belt-and-braces
+    // LK_ATTN_DECODE_MAX_SEQ, not LK_ATTN_MAX_SEQ: this kernel holds the whole
+    // sequence of scores in shared memory, so its ceiling is a shared-memory
+    // limit and not a context limit.  See the definition in kernels.cuh.
+    if (seq_len > LK_ATTN_DECODE_MAX_SEQ) {
         if (threadIdx.x == 0 && blockIdx.x == 0)
-            printf("FATAL: seq_len %d exceeds LK_ATTN_MAX_SEQ %d\n", seq_len, LK_ATTN_MAX_SEQ);
+            printf("FATAL: seq_len %d exceeds LK_ATTN_DECODE_MAX_SEQ %d\n",
+                   seq_len, LK_ATTN_DECODE_MAX_SEQ);
         return;
     }
     const int lim = seq_len;
@@ -1254,14 +1258,19 @@ __global__ void k_moe_down_accum(const uint4 * __restrict__ qs, const __half * _
 // That grid was still wrong, and Phase 4v below explains why.
 // LK_ATTN_CHUNK now lives in kernels.cuh, derived from LK_ATTN_TARGET_N.
 #define LK_ATTN_GQA   (LK_N_HEADS / LK_N_KV_HEADS)      // query heads per kv head
-// The attention split derives its slice count at runtime, so the shared score
-// array must cover the LARGEST chunk that rule can ever ask for.  With
-// slices = clamp(ceil(seq/TARGET_N), SPLIT_MIN, SPLIT), chunk = ceil(seq/slices)
-// is at most TARGET_N provided the cap can cover the whole sequence:
-static_assert(LK_ATTN_SPLIT * LK_ATTN_TARGET_N >= LK_ATTN_MAX_SEQ,
-              "attention split cap too small: chunk can exceed LK_ATTN_CHUNK");
-static_assert(LK_ATTN_CHUNK == LK_ATTN_TARGET_N,
-              "LK_ATTN_CHUNK must equal LK_ATTN_TARGET_N; see the argument in kernels.cuh");
+// The shared score array must cover the LARGEST chunk the slice rule can ask
+// for, which is max(LK_ATTN_TARGET_N, ceil(LK_ATTN_MAX_SEQ / LK_ATTN_SPLIT)) --
+// LK_ATTN_CHUNK is defined to be exactly that, so the old assert
+// (SPLIT * TARGET_N >= MAX_SEQ) is no longer the invariant and is replaced by
+// the two facts that actually matter: the array is at least TARGET_N, and the
+// slice rule can never ask for more than the array holds.
+static_assert(LK_ATTN_CHUNK >= LK_ATTN_TARGET_N,
+              "LK_ATTN_CHUNK must cover the uncapped case (chunk <= TARGET_N)");
+static_assert((LK_ATTN_MAX_SEQ + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT <= LK_ATTN_CHUNK,
+              "LK_ATTN_CHUNK must cover the capped case (chunk <= ceil(MAX_SEQ/SPLIT))");
+static_assert(LK_ATTN_CHUNK * LK_ATTN_GQA * 4 + LK_ATTN_GQA * 256 * 4 + LK_HEAD_DIM * LK_ATTN_GQA * 4
+              <= 48 * 1024,
+              "static shared memory per block must stay under the 48 KB sm_86 limit");
 
 // ---------------------------------------------------------------------------
 // Phase 4v: GQA-aware split -- the fix for the context cliff.
@@ -1299,6 +1308,30 @@ k_attn_split(const float * __restrict__ q,
     const int kv_head = blockIdx.x;
     const int sp      = blockIdx.y;
     const int head0   = kv_head * LK_ATTN_GQA;
+
+    // EARLY OUT, BEFORE ANY SHARED MEMORY AND BEFORE ANY __syncthreads().
+    //
+    // At short context almost the whole grid is dead: at seq=272 the slice rule
+    // returns 8 slices, so 8 of the 256 launch-width slots per kv_head hold
+    // tokens and 1984 of the (8 x 256) blocks own nothing.  Those blocks used to
+    // load s_q and hit a barrier before discovering that.  With SPLIT raised to
+    // 256 for the 131072 context that dead weight is 8x larger, and it is paid
+    // at EVERY context the engine actually runs at today.
+    //
+    // t0 and t1 depend only on seq_len and blockIdx.y, so they are block-uniform
+    // and returning here cannot diverge a barrier: every thread in the block
+    // takes the same branch.  k_attn_combine derives the same boundary, so a
+    // dead block still writes nothing and is still skipped.
+    const int nslices = lk_attn_slices(seq_len);
+    const int chunk = (seq_len + nslices - 1) / nslices;
+    const int t0 = sp * chunk;
+    const int t1 = (t0 + chunk < seq_len) ? (t0 + chunk) : seq_len;
+    // Blocks past the live slice count own no tokens and write NOTHING: at short
+    // context most of the grid is in this state, and having them store 4 x 66
+    // sentinel floats each cost a megabyte of pointless global traffic per
+    // layer.
+    if (t0 >= t1) return;
+
     // DIM-major q: the four heads that share this kv_head are contiguous for a
     // given dim, so one float4 shared load fetches all four q values.  Head-major
     // (the obvious layout) needs four separate shared loads per dim, i.e. 256
@@ -1317,15 +1350,6 @@ k_attn_split(const float * __restrict__ q,
     }
     __syncthreads();
 
-    const int nslices = lk_attn_slices(seq_len);
-    const int chunk = (seq_len + nslices - 1) / nslices;
-    const int t0 = sp * chunk;
-    const int t1 = (t0 + chunk < seq_len) ? (t0 + chunk) : seq_len;
-    // Blocks past the live slice count own no tokens and write NOTHING: at short
-    // context most of the grid is in this state, and having them store 4 x 66
-    // sentinel floats each cost a megabyte of pointless global traffic per
-    // layer.  k_attn_combine derives the same boundary and skips them.
-    if (t0 >= t1) return;
     const int n = t1 - t0;
     float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
