@@ -76,8 +76,28 @@ def engine_gen(binpath, ids, ngen):
 
 def oracle_gen(text, ngen):
     d = post("/completion", {"prompt": text, "n_predict": ngen, "temperature": 0.0,
-                             "cache_prompt": False, "seed": 1234})
-    return d["content"], d["tokens"]
+                             "cache_prompt": False, "seed": 1234,
+                             "return_tokens": True})
+    # `return_tokens` is not the default.  Without it llama-server returns an
+    # EMPTY `tokens` list and the token-agreement column silently reports 0/0,
+    # which reads as "no data" rather than as "the instrument never worked".
+    return d["content"], (d.get("tokens") or [])
+
+
+# ---------------------------------------------------------------------------
+# CHAT FORMAT, AND WHY IT IS BAKED INTO THE PROMPT.
+#
+# This model is an instruct model with a visible reasoning block: asked a bare
+# question it emits  thinking... and burns the whole token budget thinking.  Both
+# engines must be given the identical token stream, and the engine has no chat
+# template of its own, so the template is applied HERE and the resulting ids are
+# handed to both.  Pre-filling an EMPTY think block (`` immediately after
+# the assistant header) suppresses the reasoning block entirely and makes the
+# model answer directly -- verified against the oracle before being written in.
+# ---------------------------------------------------------------------------
+def wrap(prompt):
+    return ("<|im_start|>user\n" + prompt + "<|im_end|>\n"
+            "<|im_start|>assistant\n\n")
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +146,20 @@ def add(cat, prompt, ngen, check):
 
 
 # ---- factual: one unique answer, checkable by substring -------------------
+# NO "Question: ... / Answer:" scaffolding.  MEASURED: appending that scaffolding
+# pushes this model back into a  thinking block that consumes the entire token
+# budget, and then BOTH engines fail -- which reads as a shared model defect and
+# is actually the harness asking in a shape the chat template never produces.
+# The bare question under the ChatML template answers directly.
 for q, a in [("What is the capital of Australia?", "canberra"),
              ("What is the chemical symbol for gold?", "au"),
              ("Who wrote the play Romeo and Juliet?", "shakespeare"),
              ("What is the largest planet in our solar system?", "jupiter"),
              ("How many sides does a hexagon have?", "6")]:
-    add("factual", "Question: %s\nAnswer:" % q, 24,
-        (lambda a: (lambda t: a in t.lower()))(a))
+    # Word boundaries, not plain substring: "au" is inside "because", and a
+    # checker that passes for the wrong reason is worse than no checker.
+    add("factual", q, 40,
+        (lambda a: (lambda t: re.search(r"\b%s\b" % re.escape(a), t.lower()) is not None))(a))
 
 # ---- reasoning: parse the number, compare to a computed truth -------------
 for q, a in [("A train travels 60 miles per hour for 3 hours. How many miles does it travel?", 180),
@@ -140,7 +167,7 @@ for q, a in [("A train travels 60 miles per hour for 3 hours. How many miles doe
              ("A rectangle is 13 cm long and 7 cm wide. What is its area in square centimetres?", 91),
              ("Sarah has 48 apples. She gives away one quarter of them. How many apples does she have left?", 36),
              ("What is 17 multiplied by 23?", 391)]:
-    add("reasoning", "Question: %s\nAnswer with just the number.\nAnswer:" % q, 32,
+    add("reasoning", "%s Reply with only the number." % q, 64,
         (lambda a: (lambda t: num(t) is not None and abs(float(num(t)) - a) < 1e-6))(a))
 
 # ---- code: extracted and EXECUTED ----------------------------------------
@@ -169,7 +196,7 @@ CODE = [
   "assert gcd(12,18)==6\nassert gcd(7,13)==1\nassert gcd(100,10)==10"),
 ]
 for prompt, tests in CODE:
-    add("code", prompt, 220, (lambda tests: (lambda t: run_code(extract_code(t), tests)))(tests))
+    add("code", prompt, 320, (lambda tests: (lambda t: run_code(extract_code(t), tests)))(tests))
 
 
 def main():
@@ -178,26 +205,57 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
+    # THE ENGINE DOES NOT STOP AT EOS.  Given a fixed ngen it keeps generating
+    # through <|im_end|> and <|endoftext|>, so the answer is correct and is then
+    # followed by a degenerate repetition loop.  llama-server stops, so scoring
+    # the raw text compares one clean answer against one clean answer plus
+    # garbage and reports a token agreement that means nothing.  Both sides are
+    # therefore CLIPPED AT THE FIRST EOS before scoring OR comparing; the raw
+    # text is still recorded in the JSON so the loop stays visible.
+    eos_ids = []
+    for e in ("<|im_end|>", "<|endoftext|>"):
+        t = tok(e)
+        if len(t) == 1:
+            eos_ids.append(t[0])
+    if not eos_ids:
+        print("WARNING: could not resolve EOS ids; agreement will be understated")
+
+    def clip_ids(v):
+        for i, x in enumerate(v):
+            if x in eos_ids:
+                return v[:i]
+        return v
+
+    def clip_txt(s):
+        cut = len(s)
+        for e in ("<|im_end|>", "<|endoftext|>"):
+            j = s.find(e)
+            if j >= 0:
+                cut = min(cut, j)
+        return s[:cut]
+
     rows = []
-    print("%-10s %-6s %-6s %-6s  %s" % ("category", "eng", "orc", "agree", "detail"))
+    print("%-10s %-6s %-6s %-9s %s" % ("category", "eng", "orc", "agree", "detail"))
     print("-" * 78)
     for cat, prompt, ngen, check in P:
-        text = prompt
-        ids = tok(prompt)
+        text = wrap(prompt)
+        ids = tok(text)
         etoks = engine_gen(a.engine, ids, ngen)
         etxt = detok(etoks)
         otxt, otoks = oracle_gen(text, ngen)
 
-        e_res = check(etxt)
-        o_res = check(otxt)
+        ec, oc = clip_txt(etxt), clip_txt(otxt)
+        e_res = check(ec)
+        o_res = check(oc)
         e_ok = e_res[0] if isinstance(e_res, tuple) else bool(e_res)
         o_ok = o_res[0] if isinstance(o_res, tuple) else bool(o_res)
-        # Token-level agreement over the length both produced: a pure scheduling
-        # difference should show up as a small disagreement, not a divergence in
-        # the first few tokens.
-        k = min(len(etoks), len(otoks))
-        agree = sum(1 for i in range(k) if etoks[i] == otoks[i])
-        firstdiff = next((i for i in range(k) if etoks[i] != otoks[i]), k)
+        # Token agreement over the CLIPPED sequences.  This is the number that
+        # says whether the two implementations are the same model; the raw one
+        # mostly measures that llama-server honours EOS and we do not.
+        ecl, ocl = clip_ids(etoks), clip_ids(otoks)
+        k = min(len(ecl), len(ocl))
+        agree = sum(1 for i in range(k) if ecl[i] == ocl[i])
+        firstdiff = next((i for i in range(k) if ecl[i] != ocl[i]), k)
 
         detail = ""
         if isinstance(e_res, tuple) and not e_ok:

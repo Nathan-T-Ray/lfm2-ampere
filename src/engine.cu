@@ -947,6 +947,26 @@ int main(int argc, char ** argv) {
     const int ngen = getenv("LK_NGEN") ? atoi(getenv("LK_NGEN")) : 32;
     const bool bench = getenv("LK_BENCH") != nullptr;
 
+    // HARD GUARD, AND IT IS NOT DEFENSIVE PROGRAMMING -- IT IS A REAL BUG FOUND
+    // BY RUNNING AT THE LIMIT.  Nothing in the forward path bounds-checks d_pos,
+    // and kcache/vcache are exactly max_seq long, so a prompt plus a generation
+    // that together exceed LK_MAX_SEQ writes past the end of the KV cache.  That
+    // does not crash: it corrupts whatever the allocator put next and the model
+    // produces blank or repetitive output that reads like the model giving up at
+    // long context.  A 131072-token prompt at the default LK_MAX_SEQ of 131072
+    // hits it on the FIRST generated token -- exactly the case the long-context
+    // work creates -- and it was diagnosed as "the model fails at 131k" until
+    // the arithmetic was done.
+    if ((long) toks.size() + (long) ngen > (long) max_seq) {
+        fprintf(stderr,
+                "FATAL: prompt %zu + ngen %d = %ld exceeds LK_MAX_SEQ %d.  The KV "
+                "cache is exactly max_seq long and nothing bounds-checks d_pos, so "
+                "continuing would write past the end of it.  Raise LK_MAX_SEQ or "
+                "lower LK_NGEN.\n",
+                toks.size(), ngen, (long) toks.size() + (long) ngen, max_seq);
+        return 1;
+    }
+
     // prefill: feed each prompt token; the graph advances d_pos itself
     //
     // TIMED SEPARATELY, AND IT IS NOT A DETAIL.  There is no batched prefill:

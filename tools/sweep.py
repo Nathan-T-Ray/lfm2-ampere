@@ -15,6 +15,7 @@ import pathlib
 import re
 import subprocess
 import statistics
+import struct
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -44,18 +45,34 @@ def run_once(ids, ngen, extra_env=None):
     env["LK_BENCH"] = "1"
     env["LK_NGEN"] = str(ngen)
     env["CUDA_VISIBLE_DEVICES"] = env.get("LK_GPU", "0")
+    # LK_PROMPT_BIN, not argv.  A 131072-token prompt is ~0.79 MB of digits plus
+    # ~1.05 MB of argv pointers against a 2 MB ARG_MAX that also has to hold the
+    # environment, so execve fails with E2BIG before main() runs and it presents
+    # as "the engine crashed at long context".  Passing the blob by file removes
+    # the limit and costs one write per point.
+    tmp = pathlib.Path("/tmp/lk_sweep_prompt.bin")
+    tmp.write_bytes(struct.pack("<%di" % len(ids), *ids))
+    env["LK_PROMPT_BIN"] = str(tmp)
     if extra_env:
         env.update(extra_env)
-    r = subprocess.run([str(ENGINE), "gen"] + [str(i) for i in ids],
-                       capture_output=True, text=True, env=env, timeout=3600)
+    r = subprocess.run([str(ENGINE), "gen"],
+                       capture_output=True, text=True, env=env, timeout=28800)
     if r.returncode != 0:
         raise RuntimeError(r.stderr[-3000:])
     for line in r.stdout.splitlines():
-        m = RESULT.match(line)
-        if m:
-            return dict(ctx=int(m.group(1)), n=int(m.group(2)),
-                        sec=float(m.group(3)), tps=float(m.group(4)),
-                        gbs=float(m.group(5)), pct=float(m.group(6)))
+        if line.startswith("RESULT "):
+            # Every field is key=value, so parse them all rather than depending on
+            # positional groups: adding prefill_s to the engine's line must not be
+            # able to silently change what this returns.
+            kv = dict(p.split("=", 1) for p in line.split()[1:] if "=" in p)
+            out = {k: float(v) for k, v in kv.items()}
+            out["ctx"] = int(kv["ctx"])
+            out["n"] = int(kv["generated"])
+            out["sec"] = float(kv["seconds"])
+            out["tps"] = float(kv["tok_s"])
+            out["gbs"] = float(kv["GB_s"])
+            out["pct"] = float(kv["pct_peak"])
+            return out
     raise RuntimeError("no RESULT line\n" + r.stdout[-2000:] + r.stderr[-2000:])
 
 
@@ -65,23 +82,43 @@ def main():
     ap.add_argument("--ngen", type=int, default=64)
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--label", default="")
+    # --corpus exists because the default is 558 tokens and make_prompt TILES it.
+    # At 8192 that is already 15 repeats and at 32768 it is 59, which flattens
+    # the router distribution -- the MoE is ~60% of the step and its traffic
+    # depends on routing, so a tiled prompt measures a different model.  Long
+    # context needs a corpus that is actually long.
+    ap.add_argument("--corpus", default="",
+                    help="int32 token blob; default ref/ppl_natural.bin")
     a = ap.parse_args()
 
-    corpus = load_corpus()
+    if a.corpus:
+        blob = (ROOT / a.corpus).read_bytes() if not os.path.isabs(a.corpus) \
+            else pathlib.Path(a.corpus).read_bytes()
+        corpus = list(struct.unpack("<%di" % (len(blob) // 4), blob))
+    else:
+        corpus = load_corpus()
     label = a.label or os.environ.get("LK_SWEEP_LABEL", "")
     print("# corpus: %d natural tokens, ngen=%d, reps=%d %s"
           % (len(corpus), a.ngen, a.reps, label))
-    print("%8s %10s %10s %10s %8s %9s" % ("ctx", "tok/s", "sd", "GB/s", "pct_peak", "kv_MB"))
+    print("%8s %10s %10s %10s %8s %9s %10s %11s"
+          % ("ctx", "tok/s", "sd", "GB/s", "pct_peak", "kv_MB", "pre_s", "pre_tok/s"))
     for ctx in [int(x) for x in a.ctx.split(",")]:
-        ids = make_prompt(corpus, ctx)
+        if ctx > len(corpus):
+            print("%8d  skipped: corpus has only %d tokens" % (ctx, len(corpus)))
+            continue
+        # No tiling: truncate.  Repeating a corpus changes the model, and above
+        # ~32k there is nothing to repeat from anyway.
+        ids = corpus[:ctx]
         rs = [run_once(ids, a.ngen) for _ in range(a.reps)]
         tps = [r["tps"] for r in rs]
         sd = statistics.stdev(tps) if len(tps) > 1 else 0.0
         kv_mb = ctx * 20480 / 1e6
-        print("%8d %10.2f %10.2f %10.1f %8.1f %9.1f"
+        print("%8d %10.2f %10.2f %10.1f %8.1f %9.1f %10.2f %11.1f"
               % (rs[0]["ctx"], statistics.mean(tps), sd,
                  statistics.mean([r["gbs"] for r in rs]),
-                 statistics.mean([r["pct"] for r in rs]), kv_mb))
+                 statistics.mean([r["pct"] for r in rs]), kv_mb,
+                 statistics.mean([r.get("prefill_s", 0.0) for r in rs]),
+                 statistics.mean([r.get("prefill_tok_s", 0.0) for r in rs])))
     return 0
 
 
