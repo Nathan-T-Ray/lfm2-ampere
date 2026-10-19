@@ -2234,6 +2234,29 @@ the whole point of this engine is that it does not. Three independent checks:
   engine failures is a defect in my own answer extractor. Six code problems
   cannot distinguish 4/6 from 6/6, so the correct claim is **"no evidence of a
   deficit"**, not parity.
+* **Per-position NLL against llama.cpp, over the 126937 positions both engines
+  scored of the same corpus** -- the sharpest of the three, because it measures
+  the whole output distribution rather than one retrieved string.  A fault in the
+  attention split would not move the mean; it raises NLL for the tokens that sit
+  FAR from the start, and a corpus-wide average dilutes exactly that away.  One
+  teacher-forced pass each, bucketed by position:
+
+  | position | n | engine NLL | llama.cpp NLL | delta | top-1 agree |
+  |---|---|---|---|---|---|
+  | 1-256 | 255 | 2.803144 | 2.806608 | **-0.003464** | 86.67% |
+  | 256-1024 | 768 | 3.572755 | 3.543318 | +0.029437 | 90.36% |
+  | 1024-4096 | 3072 | 4.365313 | 4.303838 | +0.061475 | 87.53% |
+  | 4096-16384 | 12288 | 4.383152 | 4.335751 | +0.047401 | 87.61% |
+  | 16384-65536 | 49152 | 4.411635 | 4.385888 | +0.025747 | 87.97% |
+  | 65536-131072 | 61401 | 4.340046 | 4.343465 | **-0.003419** | 88.48% |
+
+  **The delta does not grow with position.**  It peaks in the 1024-4096 bucket and
+  returns to zero -- marginally negative, the engine very slightly BETTER than
+  llama.cpp -- in the 65536-131072 bucket, which is where an attention defect
+  would be loudest.  Top-1 agreement is flat at 87-90% across the entire range.
+  The engine also scores better above 65536 than it does at 16384-65536, which is
+  simply what more context does.  **If split-K attention were subtly wrong at long
+  range, this is the instrument that would show it, and it shows nothing.**
 * The engine's **first nine tokens on a clean prompt are identical** to
   llama.cpp's.
 

@@ -40,7 +40,13 @@ BUCKETS = [(1, 256), (256, 1024), (1024, 4096), (4096, 16384),
 
 
 def run(cmd, env):
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=28800)
+    # errors="replace", NOT the default.  llama.cpp writes progress and timing
+    # lines to stderr that are not valid UTF-8, and text=True decodes BOTH
+    # streams unconditionally -- so a successful run died with
+    # UnicodeDecodeError before its output was ever looked at.  This tool had
+    # never been executed, which is the only reason that survived.
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                       env=env, timeout=28800)
     if r.returncode != 0:
         raise RuntimeError("%s failed:\n%s\n%s" % (cmd[0], r.stdout[-1500:], r.stderr[-2500:]))
     return r.stdout
