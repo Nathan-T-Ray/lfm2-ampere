@@ -50,6 +50,15 @@ NORM_ACCUM ?= 1
 NORM_GEMV  ?= 1
 # Diagnostic ablations.  ABLATE=0 is the only correct build; see kernels.cuh.
 ABLATE    ?= 0
+# bench-attn knobs.  Defaults are the published operating point: 131040 is the
+# largest context the engine can be driven at with room for a generated token,
+# and 200 iterations x 5 reps is what every attention number in
+# ARCHITECTURE.md section 14 was taken at.  A single timing on this machine has
+# been observed to drift by more than the effect being measured, which is why
+# the harness reports a median over reps rather than a mean.
+SEQ       ?= 131040
+ITERS     ?= 200
+REPS      ?= 5
 # FP16 range audit: records min/max of block_q8_1's ds.x and ds.y over a real
 # run.  AUDIT=1 puts atomics in the quantisation hot path, so it is MEASUREMENT
 # ONLY -- never benchmark an AUDIT=1 build.  Gate: `make AUDIT=1 engine` then
@@ -175,7 +184,27 @@ $(BUILD)/oracle_ppl: tools/oracle_ppl.cpp | $(BUILD)
 
 oracle-tools: $(BUILD)/oracle_logits $(BUILD)/oracle_ppl
 
-$(BUILD)/bench_launch: tests/bench_launch.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
+$(BUILD)/bench_attn: tests/bench_attn.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_attn.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+# The long-context instrument.  Isolates k_attn_split + k_attn_combine -- the
+# exact pair the engine launches per attention layer -- at a size where the KV
+# cache is far larger than the 6 MB L2, so the GB/s it reports is real DRAM
+# traffic and not cache reuse.  Every claim about attention bandwidth in
+# ARCHITECTURE.md section 14 comes from this binary; an end-to-end A/B at 131040
+# costs 627 s per side and cannot separate attention from the 40 layers around it.
+#
+#   LK_GPU=0 ./build/bench_attn 131040 200 5
+#
+# Build it with LK_ATTN_ABLATE=1/2/3 to time the V loop, the K loop and the
+# fixed overhead separately.  WHEN YOU DO, THE GB/s COLUMN IS NO LONGER MEANINGFUL:
+# the harness counts bytes as seq*2048 regardless of which half actually ran, so
+# an ablated build prints a number that is a fraction of the real bandwidth and
+# reads like a regression.  It prints the mode on every line for that reason.
+bench-attn: $(BUILD)/bench_attn
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_attn $(SEQ) $(ITERS) $(REPS)
+
+
 > $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
 
 $(BUILD)/bench_norm: tests/bench_norm.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda

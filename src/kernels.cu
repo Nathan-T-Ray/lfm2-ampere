@@ -1268,7 +1268,7 @@ static_assert(LK_ATTN_CHUNK >= LK_ATTN_TARGET_N,
               "LK_ATTN_CHUNK must cover the uncapped case (chunk <= TARGET_N)");
 static_assert((LK_ATTN_MAX_SEQ + LK_ATTN_SPLIT - 1) / LK_ATTN_SPLIT <= LK_ATTN_CHUNK,
               "LK_ATTN_CHUNK must cover the capped case (chunk <= ceil(MAX_SEQ/SPLIT))");
-static_assert(LK_ATTN_CHUNK * LK_ATTN_GQA * 4 + LK_ATTN_GQA * 256 * 4 + LK_HEAD_DIM * LK_ATTN_GQA * 4
+static_assert(LK_ATTN_CHUNK * LK_ATTN_GQA * 4 + LK_ATTN_GQA * 256 * 4 + (LK_HEAD_DIM / 8) * 36 * 4
               <= 48 * 1024,
               "static shared memory per block must stay under the 48 KB sm_86 limit");
 
@@ -1340,68 +1340,123 @@ k_attn_split(const float * __restrict__ q,
     // kernel to 255 registers with spills, which in turn stopped the V loop
     // unrolling and cost it the memory-level parallelism it needs.  Registers
     // and shared traffic here are the same problem.
-    __shared__ __align__(16) float s_q[LK_HEAD_DIM * LK_ATTN_GQA];
+    // Padded float4 staging of q, for the Phase 4z.8 lane mapping.
+    //
+    // The K loop's lanes now split one token's 64 dims eight ways, so a lane
+    // reads the four heads' q values for EIGHT consecutive dims: 8 x float4.
+    // Storing them as one float4 per dim (the obvious layout, and the one this
+    // replaces) makes those eight lanes address base + dsub*128 B -- a stride
+    // of exactly 128 B, which is exactly the 32-bank cycle, so all eight land
+    // in the SAME bank group and every q read is an 8-way conflict.
+    //
+    // Each 8-dim group is therefore 9 float4 (36 floats) instead of 8.  The
+    // extra 16 B shifts group dsub to bank group (4*dsub) mod 32, so the eight
+    // lanes hit eight different bank groups and the reads are conflict-free.
+    // The array grows from 1024 B to 1152 B; see the shared-memory assert.
+    __shared__ __align__(16) float s_qf[(LK_HEAD_DIM / 8) * 36];
     __shared__ float s_score[LK_ATTN_GQA][LK_ATTN_CHUNK];
     __shared__ float s_m[LK_ATTN_GQA][256];
     {
         const int d = threadIdx.x & (LK_HEAD_DIM - 1);
         const int g = threadIdx.x >> 6;                 // 0..3
-        s_q[d * LK_ATTN_GQA + g] = q[(head0 + g) * LK_HEAD_DIM + d];
+        s_qf[(d >> 3) * 36 + (d & 7) * 4 + g] =
+            q[(head0 + g) * LK_HEAD_DIM + d];
     }
     __syncthreads();
 
     const int n = t1 - t0;
     float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const __half * krow =
-            kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
+    // ---------------------------------------------------------------------
+    // Phase 4z.8: the K loop is now WARP-COALESCED.
+    //
+    // It used to be `for (j = threadIdx.x; j < n; j += blockDim.x)`, i.e. one
+    // thread per token.  At a given dim the warp's 32 lanes then addressed
+    // base + t*128 + i*16: THIRTY-TWO DIFFERENT CACHE LINES, sixteen useful
+    // bytes of a 32-byte sector each.  The other half of every sector is only
+    // touched by the NEXT iteration, by which time the line is long gone --
+    // 40-odd resident warps each holding 32 lines is 160 KB against a 128 KB
+    // L1 -- so every sector was fetched twice for the same bytes.
+    //
+    // Measured, per layer at seq=131040, isolating each half with
+    // LK_ATTN_ABLATE (bench_attn, median of 5x200): K 285.0 us = 471 GB/s
+    // against V 187.3 us = 716 GB/s on the SAME layout and the SAME byte
+    // count.  The difference is this mapping and nothing else.
+    //
+    // The new mapping splits each token's 64 dims eight ways: lane l covers
+    // dims (l & 7)*8 .. +7 of token t0 + j + (l >> 3).  Eight lanes tile one
+    // token's 128 bytes exactly, and a warp instruction covers FOUR tokens =
+    // 512 contiguous bytes = 16 sectors, every one fully consumed.  It is the
+    // same coalescing the V loop already had.
+    //
+    // THIS IS NOT BIT-IDENTICAL and cannot be: each lane now sums 8 dims and
+    // the eight partials are combined by a shuffle tree, where before one
+    // thread summed all 64 in order.  tools/ab.py is therefore NOT the gate
+    // here -- make test-attn against the float64 reference is, and the
+    // acceptance criterion is the error against that reference, not agreement
+    // with the kernel being replaced.
+    // ---------------------------------------------------------------------
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int wsub = lane >> 3;          // which of this warp's four tokens
+    const int dsub = lane & 7;           // which 8-dim group of its row
+    for (int base = warp * 4; base < n; base += 32) {
+        const int j = base + wsub;
+        const bool live = (j < n);
+        // Clamp the address rather than branching around the load: a dead lane
+        // reads t0, which is always in range because the early-out above
+        // guarantees t1 > t0.  Keeping the load unconditional is what lets the
+        // compiler software-pipeline the loop; a branch here costs the
+        // memory-level parallelism the whole rewrite is for.
+        const int t = t0 + (live ? j : 0);
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 #if LK_ATTN_ABLATE == 2 || LK_ATTN_ABLATE == 3
-        if (krow) { a0 = (float) j; }        // ABLATION: no K read, no dot
+        if (live && dsub == 0) { a0 = (float) j; }   // ABLATION: no K read, no dot
 #else
-        // 16 uint4 loads cover the token's 64 dims = one 128-byte cache line.
-        //
-        // THIS WAS 32 half2 (4-BYTE) LOADS, AND THE ACCESS PATTERN WAS THE
-        // LONG-CONTEXT BOTTLENECK.  Thread j owns token j, so at a given i the
-        // warp's 32 lanes address base + t*128 + i*4: THIRTY-TWO DIFFERENT
-        // CACHE LINES, four useful bytes each.  The line is fully consumed over
-        // the 32 iterations, so DRAM traffic is identical either way -- the old
-        // comment above is right about that -- but the LSU issues 32 sector
-        // lookups per instruction for 32 instructions per 128 bytes, against 8
-        // for the uint4 form.  Measured symptom: attention sustains ~570 GB/s
-        // while every streaming kernel in the same engine sustains 942 GB/s,
-        // and that gap IS the whole long-context fall-off (131k decode 144 tok/s
-        // against llama.cpp's 172).  It is not parallelism: sweeping
-        // LK_ATTN_SPLIT 128 / 256 / 512 at 32768 moved throughput by 0.06%.
-        //
-        // The arithmetic is untouched: q and i ascend in the same order, v0
-        // before v1, into the same four accumulators.  This MUST stay
-        // bit-identical and tools/ab.py is the gate that says whether it did.
-        const uint4 * k4 = (const uint4 *) krow;
-#pragma unroll 2
-        for (int q = 0; q < LK_HEAD_DIM / 8; ++q) {
-            const uint4 w = k4[q];
-            const __half2 * h2 = (const __half2 *) &w;
+        // ONE uint4 per lane per iteration.  Lane l of a warp addresses
+        // base + (l>>3)*128 + (l&7)*16, so the warp's 32 lanes walk 512
+        // contiguous bytes and every 32-byte sector they touch is consumed
+        // whole by that one instruction.  The uint4 form itself was already
+        // here and is kept: same 16 bytes per lane, same 4-byte-aligned
+        // unpack.
+        const uint4 w = ((const uint4 *)
+            (kc + ((size_t) t * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM))[dsub];
+        const __half2 * h2 = (const __half2 *) &w;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float v0 = __half2float(__low2half(h2[i]));
-                const float v1 = __half2float(__high2half(h2[i]));
-                const int ii = q * 4 + i;
-                const float4 qa = ((const float4 *) s_q)[2 * ii];
-                const float4 qb = ((const float4 *) s_q)[2 * ii + 1];
-                a0 += qa.x * v0; a0 += qb.x * v1;
-                a1 += qa.y * v0; a1 += qb.y * v1;
-                a2 += qa.z * v0; a2 += qb.z * v1;
-                a3 += qa.w * v0; a3 += qb.w * v1;
-            }
+        for (int i = 0; i < 4; ++i) {
+            const float v0 = __half2float(__low2half(h2[i]));
+            const float v1 = __half2float(__high2half(h2[i]));
+            const float4 qa = ((const float4 *) s_qf)[dsub * 9 + 2 * i];
+            const float4 qb = ((const float4 *) s_qf)[dsub * 9 + 2 * i + 1];
+            a0 += qa.x * v0; a0 += qb.x * v1;
+            a1 += qa.y * v0; a1 += qb.y * v1;
+            a2 += qa.z * v0; a2 += qb.z * v1;
+            a3 += qa.w * v0; a3 += qb.w * v1;
         }
 #endif
-        a0 *= LK_ATTN_SCALE; a1 *= LK_ATTN_SCALE;
-        a2 *= LK_ATTN_SCALE; a3 *= LK_ATTN_SCALE;
-        s_score[0][j] = a0; s_score[1][j] = a1;
-        s_score[2][j] = a2; s_score[3][j] = a3;
-        m0 = fmaxf(m0, a0); m1 = fmaxf(m1, a1);
-        m2 = fmaxf(m2, a2); m3 = fmaxf(m3, a3);
+        if (!live) { a0 = 0.0f; a1 = 0.0f; a2 = 0.0f; a3 = 0.0f; }
+        // The eight lanes sharing a token each hold a partial over 8 of its 64
+        // dims, so the dot has to be finished across them.  width=8 keeps
+        // every round inside its own token's lane group, and all 32 lanes
+        // reach all three rounds because `live` is uniform across a group, so
+        // the full mask is correct.  Only lane dsub==0 of each group ends up
+        // holding that group's total.  Three rounds x four heads = 12 shuffle
+        // instructions per warp per FOUR tokens, against 256 FMAs -- this is
+        // the price of the coalescing and it is why the trade is available.
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            a0 += __shfl_down_sync(0xffffffffu, a0, off, 8);
+            a1 += __shfl_down_sync(0xffffffffu, a1, off, 8);
+            a2 += __shfl_down_sync(0xffffffffu, a2, off, 8);
+            a3 += __shfl_down_sync(0xffffffffu, a3, off, 8);
+        }
+        if (dsub == 0 && live) {
+            a0 *= LK_ATTN_SCALE; a1 *= LK_ATTN_SCALE;
+            a2 *= LK_ATTN_SCALE; a3 *= LK_ATTN_SCALE;
+            s_score[0][j] = a0; s_score[1][j] = a1;
+            s_score[2][j] = a2; s_score[3][j] = a3;
+            m0 = fmaxf(m0, a0); m1 = fmaxf(m1, a1);
+            m2 = fmaxf(m2, a2); m3 = fmaxf(m3, a3);
+        }
     }
     // fmaxf is exact and associative, so this tree's shape cannot change the
     // result; only the sum tree below is order-sensitive.

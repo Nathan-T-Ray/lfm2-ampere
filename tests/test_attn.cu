@@ -114,35 +114,61 @@ static void run_case(int seq, bool verbose) {
     CK(cudaMemcpy(d_pos, &pos, 4, cudaMemcpyHostToDevice));
 
     // serial reference (the kernel that passes the oracle gate 66/66)
-    k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK>>>(d_q, d_k, d_v, d_pos, d_out_s, nullptr);
+    // The serial kernel is a SECOND OPINION, not the definition of correct --
+    // host_ref is the definition.  It is only usable up to
+    // LK_ATTN_DECODE_MAX_SEQ, because it keeps its whole score row in a
+    // __shared__ float s_score[LK_ATTN_DECODE_MAX_SEQ]; past that it prints
+    // FATAL and returns early, leaving d_out_s untouched.  Comparing against an
+    // output that was never written is how this test reported a 6.2e-03
+    // "divergence" at 131072 from a kernel whose error against the float64
+    // reference was 3.6e-09 -- the failure was entirely in the reference.
+    const bool do_serial = (seq <= LK_ATTN_DECODE_MAX_SEQ);
+    if (do_serial) {
+        k_attention_decode<<<LK_N_HEADS, LK_ATTN_BLOCK>>>(d_q, d_k, d_v, d_pos, d_out_s, nullptr);
+    }
     // kernel under test
     k_attn_split<<<dim3(LK_N_KV_HEADS, LK_ATTN_SPLIT), 256>>>(d_q, d_k, d_v, d_pos, d_part);
     k_attn_combine<<<LK_N_HEADS, LK_HEAD_DIM>>>(d_part, d_pos, d_out_p, nullptr);
     CK(cudaDeviceSynchronize());
 
     std::vector<float> os(LK_N_HEADS * LK_HEAD_DIM), op(LK_N_HEADS * LK_HEAD_DIM);
-    CK(cudaMemcpy(os.data(), d_out_s, os.size() * 4, cudaMemcpyDeviceToHost));
+    if (do_serial) CK(cudaMemcpy(os.data(), d_out_s, os.size() * 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(op.data(), d_out_p, op.size() * 4, cudaMemcpyDeviceToHost));
     std::vector<double> ref;
     host_ref(q, kh, vh, seq, ref);
 
     const int n = LK_N_HEADS * LK_HEAD_DIM;
-    const double es = maxdev(os, ref, n);      // serial vs exact
-    const double ep = maxdev(op, ref, n);      // split  vs exact
-    const double d  = maxdiff(os, op, n);      // split  vs serial
+    const double es = do_serial ? maxdev(os, ref, n) : 0.0;   // serial vs exact
+    const double ep = maxdev(op, ref, n);                     // split  vs exact
+    const double d  = do_serial ? maxdiff(os, op, n) : 0.0;   // split  vs serial
 
-    printf("  serial vs float64   max abs err = %.3e\n", es);
+    if (do_serial) {
+        printf("  serial vs float64   max abs err = %.3e\n", es);
+    } else {
+        printf("  serial vs float64   SKIPPED (seq > LK_ATTN_DECODE_MAX_SEQ %d;\n"
+               "                      the serial kernel cannot run here at all)\n",
+               LK_ATTN_DECODE_MAX_SEQ);
+    }
     printf("  split  vs float64   max abs err = %.3e\n", ep);
-    printf("  split  vs serial    max abs diff= %.3e\n", d);
+    if (do_serial) printf("  split  vs serial    max abs diff= %.3e\n", d);
 
-    // Tolerances.  The comparison that matters is split-vs-serial: both are
-    // float32 with the same accumulation order per head, so the only permitted
-    // difference is where the exp/normalisation rounding lands.  Anything above
-    // ~1e-4 means the kernel is computing something different, not something
-    // rounded differently.
+    // Tolerances.
+    //
+    // split-vs-serial is the SHORT-CONTEXT check (it can only run at seq <=
+    // LK_ATTN_DECODE_MAX_SEQ): both are float32.  Phase 4z.8 deliberately broke
+    // the accumulation order they used to share -- a shuffle tree over eight
+    // 8-dim partials instead of one 64-long serial chain -- so this is now a
+    // comparison between two different roundings, and it stays at 1e-4 because
+    // the measured value is 7.5e-08, a thousand times inside it.  It is a
+    // smoke check that the two kernels agree about what they are computing.
+    //
+    // split-vs-float64 is the REAL gate, and it covers every length.  It is
+    // also the stricter of the two: the coalesced K loop is a TREE, so it is
+    // more accurate than the serial chain it replaced, and its measured error
+    // is ~1e-8 where the serial kernel's own is ~7e-8.
     const double tol_split_serial = 1e-4;
-    const double tol_vs_exact      = 1e-3;
-    if (d > tol_split_serial) {
+    const double tol_vs_exact     = 1e-3;
+    if (do_serial && d > tol_split_serial) {
         printf("  FAIL: split diverges from serial by %.3e (tol %.1e)\n", d, tol_split_serial);
         ++g_fail;
     }
@@ -150,7 +176,7 @@ static void run_case(int seq, bool verbose) {
         printf("  FAIL: error vs float64 exceeds %.1e\n", tol_vs_exact);
         ++g_fail;
     }
-    if (verbose && d > tol_split_serial) {
+    if (verbose && do_serial && d > 1e-5) {
         // locate the worst head so the bug has an address
         for (int h = 0; h < LK_N_HEADS; ++h) {
             double hd = 0.0;
@@ -164,11 +190,11 @@ static void run_case(int seq, bool verbose) {
 }
 
 int main() {
-    printf("attention equivalence: LK_ATTN_SPLIT=%d LK_ATTN_GQA=%d\n",
-           LK_ATTN_SPLIT, LK_N_HEADS / LK_N_KV_HEADS);
-    // 4096 -> even slices, all non-empty.  100 -> uneven.  5 -> SPLIT-1 empty
-    // slices, which is where the early-out path and the combine's -1e30 sentinel
-    // interact.  1 -> the very first decode step.
+    printf("attention equivalence: LK_ATTN_SPLIT=%d LK_ATTN_GQA=%d LK_ATTN_CHUNK=%d\n",
+           LK_ATTN_SPLIT, LK_N_HEADS / LK_N_KV_HEADS, LK_ATTN_CHUNK);
+    // SHORT AND UNEVEN.  4096 -> even slices, all non-empty.  100 -> uneven.
+    // 5 -> SPLIT-1 empty slices, which is where the early-out path and the
+    // combine's -1e30 sentinel interact.  1 -> the very first decode step.
     run_case(4096, true);
     run_case(8192, true);      // the cap: slices == LK_ATTN_SPLIT
     run_case(513, true);       // just above the SPLIT_MIN * TARGET_N knee
@@ -176,6 +202,30 @@ int main() {
     run_case(100, true);
     run_case(5, true);
     run_case(1, true);
+    // ---------------------------------------------------------------------
+    // LONG CONTEXT.  Added for Phase 4z.8, and they run last because they are
+    // the expensive cases.
+    //
+    // This test used to stop at 8192, which is exactly where LK_ATTN_SPLIT
+    // stops mattering: at 8192 the slice rule saturates (nslices == SPLIT ==
+    // 128, chunk == TARGET_N == 64) and EVERY LONGER SEQUENCE IS THE SAME CODE
+    // PATH WITH A BIGGER NUMBER.  So the shipped test validated the one regime
+    // in which a long-context addressing bug cannot appear.
+    //
+    // The 4z.8 K loop is warp-coalesced and NOT bit-identical -- each lane sums
+    // 8 dims and a shuffle tree combines the eight partials, where the kernel it
+    // replaces summed all 64 in one thread -- so tools/ab.py cannot gate it and
+    // this test is the only thing that can.  It is the gate, not a smoke test,
+    // and it has to cover the sizes the engine actually runs at.
+    //
+    // 100003 is here on purpose: it is prime, so it is not a multiple of the
+    // warp's 4-token stride, of 32, of TARGET_N or of SPLIT, and it exercises
+    // the dead-lane tail (n % 32 != 0) that the interior cases never reach.
+    run_case(16384, true);     // chunk 128
+    run_case(32768, true);     // chunk 256
+    run_case(65536, true);     // chunk 512
+    run_case(100003, true);    // chunk 782, and a ragged tail
+    run_case(131072, true);    // chunk 1024 == LK_ATTN_CHUNK, the maximum
     printf("\n%s\n", g_fail ? "ATTENTION TEST FAILED" : "ATTENTION TEST PASSED");
     return g_fail ? 1 : 0;
 }
