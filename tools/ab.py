@@ -21,6 +21,14 @@ def run(binary, ids, ngen, extra_env=None):
     env = dict(os.environ)
     env["LK_NGEN"] = str(ngen)
     env["CUDA_VISIBLE_DEVICES"] = env.get("LK_GPU", "0")
+    # TURN THE END-OF-TURN STOP OFF FOR THIS GATE.  bench mode is what normally
+    # suppresses it, but bench mode also suppresses the `out:` line that this
+    # gate compares, so it cannot be used here.  Without this the gate would
+    # still pass -- both sides stop on the same token -- but it would silently
+    # start comparing twenty tokens instead of forty-eight on any prompt whose
+    # trajectory happens to end early, and a gate that quietly shortens itself
+    # is worse than one that fails.
+    env["LK_EOS"] = ""
     if extra_env:
         env.update(extra_env)
     r = subprocess.run([str(binary), "gen"] + [str(i) for i in ids],

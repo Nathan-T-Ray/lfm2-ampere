@@ -1353,29 +1353,47 @@ k_attn_split(const float * __restrict__ q,
     const int n = t1 - t0;
     float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        const __half2 * k2 = (const __half2 *)
-            (kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM);
+        const __half * krow =
+            kc + ((size_t)(t0 + j) * LK_N_KV_HEADS + kv_head) * LK_HEAD_DIM;
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 #if LK_ATTN_ABLATE == 2 || LK_ATTN_ABLATE == 3
-        if (k2) { a0 = (float) j; }        // ABLATION: no K read, no dot
+        if (krow) { a0 = (float) j; }        // ABLATION: no K read, no dot
 #else
-        // 32 half2 loads = the token's 64 dims = one 128-byte cache line.  The
-        // uint4 form used before also read one line, but a uint4 shared load for
-        // q cannot be expressed against it; half2 is the granularity at which
-        // both sides can be 128-bit.  Unroll 4 keeps 4 lines in flight, which is
-        // what the register budget allows; the 8-way unroll this replaced was
-        // the single biggest consumer of registers in the kernel.
-#pragma unroll 4
-        for (int i = 0; i < LK_HEAD_DIM / 2; ++i) {
-            const __half2 w = k2[i];
-            const float v0 = __half2float(__low2half(w));
-            const float v1 = __half2float(__high2half(w));
-            const float4 qa = ((const float4 *) s_q)[2 * i];
-            const float4 qb = ((const float4 *) s_q)[2 * i + 1];
-            a0 += qa.x * v0; a0 += qb.x * v1;
-            a1 += qa.y * v0; a1 += qb.y * v1;
-            a2 += qa.z * v0; a2 += qb.z * v1;
-            a3 += qa.w * v0; a3 += qb.w * v1;
+        // 16 uint4 loads cover the token's 64 dims = one 128-byte cache line.
+        //
+        // THIS WAS 32 half2 (4-BYTE) LOADS, AND THE ACCESS PATTERN WAS THE
+        // LONG-CONTEXT BOTTLENECK.  Thread j owns token j, so at a given i the
+        // warp's 32 lanes address base + t*128 + i*4: THIRTY-TWO DIFFERENT
+        // CACHE LINES, four useful bytes each.  The line is fully consumed over
+        // the 32 iterations, so DRAM traffic is identical either way -- the old
+        // comment above is right about that -- but the LSU issues 32 sector
+        // lookups per instruction for 32 instructions per 128 bytes, against 8
+        // for the uint4 form.  Measured symptom: attention sustains ~570 GB/s
+        // while every streaming kernel in the same engine sustains 942 GB/s,
+        // and that gap IS the whole long-context fall-off (131k decode 144 tok/s
+        // against llama.cpp's 172).  It is not parallelism: sweeping
+        // LK_ATTN_SPLIT 128 / 256 / 512 at 32768 moved throughput by 0.06%.
+        //
+        // The arithmetic is untouched: q and i ascend in the same order, v0
+        // before v1, into the same four accumulators.  This MUST stay
+        // bit-identical and tools/ab.py is the gate that says whether it did.
+        const uint4 * k4 = (const uint4 *) krow;
+#pragma unroll 2
+        for (int q = 0; q < LK_HEAD_DIM / 8; ++q) {
+            const uint4 w = k4[q];
+            const __half2 * h2 = (const __half2 *) &w;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float v0 = __half2float(__low2half(h2[i]));
+                const float v1 = __half2float(__high2half(h2[i]));
+                const int ii = q * 4 + i;
+                const float4 qa = ((const float4 *) s_q)[2 * ii];
+                const float4 qb = ((const float4 *) s_q)[2 * ii + 1];
+                a0 += qa.x * v0; a0 += qb.x * v1;
+                a1 += qa.y * v0; a1 += qb.y * v1;
+                a2 += qa.z * v0; a2 += qb.z * v1;
+                a3 += qa.w * v0; a3 += qb.w * v1;
+            }
         }
 #endif
         a0 *= LK_ATTN_SCALE; a1 *= LK_ATTN_SCALE;

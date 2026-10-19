@@ -2023,3 +2023,265 @@ quantisation **with no cross-block communication at all**. That turns 2 of the
 verified against **14 distinct synchronization implementations**, which is a
 stronger statement than §13.13 could make. The grid-stride rewrite is safe; the
 persistence is not.
+
+---
+
+## 14. LONG CONTEXT — WHAT THE FALL-OFF ACTUALLY IS
+
+This section exists because the question changed. Up to §13 the question was
+"how fast is a token", measured at context 272 where attention is free. The
+question that decides whether this engine is usable as a serving engine is "how
+fast is a token when the prompt is 30k characters of system prompt", and the
+answer to that was not merely worse, it was **wrong in a way the reported number
+was hiding**.
+
+### 14.1 The engine was reporting the flattering half
+
+`RESULT` reported `tok_s` and nothing else. Decode is one token per step; prefill
+is also one token per step, because **there is no batched prefill** — every prompt
+token costs a full decode step. So ingesting a 131040-token system prompt costs
+131040 sequential steps, and none of that was in the number.
+
+Both are now reported. Same weights, same KV cache, same greedy 32 tokens, one
+RTX 3090 Ti, `LK_ATTN_MAX_SEQ` raised to 131072:
+
+| ctx | engine tok/s | llama.cpp tok/s | ratio | engine prefill | llama.cpp prefill | prefill ratio |
+|---|---|---|---|---|---|---|
+| 256 | 451.08 | 256.29 | **1.76x** | 0.58 s | 0.07 s | 8.4x |
+| 1024 | 444.57 | 261.46 | 1.70x | 2.36 s | 0.17 s | 13.7x |
+| 4096 | 419.18 | 255.63 | 1.64x | 9.71 s | 0.62 s | 15.6x |
+| 8192 | 385.64 | 250.23 | 1.54x | 20.23 s | 1.27 s | 15.9x |
+| 16384 | 354.69 | 237.17 | 1.50x | 43.31 s | 2.65 s | 16.3x |
+| 32768 | 290.73 | 218.11 | 1.33x | 96.23 s | 5.76 s | 16.7x |
+| 65536 | 215.83 | 186.95 | 1.15x | 233.22 s | 13.48 s | 17.3x |
+| 131040 | 141.69 | 144.73 | **0.98x** | **627.49 s** | 34.47 s | **18.2x** |
+
+**At maximum context the engine is no longer faster, and reading one maximum
+prompt takes ten and a half minutes where llama.cpp takes thirty-four seconds.**
+The 1.69x at short context is real and it is not what a serving workload sees
+first: the workload pays the prefill before it gets a single token.
+
+### 14.2 The curve is a property of the engine, not of the text
+
+A fall-off that depends on the *content* would mean something is wrong with how
+the model is being run. A fall-off that depends only on *length* is the physics of
+reading a KV cache. The two are distinguishable by running a second corpus.
+
+The second corpus is 148913 tokens of source code — a different token
+distribution, different entropy, different router traffic, from a different
+document. If the curve moved, the kernel was reacting to the text. It did not
+move:
+
+| ctx | 256 | 1024 | 4096 | 8192 | 16384 | 32768 | 65536 | 131040 |
+|---|---|---|---|---|---|---|---|---|
+| regular | 1.76x | 1.70x | 1.64x | 1.54x | 1.50x | 1.33x | 1.15x | 0.98x |
+| code | 1.70x | 1.75x | 1.63x | 1.55x | 1.49x | 1.32x | 1.16x | 0.97x |
+
+Every point agrees to within about one percent, and prefill agrees from 8.2x to
+17.9x against 8.4x to 18.2x. **The fall-off is length, not content.**
+
+### 14.3 The diagnosis, and then the measurement that overturned it
+
+The first diagnosis was a curve fit: decode marginal cost at long context implies
+attention moves KV at about 570 GB/s while every streaming kernel in the same
+engine moves weights at 942 GB/s, and that gap *is* the fall-off.
+
+That reasoning has a defect that end-to-end timing cannot expose: it attributes
+**all** marginal cost to attention, so it cannot distinguish "attention is slow"
+from "attention is slow for reason X" from "something near attention is slow". An
+end-to-end A/B at 131040 costs 627 s of prefill per side and still cannot separate
+them.
+
+`tests/bench_attn.cu` was written to separate them. It times `k_attn_split` +
+`k_attn_combine` — the exact pair the engine launches per attention layer — at a
+size where the KV cache is far larger than the 6 MB L2, and uses the kernel's own
+`LK_ATTN_ABLATE` switch to split the kernel into its parts. At seq=131040, per
+layer, 268.4 MB of KV, median of 5×200 iterations, reproducible to 0.1%:
+
+| configuration | time | bytes actually read | effective BW |
+|---|---|---|---|
+| A3: neither loop | 23.2 µs | 0 | — (fixed overhead) |
+| A1: K read + score dot | 285.0 µs | 134.2 MB | **471 GB/s** |
+| A2: V read + accumulate | 187.3 µs | 134.2 MB | **716 GB/s** |
+| A0: both (real kernel) | 456.4 µs | 268.4 MB | **588 GB/s** |
+
+The parts sum to 449.1 µs against 456.4 µs measured, so the two phases barely
+overlap and the decomposition is real.
+
+**The two loops read the same number of bytes over the same layout and differ by
+1.5x.** The reason is the mapping, and it is visible in the source:
+
+* **V** maps `tid -> (half, head, pair)`, so a warp covers all 32 half2 pairs of
+  one head — 128 contiguous bytes, **exactly one cache line per warp load**.
+* **K** maps `tid -> token`, so at a given `i` the 32 lanes of a warp address
+  `base + t*1024 + i*4`: **thirty-two different cache lines, four useful bytes
+  each.**
+
+The old comment above the K loop was right that DRAM traffic is identical either
+way — the line is fully consumed over the 32 iterations. What it missed is that
+one warp instruction issuing 32 sector lookups against 8 is a different
+instruction to the memory system even when the bytes are the same.
+
+### 14.4 What the fix bought, verified two ways
+
+Two changes to K, and the weaker one is the one that was already written:
+
+1. **16 × `uint4` loads replace 32 × `__half2`.** The arithmetic is untouched —
+   `q` and `i` ascend in the same order, `v0` before `v1`, into the same four
+   accumulators — so the result must be **bit-identical**.
+2. The access pattern itself is *not* fixed by (1). It is still one thread per
+   token and still 32 lines per warp load.
+
+(1) is verified by `tools/ab.py`, which compares the token trajectories of the old
+and new binaries across seven regimes: **7/7 BIT-IDENTICAL**. That gate is
+meaningful rather than ceremonial because `NVFLAGS` contains no `-use_fast_math`,
+so the compiler is not permitted to reassociate the add chain. If the reasoning
+about the loop order had been wrong, the gate would have failed.
+
+In isolation (median of 5×200, interleaved rounds):
+
+| seq | before | after | gain | before BW | after BW |
+|---|---|---|---|---|---|
+| 8192 | 52.4 µs | 45.9 µs | 1.14x | 320 GB/s | 366 GB/s |
+| 32768 | 130.7 µs | 104.5 µs | 1.25x | 513 GB/s | 642 GB/s |
+| 65536 | 246.6 µs | 203.9 µs | 1.21x | 544 GB/s | 658 GB/s |
+| 131040 | 512.1 µs | 456.4 µs | **1.12x** | 524 GB/s | 588 GB/s |
+
+The isolated number only matters if it survives the trip to a real workload. Two
+engine binaries, interleaved round-robin so that any drift over a forty-minute run
+hits both sides equally, same corpus, same 32 greedy tokens:
+
+| ctx | before | after | gain | prefill before | prefill after |
+|---|---|---|---|---|---|
+| 32768 | 290.14 tok/s | **315.28 tok/s** | **1.087x** | 96.1 s | 91.9 s |
+| 131040 | 140.81 tok/s | **150.86 tok/s** | **1.071x** | 627.8 s | **580.9 s** |
+
+Run-to-run spread is 0.2-0.3%, an order of magnitude below the effect, and the
+two runs of each side bracket each other. More importantly the **isolated
+measurement predicts the end-to-end result**: at 32768 the kernel saves
+(130.7 - 104.5) us x 10 layers = 0.262 ms out of a 3.44 ms token, which is
+314.5 tok/s against 315.28 measured; at 131040 it predicts 153.8 against 150.86.
+That agreement is the check the original curve fit did not have.
+
+**At maximum context this moves the engine from 0.98x to 1.04x against
+llama.cpp** -- from "no longer faster" back to faster. Prefill improves too
+(7.5% at 131040), because prefill is attention-bound at long context for exactly
+the same reason.
+
+**And it does not close the gap.** 588 GB/s against 942 GB/s streaming. The
+original diagnosis was directionally right and quantitatively wrong: the K load
+pattern costs about 12%, not the whole 40%, and the ~570 GB/s I inferred from the
+end-to-end fit was a coincidence that happened to land between the before and
+after numbers. **A curve fit that cannot be checked against an isolated
+measurement should not be reported as a mechanism.**
+
+### 14.5 The counter-check the fit was missing
+
+The fit is not useless — it is a good *model*, it just is not a *mechanism*. It
+says the per-token cost is a constant plus an attention term:
+
+    t(ctx) ~= C + attention(ctx)
+
+with `C` the fixed weight-streaming cost, which does not grow with context.
+Measured: the engine's `C` is **2.3 ms** (at context 256 the whole token is
+2.22 ms and attention is negligible). At 131040 the measured attention term is
+4.56 ms, predicting 6.86 ms; the engine delivers 141.69 tok/s = 7.06 ms. The model
+holds to 3%.
+
+llama.cpp fits the same shape with a much worse `C` and much better attention:
+3.90 ms fixed, and 6.91 - 3.90 = **3.01 ms** of attention at 131040, i.e.
+**891 GB/s**. So:
+
+* short context, the engine wins on `C` (2.3 vs 3.90 ms) — that is the 1.76x;
+* long context, the engine loses on attention (4.56 vs 3.01 ms) — that is the 0.98x;
+* **the entire long-context deficit is one loop's access pattern**, and the prize
+  for fixing it properly is 2.3 + 3.0 = 5.3 ms = **~188 tok/s at maximum context,
+  1.30x faster than llama.cpp**, against 141.69 today.
+
+### 14.6 The unbounded write, found twice
+
+Nothing in the forward path bounds-checks `d_pos`, and `kcache`/`vcache` are
+exactly `max_seq` long. Any mode that feeds more tokens than `max_seq` writes past
+the end of them. It does not crash — it corrupts the neighbouring allocation, and
+the model then emits blank or repetitive text, which reads exactly like **"the
+model gives up at long context"**.
+
+It was found in `gen` first, where a 131040-token prompt at the default
+`LK_MAX_SEQ` of 131072 hits it on the first generated token, and it was diagnosed
+as a model failure until the arithmetic was done. It was **still open in `ppl`** —
+the mode the perplexity and NLL evidence runs through — where this project's own
+149837-token corpora against a 131072 cache were overrunning by 18765 positions
+while continuing to print a plausible perplexity. It was also open in both
+argv-fed diagnostic modes.
+
+All four now call one shared guard. It was capped rather than fatal in `ppl`,
+because dying would remove exactly the high positions the NLL curve exists to
+measure.
+
+### 14.7 Coherence — the check that the model is still there
+
+A benchmark cannot tell a fast kernel from one that has lobotomised the model, and
+the whole point of this engine is that it does not. Three independent checks:
+
+* **Nonce retrieval in a haystack**, both engines fed byte-identical token streams,
+  needle at depth 0.5: **HIT/HIT at 2048, 8192, 32768, 65536 and 98304; MISS/MISS
+  at 126976 and 131072.** The engine never misses where llama.cpp hits. **The
+  lobotomy signature is absent.** It also means the honest description of this
+  model's usable context is about **98k, not 131072** — 131072 is nominal, and it
+  is nominal for llama.cpp too.
+* **Factual / reasoning / code**, on ChatML-wrapped prompts: factual 4/5 against
+  3/5, reasoning 4/5 against 4/5, code 4/6 against 6/6 where one of the two
+  engine failures is a defect in my own answer extractor. Six code problems
+  cannot distinguish 4/6 from 6/6, so the correct claim is **"no evidence of a
+  deficit"**, not parity.
+* The engine's **first nine tokens on a clean prompt are identical** to
+  llama.cpp's.
+
+### 14.8 The engine did not stop, and that mattered more than any kernel
+
+The engine produced the correct answer, emitted `<|im_end|>`, and then kept
+going — through `<|endoftext|>` and into a repeat of the answer. Nothing was
+wrong with the model or the kernel; the loop counted to `ngen` and never looked at
+what it had produced. **A reader sees an answer repeated forever and concludes the
+quantisation broke the model.**
+
+`<|im_end|>` is 124900, which is the model's own `tokenizer.ggml.eos_token_id` in
+the GGUF metadata, and `<|endoftext|>` is 124895; both were read out of the
+running llama-server's `/tokenize` rather than guessed. Generation now stops on
+them unless `LK_BENCH` is set — bench mode must run a fixed length or every
+throughput number in this document becomes irreproducible — and `LK_EOS=""`
+disables the stop. The parity gate sets `LK_EOS=""` explicitly, because a gate
+that silently shortens itself is worse than one that fails.
+
+Same prompt, same kernel, 600-token budget, the only difference being the stop:
+
+| | tokens emitted | `stopped` | tail of the transcript |
+|---|---|---|---|
+| stop **on** | 99 | 1 | `...construction began in the 1910s."` |
+| stop **off** | 600 | 0 | `...ever since.\n</think\n>The capital of Australia is **Canberra**...` |
+
+The answer is identical and correct in both. Without the stop the model reaches
+the end of its turn and starts over, which is precisely the output that reads as
+a broken quantisation.
+
+### 14.9 What is still open, in priority order
+
+1. **Rewrite the K loop to be warp-coalesced.** The measured target is 891 GB/s
+   (§14.5). The shape that reaches it gives up thread-private dot products and
+   pays a shuffle reduction instead; instruction issue goes up by roughly 5x and
+   is still under 20% of the machine, which is the whole reason the trade is
+   available. **This will NOT be bit-identical** — the summation order changes —
+   so it must be gated on `make test-attn` against the float64 reference instead,
+   and the two gates are not interchangeable.
+2. **Batched prefill.** 8.4x → 18.2x is the number a serving workload pays first,
+   and it is a consequence of having no batched path at all.
+3. **RoPE inverse frequencies in double, precomputed.** The phase is computed as
+   `powf(1e7, -2d/64)` per thread per token in fp32; the error is `pos * eps`,
+   about 0.013 rad at 131072 today, and 0.026 rad if `-use_fast_math` is ever
+   added — at which point nothing in the test suite would catch it.
+4. **Extend `make test-attn` to seq=131072.** Today it validates a few hundred
+   tokens. The long-context evidence is behavioural (the needle test), not
+   numerical, and item 1 above cannot be gated without this.
+5. **Document the effective context as ~98k.**
+6. **Do not quantise the KV cache.** FP16 KV is what makes exact parity with
+   llama.cpp possible, and llama.cpp is also FP16 here.

@@ -1,0 +1,24 @@
+[
+ {
+  "ctx": 98304,
+  "depth": 0.5,
+  "nonce": "32NMQRJFS2",
+  "prompt_tokens": 98304,
+  "engine_hit": true,
+  "oracle_hit": true,
+  "engine_text": " 32NMQRJFS2. The document is a README file for",
+  "oracle_text": " 32NMQRJFS2. The document says \"the secret passcode",
+  "oracle_prompt_n": 98301
+ },
+ {
+  "ctx": 126976,
+  "depth": 0.5,
+  "nonce": "F9N4PZ2PK7",
+  "prompt_tokens": 126976,
+  "engine_hit": false,
+  "oracle_hit": false,
+  "engine_text": " 1234567890.\n\nAnswer: the secret passcode is 3435",
+  "oracle_text": " 1234.\"\n\nAnswer: the secret passcode is 1234.\"",
+  "oracle_prompt_n": 126973
+ }
+]

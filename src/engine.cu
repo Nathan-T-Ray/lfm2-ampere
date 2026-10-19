@@ -818,9 +818,37 @@ int main(int argc, char ** argv) {
                         else CK(cudaGraphLaunch(gexec, st)); };
     auto take = [&]() { int t = 0; CK(cudaMemcpy(&t, e->d_token, 4, cudaMemcpyDeviceToHost)); return t; };
 
+    // ONE PLACE THAT KNOWS THE KV CACHE IS FINITE.
+    //
+    // d_pos is never bounds-checked anywhere in the forward path and kcache and
+    // vcache are exactly max_seq long, so ANY mode that feeds more than max_seq
+    // tokens writes past the end of them.  That happened first in gen, where it
+    // looked exactly like "the model gives up at long context" rather than like
+    // a memory bug; it was still open in ppl, which is the mode the perplexity
+    // and NLL evidence runs through; and it was open in both argv-fed modes
+    // here.  Four copies of one check is how three of them came to be missing,
+    // so this is the shared copy that the argv-fed modes call.  ppl keeps its
+    // own only because its arithmetic differs by one -- it feeds N-1 tokens in
+    // order to score N -- and hiding that off-by-one behind a `reserve` of -1
+    // would be the kind of cleverness that loses the bug a second time.
+    //
+    // `reserve` is the number of extra positions the mode feeds AFTER this
+    // vector, which prof does and the others do not.
+    auto fit = [&](std::vector<int> & v, long reserve) {
+        const long cap = (long) max_seq - reserve;
+        if ((long) v.size() > cap) {
+            fprintf(stderr,
+                    "%s: %zu tokens + %ld reserve exceeds LK_MAX_SEQ %d; using "
+                    "the first %ld.\n",
+                    mode, v.size(), reserve, max_seq, cap > 0 ? cap : 0L);
+            v.resize(cap > 0 ? (size_t) cap : 0);
+        }
+    };
+
     if (strcmp(mode, "topk") == 0) {
         std::vector<int> tk;
         for (int i = 2; i < argc; ++i) tk.push_back(atoi(argv[i]));
+        fit(tk, 0);
         for (size_t i = 0; i < tk.size(); ++i) { feed(tk[i]); run(); }
         CK(cudaStreamSynchronize(st));
         std::vector<float> lg(LK_VOCAB);
@@ -866,6 +894,28 @@ int main(int argc, char ** argv) {
         int N = (int)ids.size();
         if (argc > 3) N = std::min(N, atoi(argv[3]));
         if (N < 2) { fprintf(stderr, "need >= 2 tokens\n"); return 1; }
+        // THE SAME UNBOUNDED WRITE AS IN gen, AND IT WAS STILL OPEN HERE.
+        //
+        // The loop below feeds N-1 tokens one at a time, and each feed advances
+        // d_pos, but kcache/vcache are exactly max_seq long and nothing in the
+        // forward path checks.  A corpus longer than the KV cache writes past
+        // the end of the cache and keeps going: this project's own corpora are
+        // 149837 tokens against a 131072 cache, so the last 18765 positions were
+        // being written into whatever the allocator placed next -- while still
+        // printing a plausible perplexity, because the overflow lands in memory
+        // that is read back as if it were real KV.
+        //
+        // gen got a hard guard first because that is where the corruption was
+        // noticed; the identical hazard sat one mode away.  Truncating is the
+        // honest fix: it scores a prefix and says so, rather than dying, because
+        // the whole point of the NLL curve is the high positions.
+        if (N - 1 > max_seq) {
+            fprintf(stderr,
+                    "ppl: corpus is %d tokens, KV cache holds %d.  Scoring the "
+                    "first %d tokens only; raise LK_MAX_SEQ to score further.\n",
+                    N, max_seq, max_seq);
+            N = max_seq;
+        }
         std::vector<float> lg(LK_VOCAB);
         const char * dump = getenv("LK_PPL_DUMP");
         FILE * df = dump ? fopen(dump, "w") : nullptr;
@@ -896,6 +946,7 @@ int main(int argc, char ** argv) {
         std::vector<int> tk;
         for (int i = 2; i < argc; ++i) tk.push_back(atoi(argv[i]));
         if (tk.empty()) { fprintf(stderr, "usage: %s prof TOKEN_ID...\n", argv[0]); return 1; }
+        fit(tk, 4);   // prof feeds the last token 3 more times plus one forward
         lk_prof_init(st);
         for (size_t i = 0; i < tk.size(); ++i) { feed(tk[i]); run(); }
         CK(cudaStreamSynchronize(st));
@@ -947,6 +998,49 @@ int main(int argc, char ** argv) {
     const int ngen = getenv("LK_NGEN") ? atoi(getenv("LK_NGEN")) : 32;
     const bool bench = getenv("LK_BENCH") != nullptr;
 
+    // ---- end of turn ------------------------------------------------------
+    //
+    // THE ENGINE DID NOT STOP.  It produced the right answer, emitted
+    // <|im_end|>, and then kept going: the transcript ran through
+    // <|endoftext|> and started the answer over.  Nothing was wrong with the
+    // model or the kernel -- the loop simply counted to ngen and never looked
+    // at what it had produced.  But a reader sees an answer repeated forever
+    // and concludes the quantisation broke the model, so this is the cheapest
+    // large gain in PERCEIVED coherence available, and it was worth more than
+    // any kernel change in this whole long-context effort.
+    //
+    // 124900 = <|im_end|>, which is the model's own tokenizer.ggml.eos_token_id
+    //          in the GGUF metadata, i.e. the end of a chat turn.
+    // 124895 = <|endoftext|>, the document terminator.
+    // Both are verified against the running llama-server's /tokenize rather
+    // than guessed, and llama.cpp stops on 124900, which is the one that
+    // actually occurs first in practice.
+    //
+    // NOT APPLIED IN BENCH MODE.  Every timing number this project reports is
+    // taken over a fixed ngen; if the sequence ends early the loop would time
+    // four tokens instead of thirty-two and report a throughput that no
+    // workload can reproduce.
+    //
+    // LK_EOS="" disables the stop; LK_EOS="1,2" replaces the set.
+    std::vector<int> eos;
+    {
+        const char * es = getenv("LK_EOS");
+        const char * src = es ? es : "124900,124895";
+        const char * p = src;
+        while (*p) {
+            char * end = nullptr;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            eos.push_back((int) v);
+            p = end;
+            while (*p == ',' || *p == ' ') ++p;
+        }
+    }
+    auto is_eos = [&eos](int t) {
+        for (int x : eos) if (x == t) return true;
+        return false;
+    };
+
     // HARD GUARD, AND IT IS NOT DEFENSIVE PROGRAMMING -- IT IS A REAL BUG FOUND
     // BY RUNNING AT THE LIMIT.  Nothing in the forward path bounds-checks d_pos,
     // and kcache/vcache are exactly max_seq long, so a prompt plus a generation
@@ -986,16 +1080,27 @@ int main(int argc, char ** argv) {
     if (!bench) printf("out:");
     auto t0 = std::chrono::steady_clock::now();
     int done = 0;
+    bool stopped = false;
     // emit the token produced by the prefill -- dropping it silently shifts the
     // whole trajectory by one and makes parity comparisons meaningless
-    if (!bench) { printf(" %d", next); fflush(stdout); }
-    ++done;
-    for (int i = 1; i < ngen; ++i) {
-        run();
-        CK(cudaStreamSynchronize(st));
-        next = take();
+    if (!bench && is_eos(next)) {
+        // The turn ended before a single token was emitted.  Nothing is printed
+        // and nothing is counted, which is what llama.cpp does with a stop
+        // token too; counting it would make "generated" mean something
+        // different in the two engines and quietly break every comparison that
+        // divides by it.
+        stopped = true;
+    } else {
         if (!bench) { printf(" %d", next); fflush(stdout); }
         ++done;
+        for (int i = 1; i < ngen; ++i) {
+            run();
+            CK(cudaStreamSynchronize(st));
+            next = take();
+            if (!bench && is_eos(next)) { stopped = true; break; }
+            if (!bench) { printf(" %d", next); fflush(stdout); }
+            ++done;
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     if (!bench) printf("\n");
@@ -1016,11 +1121,11 @@ int main(int argc, char ** argv) {
     const double tps = done / sec;
     const double BYTES_PER_TOKEN = 1466751488.0;
     printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f "
-           "prompt_n=%d prefill_s=%.4f prefill_tok_s=%.2f\n",
+           "prompt_n=%d prefill_s=%.4f prefill_tok_s=%.2f stopped=%d\n",
            (int)toks.size() + done, done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
            100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0,
            (int)toks.size(), psec,
-           psec > 0.0 ? (double)toks.size() / psec : 0.0);
+           psec > 0.0 ? (double)toks.size() / psec : 0.0, stopped ? 1 : 0);
 
 #if LK_NORM_AUDIT
     // ARCHITECTURE.md 9.1 / REBRIEF A6.  Phase 4y's scale invariance is exact in

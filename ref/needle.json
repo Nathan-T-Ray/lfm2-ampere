@@ -1,0 +1,57 @@
+[
+ {
+  "ctx": 2048,
+  "depth": 0.5,
+  "nonce": "32NMQRJFS2",
+  "prompt_tokens": 2048,
+  "engine_hit": true,
+  "oracle_hit": true,
+  "engine_text": " 32NMQRJFS2.\n\nThe server listens on `0.0.0.0` and is",
+  "oracle_text": " 32NMQRJFS2.\n\nThe server listens on `0.0.0.0` and is",
+  "oracle_prompt_n": 2048
+ },
+ {
+  "ctx": 8192,
+  "depth": 0.5,
+  "nonce": "F9N4PZ2PK7",
+  "prompt_tokens": 8192,
+  "engine_hit": true,
+  "oracle_hit": true,
+  "engine_text": " F9N4PZ2PK7. The document is a README.md file. The document is a README",
+  "oracle_text": " F9N4PZ2PK7.\n\nThe user message says \"Answer with the passcode only.\" The passcode",
+  "oracle_prompt_n": 8193
+ },
+ {
+  "ctx": 32768,
+  "depth": 0.5,
+  "nonce": "MXFF8W3CTA",
+  "prompt_tokens": 32768,
+  "engine_hit": true,
+  "oracle_hit": true,
+  "engine_text": " MXFF8W3CTA. The secret passcode is MXFF8W3CTA. The secret pass",
+  "oracle_text": " MXFF8W3CTA. The README named it for 22 minutes on 2026-08-",
+  "oracle_prompt_n": 32768
+ },
+ {
+  "ctx": 65536,
+  "depth": 0.5,
+  "nonce": "5PZF7N7DYJ",
+  "prompt_tokens": 65536,
+  "engine_hit": true,
+  "oracle_hit": true,
+  "engine_text": " 5PZF7N7DYJ. The document is a demo for the Qwen3.8-27",
+  "oracle_text": " 5PZF7N7DYJ. The secret passcode is 5PZF7N7DYJ",
+  "oracle_prompt_n": 65533
+ },
+ {
+  "ctx": 131072,
+  "depth": 0.5,
+  "nonce": "PL6MMCHBL8",
+  "prompt_tokens": 131072,
+  "engine_hit": false,
+  "oracle_hit": false,
+  "engine_text": " \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+  "oracle_text": " 1234.",
+  "oracle_prompt_n": 131068
+ }
+]
