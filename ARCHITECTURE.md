@@ -2250,6 +2250,13 @@ the whole point of this engine is that it does not. Three independent checks:
   | 16384-65536 | 49152 | 4.411635 | 4.385888 | +0.025747 | 87.97% |
   | 65536-131072 | 61401 | 4.340046 | 4.343465 | **-0.003419** | 88.48% |
 
+  The oracle's pass scored positions 0-126937; the top 4133 positions are not in
+  it, because llama.cpp's dump stopped when the process that was reading its
+  output was killed and its pipe filled -- it blocked on write rather than
+  failing, which is worth knowing before trusting a stalled long run again.  The
+  last bucket is therefore 61401 of 65536 positions, and the conclusion below does
+  not depend on the missing 6%.
+
   **The delta does not grow with position.**  It peaks in the 1024-4096 bucket and
   returns to zero -- marginally negative, the engine very slightly BETTER than
   llama.cpp -- in the 65536-131072 bucket, which is where an attention defect
