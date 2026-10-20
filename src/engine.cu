@@ -762,6 +762,42 @@ static void forward(Engine & e, cudaStream_t st) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P0: THE BATCHED-PREFILL SEAM.
+//
+// There is no batched prefill in this engine and never has been.  Prefill is a
+// loop of one full decode step per prompt token, which is why ingesting 131072
+// tokens costs 131072 sequential steps and why llama.cpp is 15.3x faster at it.
+//
+// This struct and the function below exist so that the loop in main() no longer
+// knows how prefill actually happens.  It is deliberately a NO-OP refactor:
+// prefill_forward still executes exactly one decode step per token, in order,
+// with the same H2D of the same 4 bytes, so LK_PREFILL_B>1 changes the
+// CHUNKING and nothing else.  That is the point -- it makes the bit-identity
+// gate (tools/ab.py, 7/7) a proof about the plumbing rather than a hope, and it
+// leaves one call site to replace when the real batched kernels land.
+//
+// It is a seam, not a design.  `nb` is currently ignored beyond being a loop
+// bound; when the batched path exists it becomes the batch dimension, and the
+// tokens being contiguous in a host vector is what makes a single H2D legal.
+struct PrefillCtx {
+    Engine *         e;
+    cudaStream_t     st;
+    cudaGraphExec_t  gexec;
+    bool             direct;   // LK_NO_GRAPH or LK_PROFILE: call forward() directly
+};
+
+// Ingest `nb` tokens, in order.  Does NOT sync: the caller keeps the single
+// sync that used to follow the whole prefill loop, so the number of
+// synchronisations is unchanged as well.
+static void prefill_forward(PrefillCtx & pc, const int * toks, int nb) {
+    for (int i = 0; i < nb; ++i) {
+        CK(cudaMemcpy(pc.e->d_token, toks + i, 4, cudaMemcpyHostToDevice));
+        if (pc.direct) forward(*pc.e, pc.st);
+        else           CK(cudaGraphLaunch(pc.gexec, pc.st));
+    }
+}
+
 int main(int argc, char ** argv) {
     const char * pack = getenv("LK_PACK");
     const char * mode = (argc > 1) ? argv[1] : "gen";
@@ -780,6 +816,16 @@ int main(int argc, char ** argv) {
     if (max_seq > LK_ATTN_MAX_SEQ) {
         fprintf(stderr, "FATAL: LK_MAX_SEQ=%d exceeds the compiled split-K limit %d\n",
                 max_seq, LK_ATTN_MAX_SEQ);
+        return 1;
+    }
+
+    // P0 prefill chunk size.  1 is the historical behaviour and the only value
+    // for which the refactor above is bit-identical by construction.  Reported
+    // in RESULT so that a measurement can never be attributed to the wrong
+    // batch size after the fact.
+    const int prefill_b = getenv("LK_PREFILL_B") ? atoi(getenv("LK_PREFILL_B")) : 1;
+    if (prefill_b < 1) {
+        fprintf(stderr, "FATAL: LK_PREFILL_B=%d must be >= 1\n", prefill_b);
         return 1;
     }
 
@@ -817,6 +863,7 @@ int main(int argc, char ** argv) {
     auto run  = [&]() { if (profile || no_graph) forward(*e, st);
                         else CK(cudaGraphLaunch(gexec, st)); };
     auto take = [&]() { int t = 0; CK(cudaMemcpy(&t, e->d_token, 4, cudaMemcpyDeviceToHost)); return t; };
+    PrefillCtx pc{ e, st, gexec, (profile || no_graph) };
 
     // ONE PLACE THAT KNOWS THE KV CACHE IS FINITE.
     //
@@ -1071,7 +1118,18 @@ int main(int argc, char ** argv) {
     // look uniformly good at long context while hiding the cost that a serving
     // workload actually pays first.
     auto tp0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < toks.size(); ++i) { feed(toks[i]); run(); }
+    // P0: chunked, so that a batched path can be dropped in behind
+    // prefill_forward without this loop being touched again.  At the default
+    // LK_PREFILL_B=1 each chunk is one token and the executed work is identical
+    // to the single-token loop this replaces.  The sync count is unchanged too:
+    // prefill_forward does not sync, so there is still exactly one sync here.
+    const int pfb = prefill_b;
+    int pfb_batches = 0;
+    for (size_t i = 0; i < toks.size(); i += (size_t) pfb) {
+        const int nb = ((size_t) pfb < toks.size() - i) ? pfb : (int) (toks.size() - i);
+        prefill_forward(pc, toks.data() + i, nb);
+        ++pfb_batches;
+    }
     CK(cudaStreamSynchronize(st));
     auto tp1 = std::chrono::steady_clock::now();
     const double psec = std::chrono::duration<double>(tp1 - tp0).count();
@@ -1121,11 +1179,13 @@ int main(int argc, char ** argv) {
     const double tps = done / sec;
     const double BYTES_PER_TOKEN = 1466751488.0;
     printf("RESULT ctx=%d generated=%d seconds=%.4f tok_s=%.2f GB_s=%.1f pct_peak=%.1f "
-           "prompt_n=%d prefill_s=%.4f prefill_tok_s=%.2f stopped=%d\n",
+           "prompt_n=%d prefill_s=%.4f prefill_tok_s=%.2f stopped=%d "
+           "prefill_b=%d prefill_batches=%d\n",
            (int)toks.size() + done, done, sec, tps, tps * BYTES_PER_TOKEN / 1e9,
            100.0 * tps * BYTES_PER_TOKEN / 1e9 / 1008.0,
            (int)toks.size(), psec,
-           psec > 0.0 ? (double)toks.size() / psec : 0.0, stopped ? 1 : 0);
+           psec > 0.0 ? (double)toks.size() / psec : 0.0, stopped ? 1 : 0,
+           pfb, pfb_batches);
 
 #if LK_NORM_AUDIT
     // ARCHITECTURE.md 9.1 / REBRIEF A6.  Phase 4y's scale invariance is exact in
