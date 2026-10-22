@@ -1,0 +1,130 @@
+device: NVIDIA GeForce RTX 3090 Ti  SMs=84  L2=6 MB  smem/SM=100 KB  clock=1860 MHz  mem=10501 MHz
+residency (need 6 blocks/SM for the 504-block grid):
+    persistent, NO barrier (floor)         6 blocks/SM   40 regs      0 B smem     0 B local
+    persistent, NO barrier, smem path      6 blocks/SM   40 regs   9216 B smem     0 B local
+    V2 wait-then-load (published)          6 blocks/SM   40 regs      0 B smem     0 B local
+    V2 + L2 run-ahead 256 B/row            6 blocks/SM   39 regs      0 B smem     0 B local
+    V2 + L2 run-ahead 512 B/row            6 blocks/SM   39 regs      0 B smem     0 B local
+    V2 + L2 run-ahead 1 KB/row             6 blocks/SM   39 regs      0 B smem     0 B local
+    V2 + smem run-ahead                    6 blocks/SM   40 regs   9216 B smem     0 B local
+    V7 wait-then-load                      6 blocks/SM   40 regs      0 B smem     0 B local
+    V7 + smem run-ahead                    6 blocks/SM   40 regs   9216 B smem     0 B local
+    V2 wait-then-load, xq via L2           6 blocks/SM   39 regs      0 B smem     0 B local
+    V2 + smem run-ahead, xq via L2         6 blocks/SM   38 regs   9216 B smem     0 B local
+    V7 + smem run-ahead, xq via L2         6 blocks/SM   38 regs   9216 B smem     0 B local
+
+=====================================================================
+(B) CHAIN, 12288 rows x 31 stages -- the published shape
+    31 stages, 438.8 MB per pass, 14.16 MB per stage on average
+    bit-identity, 8 stages, memcmp vs k_gemv_q4_0: 19/19 configs identical
+
+    us per stage, median of 5 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor    GB/s
+----------------------------------------------------------------------------------------------------
+    launches, stream (published ref)         17.024   17.012   17.203    +1.453   831.5
+    launches, CUDA graph                     16.390   16.382   16.502    +0.819   863.7
+    graph, own GEMV, no prefetch             16.305   16.292   16.417    +0.733   868.2
+    graph + tail L2 prefetch 1024 rows       16.397   16.396   16.536    +0.826   863.3
+    graph + tail L2 prefetch 2048 rows       16.391   16.383   16.523    +0.819   863.7
+    graph + tail L2 prefetch 4096 rows       16.510   16.508   16.667    +0.938   857.4
+    graph + tail L2 prefetch 2048, late      15.908   15.889   15.922    +0.337   889.8
+    persistent, NO barrier (floor)           15.571   15.544   15.656    +0.000   909.1
+    persistent, NO barrier, smem path        15.794   15.763   15.849    +0.223   896.3
+    V2 wait-then-load (published)            17.534   17.520   17.910    +1.962   807.4
+    V2 + L2 run-ahead 256 B/row              17.500   17.493   17.518    +1.929   808.9
+    V2 + L2 run-ahead 512 B/row              17.441   17.421   17.505    +1.869   811.7
+    V2 + L2 run-ahead 1 KB/row               17.496   17.487   18.206    +1.924   809.1
+    V2 + smem run-ahead                      18.405   18.379   18.591    +2.833   769.1
+    V7 wait-then-load                        17.487   17.481   17.541    +1.916   809.5
+    V7 + smem run-ahead                      18.135   18.115   18.536    +2.563   780.6
+    V2 wait-then-load, xq via L2            905.461  902.948  905.922  +889.889    15.6
+    V2 + smem run-ahead, xq via L2          901.628  894.720  902.024  +886.056    15.7
+    V7 + smem run-ahead, xq via L2          893.636  887.558  893.833  +878.064    15.8
+
+    per-stage overhead above the no-barrier floor (15.571 us):
+      launch boundary (CUDA graph)             +0.819
+      barrier, wait-then-load (published)      +1.962
+      barrier + run-ahead, best                +1.869
+      barrier + run-ahead, xq via L2, best    +878.064
+      graph + tail prefetch, best              +0.337
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+(C) CHAIN, 2048 rows x 130 stages -- most warps idle
+    130 stages, 306.7 MB per pass, 2.36 MB per stage on average
+    bit-identity, 8 stages, memcmp vs k_gemv_q4_0: 19/19 configs identical
+
+    us per stage, median of 5 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor    GB/s
+----------------------------------------------------------------------------------------------------
+    launches, stream (published ref)          4.706    4.703    4.729    +2.189   501.3
+    launches, CUDA graph                      4.031    4.024    4.034    +1.514   585.2
+    graph, own GEMV, no prefetch              4.003    3.995    4.005    +1.486   589.4
+    graph + tail L2 prefetch 1024 rows        4.052    4.049    4.053    +1.535   582.3
+    graph + tail L2 prefetch 2048 rows        4.115    4.112    4.119    +1.598   573.4
+    graph + tail L2 prefetch 4096 rows        4.115    4.110    4.116    +1.598   573.4
+    graph + tail L2 prefetch 2048, late       4.066    4.063    4.077    +1.549   580.2
+    persistent, NO barrier (floor)            2.517    2.516    2.519    +0.000   937.3
+    persistent, NO barrier, smem path         2.522    2.521    2.533    +0.005   935.4
+    V2 wait-then-load (published)             5.244    5.229    5.255    +2.727   449.9
+    V2 + L2 run-ahead 256 B/row               5.191    5.186    5.194    +2.674   454.5
+    V2 + L2 run-ahead 512 B/row               5.145    5.144    5.147    +2.628   458.5
+    V2 + L2 run-ahead 1 KB/row                5.147    5.147    5.148    +2.630   458.4
+    V2 + smem run-ahead                       5.141    5.139    5.142    +2.624   458.9
+    V7 wait-then-load                         5.215    5.197    5.218    +2.698   452.4
+    V7 + smem run-ahead                       5.153    5.150    5.153    +2.636   457.8
+    V2 wait-then-load, xq via L2            165.454  165.398  165.484  +162.937    14.3
+    V2 + smem run-ahead, xq via L2          158.524  158.485  158.555  +156.007    14.9
+    V7 + smem run-ahead, xq via L2          156.620  156.609  156.623  +154.103    15.1
+
+    per-stage overhead above the no-barrier floor (2.517 us):
+      launch boundary (CUDA graph)             +1.514
+      barrier, wait-then-load (published)      +2.727
+      barrier + run-ahead, best                +2.624
+      barrier + run-ahead, xq via L2, best    +154.103
+      graph + tail prefetch, best              +1.535
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+(D) ENGINE-LIKE LAYER x 12: 6144/64/2048/64/64/64/12288/64/8192 rows
+    108 stages, 400.8 MB per pass, 3.71 MB per stage on average
+    bit-identity, 18 stages, memcmp vs k_gemv_q4_0: 19/19 configs identical
+
+    us per stage, median of 5 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor    GB/s  us/layer
+----------------------------------------------------------------------------------------------------
+    launches, stream (published ref)          6.243    6.243    6.248    +1.710   594.5     56.18
+    launches, CUDA graph                      5.598    5.596    5.604    +1.066   662.9     50.38
+    graph, own GEMV, no prefetch              5.599    5.598    5.600    +1.067   662.8     50.39
+    graph + tail L2 prefetch 1024 rows        5.662    5.659    5.664    +1.130   655.4     50.96
+    graph + tail L2 prefetch 2048 rows        5.670    5.668    5.676    +1.138   654.5     51.03
+    graph + tail L2 prefetch 4096 rows        5.698    5.694    5.700    +1.166   651.2     51.29
+    graph + tail L2 prefetch 2048, late       5.363    5.361    5.365    +0.831   692.0     48.26
+    persistent, NO barrier (floor)            4.532    4.526    4.541    +0.000   818.8     40.79
+    persistent, NO barrier, smem path         4.614    4.606    4.619    +0.081   804.4     41.52
+    V2 wait-then-load (published)             6.791    6.783    6.813    +2.258   546.5     61.12
+    V2 + L2 run-ahead 256 B/row               6.628    6.626    6.646    +2.095   559.9     59.65
+    V2 + L2 run-ahead 512 B/row               6.510    6.504    6.512    +1.978   570.1     58.59
+    V2 + L2 run-ahead 1 KB/row                6.643    6.635    6.645    +2.111   558.6     59.79
+    V2 + smem run-ahead                       6.885    6.878    6.893    +2.353   539.0     61.97
+    V7 wait-then-load                         6.675    6.665    6.696    +2.143   556.0     60.07
+    V7 + smem run-ahead                       6.688    6.664    6.696    +2.156   554.9     60.19
+    V2 wait-then-load, xq via L2            245.906  245.796  245.992  +241.374    15.1   2213.15
+    V2 + smem run-ahead, xq via L2          242.039  242.002  242.058  +237.507    15.3   2178.36
+    V7 + smem run-ahead, xq via L2          238.603  238.571  238.622  +234.071    15.6   2147.43
+
+    per-stage overhead above the no-barrier floor (4.532 us):
+      launch boundary (CUDA graph)             +1.066
+      barrier, wait-then-load (published)      +2.258
+      barrier + run-ahead, best                +1.978
+      barrier + run-ahead, xq via L2, best    +234.071
+      graph + tail prefetch, best              +0.831
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+SUMMARY: per-stage overhead above the no-barrier floor, us
+    shape           graph  published  run-ahead  RA honest    tail pf
+    (B) 12288      +0.819     +1.962     +1.869   +878.064     +0.337
+    (C) 2048       +1.514     +2.727     +2.624   +154.103     +1.535
+    (D) engine     +1.066     +2.258     +1.978   +234.071     +0.831
+    (D) per layer: graph 50.38 us, honest run-ahead 2147.43 us, floor 40.79 us

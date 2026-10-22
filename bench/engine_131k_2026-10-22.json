@@ -1,0 +1,10 @@
+[
+ {
+  "ctx": 131040,
+  "prompt_n": 131040,
+  "prefill_s": 13.929,
+  "prefill_tps": 9407.7,
+  "decode_tps": 184.51,
+  "mode": "batch"
+ }
+]

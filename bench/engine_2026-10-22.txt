@@ -1,0 +1,16 @@
+     ctx  prefill_s  prefill_t/s decode_t/s  mode
+      64      0.025       2521.3     447.81  batch
+     256      0.036       7179.5     446.26  batch
+    1024      0.070      14546.8     440.25  batch
+    4096      0.213      19208.7     418.55  batch
+    8192      0.417      19635.5     386.90  batch
+   16384      0.896      18285.9     357.92  batch
+   32768      2.041      16055.1     314.65  batch
+   65536      5.043      12996.5     254.10  batch
+engine failed:
+liquid-kernel engine ready: 40 layers, max_seq=131072
+copying 12.64 GiB of weights to the device ...
+weights resident on device
+captured CUDA graph: 343 nodes
+FATAL: prompt 131040 + ngen 64 = 131104 exceeds LK_MAX_SEQ 131072.  The KV cache is exactly max_seq long and nothing bounds-checks d_pos, so continuing would write past the end of it.  Raise LK_MAX_SEQ or lower LK_NGEN.
+

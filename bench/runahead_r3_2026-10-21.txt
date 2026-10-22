@@ -1,0 +1,163 @@
+device: NVIDIA GeForce RTX 3090 Ti  SMs=84  L2=6 MB  smem/SM=100 KB
+residency (need 6 blocks/SM for the 504-block grid):
+    persistent, NO barrier (floor)         6 blocks/SM   40 regs      0 B smem     0 B local
+    V2 wait-then-load (published)          6 blocks/SM   40 regs      0 B smem     0 B local
+    V2 + L2 512 B, before arrive           6 blocks/SM   39 regs      0 B smem     0 B local
+    V2 + smem, before arrive               6 blocks/SM   40 regs   9216 B smem     0 B local
+    no-fence bar (diag), wait-then-load    6 blocks/SM   40 regs      0 B smem     0 B local
+    no-fence bar (diag) + smem             6 blocks/SM   40 regs   9216 B smem     0 B local
+    SPLIT bar, no run-ahead                6 blocks/SM   38 regs      0 B smem     0 B local
+    SPLIT bar + smem run-ahead             6 blocks/SM   39 regs   9216 B smem     0 B local
+    SPLIT bar + L2 512 B run-ahead         6 blocks/SM   40 regs      0 B smem     0 B local
+    SPLIT bar + L2 1 KB run-ahead          6 blocks/SM   40 regs      0 B smem     0 B local
+    xq staged: NO barrier                  6 blocks/SM   37 regs   2304 B smem     0 B local
+    xq staged: V2 wait-then-load           6 blocks/SM   37 regs   2304 B smem     0 B local
+    xq staged: SPLIT, no run-ahead         6 blocks/SM   38 regs   2304 B smem     0 B local
+    xq staged: SPLIT + smem run-ahead      6 blocks/SM   39 regs  11520 B smem     0 B local
+    xq staged: SPLIT + L2 512 B            6 blocks/SM   37 regs   2304 B smem     0 B local
+
+=====================================================================
+(B) CHAIN, 12288 rows x 31 stages -- the published shape
+    31 stages, 438.8 MB per pass, 14.16 MB per stage on average
+    bit-identity, 8 stages, memcmp vs k_gemv_q4_0: 29/29 configs identical
+
+    us per stage, median of 7 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor  vs graph    GB/s
+--------------------------------------------------------------------------------------------------------------
+    launches, stream (published ref)         17.025   17.012   17.215    +1.453    +0.621   831.5
+    launches, CUDA graph                     16.404   16.377   16.516    +0.832    +0.000   863.0
+    graph, own GEMV, no prefetch             16.409   16.397   16.528    +0.838    +0.005   862.7
+    graph + tail pf 2048, early              16.490   16.476   16.628    +0.918    +0.086   858.5
+    graph + tail pf  256 late                16.173   16.159   16.318    +0.601    -0.231   875.3
+    graph + tail pf  512 late                15.908   15.889   16.054    +0.337    -0.495   889.8
+    graph + tail pf  768 late                15.696   15.683   15.842    +0.124    -0.708   901.9
+    graph + tail pf 1024 late                15.558   15.531   18.238    -0.013    -0.846   909.9
+    graph + tail pf 1536 late                15.677   15.664   15.749    +0.106    -0.727   903.0
+    graph + tail pf 2048 late                15.880   15.842   16.026    +0.308    -0.524   891.4
+    graph + tail pf 4096 late                15.816   15.598   15.882    +0.244    -0.588   895.0
+    graph + tail pf 1024 late, 512 x2        15.695   15.664   15.789    +0.123    -0.709   901.9
+    graph + tail pf 1024 late, 256 x4        15.842   15.829   15.960    +0.271    -0.562   893.5
+    graph + tail pf 2048 late, 512 x4        15.809   15.783   15.921    +0.238    -0.595   895.4
+    persistent, NO barrier (floor)           15.571   15.552   15.637    +0.000    -0.832   909.1
+    V2 wait-then-load (published)            17.566   17.527   17.922    +1.995    +1.162   805.9
+    V2 + L2 512 B, before arrive             17.414   17.362   17.512    +1.843    +1.010   812.9
+    V2 + smem, before arrive                 18.537   18.530   18.708    +2.966    +2.133   763.6
+    no-fence bar (diag), wait-then-load      17.322   17.289   17.448    +1.751    +0.918   817.2
+    no-fence bar (diag) + smem               17.521   17.500   18.300    +1.950    +1.117   807.9
+    SPLIT bar, no run-ahead                  17.494   17.487   17.633    +1.922    +1.090   809.2
+    SPLIT bar + smem run-ahead               18.042   18.009   18.425    +2.471    +1.638   784.6
+    SPLIT bar + L2 512 B run-ahead           17.084   17.051   17.487    +1.513    +0.680   828.6
+    SPLIT bar + L2 1 KB run-ahead            17.944   17.877   18.386    +2.372    +1.540   788.9
+    xq staged: NO barrier                    15.200   15.168   15.226    -0.372    -1.204   931.3
+    xq staged: V2 wait-then-load             18.505   18.504   18.999    +2.933    +2.101   765.0
+    xq staged: SPLIT, no run-ahead           18.465   18.406   18.577    +2.894    +2.061   766.6
+    xq staged: SPLIT + smem run-ahead        17.309   17.263   17.732    +1.737    +0.905   817.8
+    xq staged: SPLIT + L2 512 B              17.785   17.725   18.341    +2.213    +1.381   796.0
+
+    per-stage overhead above the no-barrier floor (15.571 us):
+      launch boundary (CUDA graph)             +0.832
+      barrier, wait-then-load (published)      +1.995
+      split barrier + run-ahead, best          +1.513
+      same, xq staged per stage, best          +1.737   <- the honest one
+      graph + tail prefetch (late), best       -0.013
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+(C) CHAIN, 2048 rows x 130 stages -- most warps idle
+    130 stages, 306.7 MB per pass, 2.36 MB per stage on average
+    bit-identity, 8 stages, memcmp vs k_gemv_q4_0: 29/29 configs identical
+
+    us per stage, median of 7 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor  vs graph    GB/s
+--------------------------------------------------------------------------------------------------------------
+    launches, stream (published ref)          4.699    4.698    4.709    +2.182    +0.674   502.0
+    launches, CUDA graph                      4.025    4.023    4.027    +1.508    +0.000   586.1
+    graph, own GEMV, no prefetch              4.091    4.087    4.094    +1.574    +0.066   576.7
+    graph + tail pf 2048, early               4.220    4.219    4.224    +1.703    +0.195   559.0
+    graph + tail pf  256 late                 3.842    3.838    3.843    +1.324    -0.183   614.1
+    graph + tail pf  512 late                 3.593    3.589    3.595    +1.076    -0.432   656.6
+    graph + tail pf  768 late                 3.393    3.390    3.399    +0.876    -0.632   695.3
+    graph + tail pf 1024 late                 3.434    3.431    3.437    +0.917    -0.591   687.0
+    graph + tail pf 1536 late                 3.726    3.716    3.735    +1.208    -0.299   633.2
+    graph + tail pf 2048 late                 4.039    4.031    4.046    +1.522    +0.014   584.1
+    graph + tail pf 4096 late                 4.041    4.036    4.048    +1.523    +0.016   583.9
+    graph + tail pf 1024 late, 512 x2         3.428    3.426    3.431    +0.910    -0.597   688.3
+    graph + tail pf 1024 late, 256 x4         3.471    3.467    3.475    +0.953    -0.555   679.8
+    graph + tail pf 2048 late, 512 x4         4.173    4.159    4.179    +1.655    +0.148   565.4
+    persistent, NO barrier (floor)            2.517    2.516    2.524    +0.000    -1.508   937.2
+    V2 wait-then-load (published)             5.249    5.227    5.262    +2.732    +1.224   449.5
+    V2 + L2 512 B, before arrive              5.159    5.147    5.160    +2.641    +1.134   457.3
+    V2 + smem, before arrive                  5.145    5.145    5.147    +2.628    +1.120   458.5
+    no-fence bar (diag), wait-then-load       4.116    4.113    4.118    +1.599    +0.091   573.1
+    no-fence bar (diag) + smem                4.112    4.105    4.649    +1.594    +0.087   573.8
+    SPLIT bar, no run-ahead                   6.157    6.136    6.164    +3.639    +2.131   383.2
+    SPLIT bar + smem run-ahead                5.638    5.630    5.643    +3.121    +1.613   418.4
+    SPLIT bar + L2 512 B run-ahead            6.171    6.171    6.177    +3.653    +2.146   382.3
+    SPLIT bar + L2 1 KB run-ahead             6.172    6.170    6.176    +3.655    +2.147   382.2
+    xq staged: NO barrier                     3.012    3.006    3.017    +0.495    -1.013   783.3
+    xq staged: V2 wait-then-load              5.382    5.364    5.393    +2.864    +1.356   438.4
+    xq staged: SPLIT, no run-ahead            5.141    5.139    5.144    +2.623    +1.116   459.0
+    xq staged: SPLIT + smem run-ahead         4.676    4.668    4.695    +2.158    +0.651   504.6
+    xq staged: SPLIT + L2 512 B               5.145    5.145    5.147    +2.628    +1.120   458.5
+
+    per-stage overhead above the no-barrier floor (2.517 us):
+      launch boundary (CUDA graph)             +1.508
+      barrier, wait-then-load (published)      +2.732
+      split barrier + run-ahead, best          +3.121
+      same, xq staged per stage, best          +2.158   <- the honest one
+      graph + tail prefetch (late), best       +0.876
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+(D) ENGINE-LIKE LAYER x 12: 6144/64/2048/64/64/64/12288/64/8192 rows
+    108 stages, 400.8 MB per pass, 3.71 MB per stage on average
+    bit-identity, 18 stages, memcmp vs k_gemv_q4_0: 29/29 configs identical
+
+    us per stage, median of 7 round-robin rounds of 5 passes
+    config                                   median      min      max  vs floor  vs graph    GB/s  us/layer
+--------------------------------------------------------------------------------------------------------------
+    launches, stream (published ref)          6.243    6.241    6.254    +1.715    +0.643   594.5     56.18
+    launches, CUDA graph                      5.599    5.598    5.604    +1.072    +0.000   662.7     50.39
+    graph, own GEMV, no prefetch              5.653    5.651    5.655    +1.126    +0.053   656.5     50.88
+    graph + tail pf 2048, early               5.746    5.742    5.748    +1.219    +0.146   645.9     51.71
+    graph + tail pf  256 late                 5.586    5.583    5.588    +1.059    -0.013   664.3     50.28
+    graph + tail pf  512 late                 5.480    5.480    5.486    +0.953    -0.119   677.1     49.32
+    graph + tail pf  768 late                 5.399    5.397    5.404    +0.872    -0.201   687.4     48.59
+    graph + tail pf 1024 late                 5.372    5.366    5.377    +0.845    -0.227   690.8     48.35
+    graph + tail pf 1536 late                 5.433    5.421    5.438    +0.906    -0.167   683.1     48.90
+    graph + tail pf 2048 late                 5.435    5.435    5.442    +0.908    -0.165   682.8     48.91
+    graph + tail pf 4096 late                 5.431    5.425    5.444    +0.904    -0.168   683.3     48.88
+    graph + tail pf 1024 late, 512 x2         5.401    5.398    5.406    +0.874    -0.199   687.1     48.61
+    graph + tail pf 1024 late, 256 x4         5.423    5.418    5.427    +0.896    -0.176   684.3     48.81
+    graph + tail pf 2048 late, 512 x4         5.486    5.484    5.489    +0.959    -0.114   676.5     49.37
+    persistent, NO barrier (floor)            4.527    4.526    4.544    +0.000    -1.072   819.7     40.74
+    V2 wait-then-load (published)             6.799    6.777    6.819    +2.272    +1.199   545.8     61.19
+    V2 + L2 512 B, before arrive              6.500    6.495    6.505    +1.973    +0.901   570.9     58.50
+    V2 + smem, before arrive                  6.965    6.963    6.967    +2.438    +1.366   532.8     62.68
+    no-fence bar (diag), wait-then-load       5.937    5.935    5.941    +1.410    +0.338   625.0     53.44
+    no-fence bar (diag) + smem                6.055    6.037    6.078    +1.528    +0.456   612.9     54.50
+    SPLIT bar, no run-ahead                   6.880    6.866    6.887    +2.353    +1.280   539.4     61.92
+    SPLIT bar + smem run-ahead                6.813    6.789    6.817    +2.286    +1.214   544.7     61.32
+    SPLIT bar + L2 512 B run-ahead            6.747    6.738    6.755    +2.220    +1.148   550.0     60.72
+    SPLIT bar + L2 1 KB run-ahead             6.912    6.904    6.918    +2.385    +1.313   536.9     62.21
+    xq staged: NO barrier                     4.559    4.547    4.564    +0.032    -1.041   814.0     41.03
+    xq staged: V2 wait-then-load              7.071    7.059    7.074    +2.544    +1.472   524.8     63.64
+    xq staged: SPLIT, no run-ahead            6.698    6.669    6.711    +2.171    +1.098   554.1     60.28
+    xq staged: SPLIT + smem run-ahead         6.606    6.595    6.637    +2.079    +1.007   561.7     59.46
+    xq staged: SPLIT + L2 512 B               6.715    6.683    6.743    +2.188    +1.115   552.7     60.43
+
+    per-stage overhead above the no-barrier floor (4.527 us):
+      launch boundary (CUDA graph)             +1.072
+      barrier, wait-then-load (published)      +2.272
+      split barrier + run-ahead, best          +2.220
+      same, xq staged per stage, best          +2.079   <- the honest one
+      graph + tail prefetch (late), best       +0.845
+    verdict on the honest run-ahead variant: FALSIFIED: does not beat the launch boundary
+
+=====================================================================
+SUMMARY: per-stage overhead above the no-barrier floor, us
+    shape           graph  published   split RA  RA honest    tail pf
+    (B) 12288      +0.832     +1.995     +1.513     +1.737     -0.013
+    (C) 2048       +1.508     +2.732     +3.121     +2.158     +0.876
+    (D) engine     +1.072     +2.272     +2.220     +2.079     +0.845
+    (D) us per layer: floor 40.74, graph 50.39, graph+tail pf 48.35, honest run-ahead 59.46

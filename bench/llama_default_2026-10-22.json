@@ -1,0 +1,92 @@
+[
+ {
+  "ctx": 64,
+  "prompt_n": 65,
+  "prefill_s": 0.037531,
+  "prefill_tps": 1731.9016279875302,
+  "decode_tps": 258.01977882867084,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 256,
+  "prompt_n": 257,
+  "prefill_s": 0.068475,
+  "prefill_tps": 3753.1945965680907,
+  "decode_tps": 257.0260479835503,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 1024,
+  "prompt_n": 1025,
+  "prefill_s": 0.160927,
+  "prefill_tps": 6369.347592386611,
+  "decode_tps": 263.78046870492034,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 4096,
+  "prompt_n": 4097,
+  "prefill_s": 0.61472,
+  "prefill_tps": 6664.823008849557,
+  "decode_tps": 258.28322369748577,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 8192,
+  "prompt_n": 8193,
+  "prefill_s": 1.247668,
+  "prefill_tps": 6566.650743627311,
+  "decode_tps": 251.68709002532603,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 16384,
+  "prompt_n": 16385,
+  "prefill_s": 2.612665,
+  "prefill_tps": 6271.374248133611,
+  "decode_tps": 240.55447807195583,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 32768,
+  "prompt_n": 32768,
+  "prefill_s": 5.719956,
+  "prefill_tps": 5728.715395712834,
+  "decode_tps": 220.1128078140047,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 65536,
+  "prompt_n": 65535,
+  "prefill_s": 13.397267,
+  "prefill_tps": 4891.669323303029,
+  "decode_tps": 188.39376652125023,
+  "gen": 64,
+  "tag": "default",
+  "flags": ""
+ },
+ {
+  "ctx": 131040,
+  "prompt_n": 131037,
+  "prefill_s": 34.569341,
+  "prefill_tps": 3790.5553363021877,
+  "decode_tps": 148.620588622457,
+  "gen": 35,
+  "tag": "default",
+  "flags": ""
+ }
+]

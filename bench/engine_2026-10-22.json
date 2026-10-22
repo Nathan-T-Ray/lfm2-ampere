@@ -1,0 +1,66 @@
+[
+ {
+  "ctx": 64,
+  "prompt_n": 64,
+  "prefill_s": 0.0254,
+  "prefill_tps": 2521.35,
+  "decode_tps": 447.81,
+  "mode": "batch"
+ },
+ {
+  "ctx": 256,
+  "prompt_n": 256,
+  "prefill_s": 0.0357,
+  "prefill_tps": 7179.48,
+  "decode_tps": 446.26,
+  "mode": "batch"
+ },
+ {
+  "ctx": 1024,
+  "prompt_n": 1024,
+  "prefill_s": 0.0704,
+  "prefill_tps": 14546.83,
+  "decode_tps": 440.25,
+  "mode": "batch"
+ },
+ {
+  "ctx": 4096,
+  "prompt_n": 4096,
+  "prefill_s": 0.2132,
+  "prefill_tps": 19208.72,
+  "decode_tps": 418.55,
+  "mode": "batch"
+ },
+ {
+  "ctx": 8192,
+  "prompt_n": 8192,
+  "prefill_s": 0.4172,
+  "prefill_tps": 19635.53,
+  "decode_tps": 386.9,
+  "mode": "batch"
+ },
+ {
+  "ctx": 16384,
+  "prompt_n": 16384,
+  "prefill_s": 0.896,
+  "prefill_tps": 18285.91,
+  "decode_tps": 357.92,
+  "mode": "batch"
+ },
+ {
+  "ctx": 32768,
+  "prompt_n": 32768,
+  "prefill_s": 2.041,
+  "prefill_tps": 16055.1,
+  "decode_tps": 314.65,
+  "mode": "batch"
+ },
+ {
+  "ctx": 65536,
+  "prompt_n": 65536,
+  "prefill_s": 5.0426,
+  "prefill_tps": 12996.52,
+  "decode_tps": 254.1,
+  "mode": "batch"
+ }
+]

@@ -1,0 +1,92 @@
+[
+ {
+  "ctx": 64,
+  "prompt_n": 65,
+  "prefill_s": 0.037561,
+  "prefill_tps": 1730.5183568062619,
+  "decode_tps": 258.7144318186412,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 256,
+  "prompt_n": 257,
+  "prefill_s": 0.068309,
+  "prefill_tps": 3762.315361079799,
+  "decode_tps": 257.44995816438177,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 1024,
+  "prompt_n": 1025,
+  "prefill_s": 0.118792,
+  "prefill_tps": 8628.52717354704,
+  "decode_tps": 264.28807400066074,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 4096,
+  "prompt_n": 4097,
+  "prefill_s": 0.383486,
+  "prefill_tps": 10683.57123858498,
+  "decode_tps": 259.1344908007256,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 8192,
+  "prompt_n": 8193,
+  "prefill_s": 0.7821589999999999,
+  "prefill_tps": 10474.852299852075,
+  "decode_tps": 251.73955969177638,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 16384,
+  "prompt_n": 16385,
+  "prefill_s": 1.5956759999999999,
+  "prefill_tps": 10268.375284205566,
+  "decode_tps": 239.74078028132084,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 32768,
+  "prompt_n": 32768,
+  "prefill_s": 3.529388,
+  "prefill_tps": 9284.32918114982,
+  "decode_tps": 220.38263935758462,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 65536,
+  "prompt_n": 65535,
+  "prefill_s": 8.688386000000001,
+  "prefill_tps": 7542.827862390091,
+  "decode_tps": 188.11080902344037,
+  "gen": 64,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ },
+ {
+  "ctx": 131040,
+  "prompt_n": 131037,
+  "prefill_s": 24.220809000000003,
+  "prefill_tps": 5410.100050745621,
+  "decode_tps": 148.12056167316987,
+  "gen": 35,
+  "tag": "tuned",
+  "flags": "-ub 4096 -b 4096"
+ }
+]

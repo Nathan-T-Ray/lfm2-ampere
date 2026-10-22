@@ -159,8 +159,21 @@ $(BUILD)/test_normscale: tests/test_normscale.cu $(BUILD)/kernels.o $(BUILD)/fla
 test-normscale: $(BUILD)/test_normscale
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_normscale
 
-$(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o src/tensor_table.h $(BUILD)/flags.stamp | $(BUILD) check-cuda
-> $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+# The batched prefill path (src/prefill.cu).  Its gate is test-prefill: the
+# per-token kernels must match the decode kernels byte for byte, the GEMM
+# must match a float64 reference of the same per-block terms, and the
+# attention a float64 softmax over the same fp16 values.
+$(BUILD)/prefill.o: src/prefill.cu src/prefill.cuh src/kernels.cuh src/quant.cuh $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -c src/prefill.cu -o $@
+
+$(BUILD)/test_prefill: tests/test_prefill.cu $(BUILD)/kernels.o $(BUILD)/prefill.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) tests/test_prefill.cu $(BUILD)/kernels.o $(BUILD)/prefill.o -o $@ $(LDFLAGS)
+
+test-prefill: $(BUILD)/test_prefill
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/test_prefill
+
+$(BUILD)/engine: src/engine.cu $(BUILD)/kernels.o $(BUILD)/prefill.o src/prefill.cuh src/tensor_table.h $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) src/engine.cu $(BUILD)/kernels.o $(BUILD)/prefill.o -o $@ $(LDFLAGS)
 
 engine: $(BUILD)/engine
 
@@ -283,6 +296,16 @@ $(BUILD)/bench_mkbar: tests/bench_mkbar.cu src/mkbar.cuh src/megakernel.cuh $(BU
 
 bench-mkbar: $(BUILD)/bench_mkbar
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_mkbar
+
+# REVIEW-2026-10-21 section 1, the run-ahead kill-test.  bench_mkbar's stage and
+# grid, with one factor moved: each warp issues its next-stage weight loads
+# BEFORE it arrives at the barrier.  Prediction: <= 0.5 us/stage of barrier
+# overhead at 12288 rows; falsified above the 1.18 us launch boundary.
+$(BUILD)/bench_runahead: tests/bench_runahead.cu src/mkbar.cuh src/megakernel.cuh $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
+> $(NVCC) $(NVFLAGS) -I src tests/bench_runahead.cu $(BUILD)/kernels.o -o $@ $(LDFLAGS)
+
+bench-runahead: $(BUILD)/bench_runahead
+> @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_runahead
 
 # --- gates ------------------------------------------------------------------
 # C1  greedy parity vs llama.cpp

@@ -4,7 +4,17 @@ the greedy token trajectory.  If a kernel change is bit-identical, the
 trajectories must agree exactly; if they agree exactly the change provably did
 not perturb a single logit enough to flip an argmax.
 
-Usage: tools/ab.py BASE_BINARY NEW_BINARY [--ngen 48] [--cases factual,prose]
+Usage: tools/ab.py BASE_BINARY NEW_BINARY [--ngen 48] [--cases factual,prose] [--prefill seq|batch]
+
+PREFILL.  The batched prefill (src/prefill.cu) is not bit-identical to the
+sequential one -- it sums GEMM blocks in a different order and runs attention on
+fp16 tensor cores -- so a gate that let it run would report every decode change
+as DIVERGED.  This gate therefore pins LK_PREFILL=seq on BOTH binaries by
+default: it is, as it always was, a proof about the decode path.  A binary older
+than the batched path ignores the variable, which is exactly the old behaviour.
+--prefill batch pins the batched path on both instead, which is the gate for a
+change INSIDE the batched path that claims to be bit-identical (a tile shape, a
+launch config, a fused epilogue that preserves the arithmetic).
 """
 import argparse
 import json
@@ -17,9 +27,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 REF = pathlib.Path(os.environ.get("LK_REF", ROOT / "ref"))
 
 
-def run(binary, ids, ngen, extra_env=None):
+def run(binary, ids, ngen, extra_env=None, prefill="seq"):
     env = dict(os.environ)
     env["LK_NGEN"] = str(ngen)
+    env["LK_PREFILL"] = prefill
     env["CUDA_VISIBLE_DEVICES"] = env.get("LK_GPU", "0")
     # TURN THE END-OF-TURN STOP OFF FOR THIS GATE.  bench mode is what normally
     # suppresses it, but bench mode also suppresses the `out:` line that this
@@ -47,6 +58,7 @@ def main():
     ap.add_argument("new")
     ap.add_argument("--ngen", type=int, default=48)
     ap.add_argument("--cases", default="")
+    ap.add_argument("--prefill", default="seq", choices=["seq", "batch"])
     a = ap.parse_args()
 
     ref = json.loads((REF / "oracle_ref.json").read_text())
@@ -60,8 +72,8 @@ def main():
     allsame = True
     for c in cases:
         ids = suite[c["name"]]["prompt_ids"]
-        b = run(pathlib.Path(a.base), ids, a.ngen)
-        n = run(pathlib.Path(a.new), ids, a.ngen)
+        b = run(pathlib.Path(a.base), ids, a.ngen, prefill=a.prefill)
+        n = run(pathlib.Path(a.new), ids, a.ngen, prefill=a.prefill)
         same = (b == n)
         allsame &= same
         first = next((i for i, (x, y) in enumerate(zip(b, n)) if x != y), None)
