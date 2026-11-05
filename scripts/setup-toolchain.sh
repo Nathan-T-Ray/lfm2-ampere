@@ -6,12 +6,14 @@
 # this every translation unit that includes cuda_fp16.h fails with
 #   fatal error: nv/target: No such file or directory
 #
-# We copy the version-matched CCCL 12.6.77 (same minor as cudart 12.6.77) out of
-# the conda package cache into the CUDA include dir, so the toolchain becomes
-# self-contained and also works through the container's /model-scratch mount.
+# A normal CUDA install already has CCCL; this is only for a toolkit assembled
+# from individual packages.  It copies a version-matched CCCL include tree (for
+# example from a conda cuda-cccl package) into the CUDA include dir.
+#
+#   usage: scripts/setup-toolchain.sh CCCL_INCLUDE_DIR [CUDA_INCLUDE_DIR]
 set -euo pipefail
-CUDA_INC="${1:-$HOME/local-agent-harnesses/model-scratch/cuda-12.6/usr/local/cuda-12.6/include}"
-CCCL="$HOME/miniconda3/pkgs/cuda-cccl_linux-64-12.6.77-ha770c72_0/targets/x86_64-linux/include"
+CCCL="${1:?usage: setup-toolchain.sh CCCL_INCLUDE_DIR [CUDA_INCLUDE_DIR]}"
+CUDA_INC="${2:-${CUDA_HOME:?set CUDA_HOME or pass CUDA_INCLUDE_DIR}/include}"
 
 if [ -d "$CUDA_INC/nv" ] && [ -d "$CUDA_INC/cuda" ]; then
   echo "CCCL already present in $CUDA_INC"; exit 0

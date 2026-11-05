@@ -24,7 +24,7 @@ import urllib.request
 
 PORT = os.environ.get("LK_ORACLE_PORT", "18099")
 LOG = pathlib.Path(os.environ.get(
-    "LK_SCRATCH", pathlib.Path.home() / "local-agent-harnesses/model-scratch/lfm25")) / "oracle_verbose.log"
+    "LK_SCRATCH", pathlib.Path(__file__).resolve().parent.parent / "work")) / "oracle_verbose.log"
 FILLER = ("The history of the Roman Empire spans more than a thousand years and "
           "its influence can still be seen in the languages, laws and borders of "
           "the modern world. ")

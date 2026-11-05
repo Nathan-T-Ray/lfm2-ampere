@@ -13,8 +13,8 @@ usage: tools/llamasrv.py --ctx 256,4096 --flags "-ub 2048" --tag ub2048 --out /t
 import argparse, json, os, pathlib, shlex, signal, struct, subprocess, sys, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SRV = os.environ.get("LK_ORACLE", str(pathlib.Path.home() / ".unsloth/llama.cpp/build/bin/llama-server"))
-GGUF = os.environ.get("LK_MODEL", str(pathlib.Path.home() / "qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf"))
+SRV = os.environ.get("LK_ORACLE", str(pathlib.Path.home() / "llama.cpp/build/bin/llama-server"))
+GGUF = os.environ.get("LK_MODEL", str(pathlib.Path(__file__).resolve().parent.parent / "models" / "LFM2.5-24B-A2B-QAD-Q4_0.gguf"))
 PORT = int(os.environ.get("LK_ORACLE_PORT", "18099"))
 
 

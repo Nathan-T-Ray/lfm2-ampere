@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.pack
 *.manifest.json
+models/
+work/
+setenv.local.sh

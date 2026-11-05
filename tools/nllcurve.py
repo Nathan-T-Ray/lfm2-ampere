@@ -30,9 +30,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ORACLE = ROOT / "build" / "oracle_ppl"
-GGUF = os.environ.get("LK_MODEL",
-                      "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf")
-BACKEND = "/home/nathan/.unsloth/llama.cpp/build/bin"
+GGUF = os.environ.get("LK_MODEL", str(ROOT / "models" / "LFM2.5-24B-A2B-QAD-Q4_0.gguf"))
+BACKEND = os.environ.get("LK_BACKEND_DIR",
+                         str(pathlib.Path.home() / "llama.cpp" / "build" / "bin"))
 
 # Log-spaced, because decode cost and context effect are both logarithmic.
 BUCKETS = [(1, 256), (256, 1024), (1024, 4096), (4096, 16384),

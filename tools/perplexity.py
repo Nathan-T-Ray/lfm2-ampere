@@ -28,7 +28,7 @@ SYS    = ROOT / "tools"
 # -- the same convention tools/parity.py and tools/sweep.py already use.
 ENGINE = pathlib.Path(os.environ.get("LK_ENGINE", ROOT / "build" / "engine"))
 ORACLE = ROOT / "build" / "oracle_ppl"
-GGUF   = os.environ.get("LK_MODEL", "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf")
+GGUF   = os.environ.get("LK_MODEL", str(ROOT / "models" / "LFM2.5-24B-A2B-QAD-Q4_0.gguf"))
 NL, H  = 41, 2048
 EPS    = 1e-5
 
@@ -54,7 +54,7 @@ def main():
 
     env = dict(os.environ)
     env["LK_BACKEND_DIR"] = os.environ.get("LK_BACKEND_DIR",
-                                           "/home/nathan/.unsloth/llama.cpp/build/bin")
+                                           str(pathlib.Path.home() / "llama.cpp" / "build" / "bin"))
     env["CUDA_VISIBLE_DEVICES"] = os.environ.get("LK_ORACLE_GPU", "0")
     if not odump.exists():
         print(sh([str(ORACLE), GGUF, str(tokf), str(odump)], env=env).strip())

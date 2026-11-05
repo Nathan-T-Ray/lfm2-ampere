@@ -29,7 +29,7 @@ ROOT    = pathlib.Path(__file__).resolve().parent.parent
 REF     = pathlib.Path(os.environ.get("LK_REF", ROOT / "ref"))
 ENGINE  = ROOT / "build" / "engine"
 ORACLE  = ROOT / "build" / "oracle_logits"
-GGUF    = os.environ.get("LK_MODEL", "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf")
+GGUF    = os.environ.get("LK_MODEL", str(ROOT / "models" / "LFM2.5-24B-A2B-QAD-Q4_0.gguf"))
 TMP     = pathlib.Path("/tmp/c1a")
 TMP.mkdir(exist_ok=True)
 

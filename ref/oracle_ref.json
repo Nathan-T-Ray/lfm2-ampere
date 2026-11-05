@@ -1,5 +1,5 @@
 {
- "model": "/home/nathan/qwen-serving/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf",
+ "model": "LFM2.5-24B-A2B-QAD-Q4_0.gguf",
  "engine": "llama.cpp/llama-server (oracle)",
  "n_predict": 128,
  "decode_tok_s_median": 227.07315126087687,

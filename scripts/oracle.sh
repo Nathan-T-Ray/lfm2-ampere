@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Manages the llama.cpp oracle (the ONLY valid correctness reference for the
-# QAD checkpoint).  Pinned to GPU 1; the engine under test uses GPU 0.
+# QAD checkpoint).  Runs on LK_ORACLE_GPU (see setenv.sh).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../setenv.sh" >/dev/null
@@ -14,7 +14,7 @@ CTX="${LK_ORACLE_CTX:-8192}"
 
 start() {
   if status >/dev/null 2>&1; then echo "oracle already running (pid $(cat "$PIDFILE"))"; return 0; fi
-  export LD_LIBRARY_PATH="$LK_OLLAMA_CUDA${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  if [ -n "$LK_ORACLE_LIBS" ]; then export LD_LIBRARY_PATH="$LK_ORACLE_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi
   export CUDA_VISIBLE_DEVICES="$LK_ORACLE_GPU"
   nohup "$LK_ORACLE" \
       -m "$LK_MODEL" \

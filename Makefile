@@ -3,7 +3,7 @@
 .RECIPEPREFIX = >
 .DEFAULT_GOAL := help
 
-CUDA_HOME ?= $(shell for c in $$HOME/local-agent-harnesses/model-scratch/cuda-12.6/usr/local/cuda-12.6 /model-scratch/cuda-12.6/usr/local/cuda-12.6 /usr/local/cuda; do [ -x $$c/bin/nvcc ] && echo $$c && break; done)
+CUDA_HOME ?= $(shell n=$$(command -v nvcc 2>/dev/null); if [ -n "$$n" ]; then dirname $$(dirname $$n); elif [ -x /usr/local/cuda/bin/nvcc ]; then echo /usr/local/cuda; fi)
 NVCC      := $(CUDA_HOME)/bin/nvcc
 ARCH      := -gencode arch=compute_86,code=sm_86
 # Sweepable tuning constants.
@@ -182,7 +182,7 @@ engine: $(BUILD)/engine
 # full-vocabulary logits and a whole-corpus teacher-forced pass both require
 # calling into the library.  LLAMA_DIR only has to point at a llama.cpp build
 # that produced versioned .so files.
-LLAMA_DIR ?= $(HOME)/.unsloth/llama.cpp
+LLAMA_DIR ?= $(HOME)/llama.cpp
 LLAMA_BIN := $(LLAMA_DIR)/build/bin
 
 $(BUILD)/oracle_logits: tools/oracle_logits.cpp | $(BUILD)
@@ -217,7 +217,7 @@ $(BUILD)/bench_attn: tests/bench_attn.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp
 bench-attn: $(BUILD)/bench_attn
 > @CUDA_VISIBLE_DEVICES=$(LK_GPU) ./$(BUILD)/bench_attn $(SEQ) $(ITERS) $(REPS)
 
-
+$(BUILD)/bench_launch: tests/bench_launch.cu $(BUILD)/flags.stamp | $(BUILD) check-cuda
 > $(NVCC) $(NVFLAGS) $< -o $@ $(LDFLAGS)
 
 $(BUILD)/bench_norm: tests/bench_norm.cu $(BUILD)/kernels.o $(BUILD)/flags.stamp | $(BUILD) check-cuda
