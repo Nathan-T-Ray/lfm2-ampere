@@ -1,12 +1,10 @@
 # lfm2-ampere
 
-A CUDA inference engine for [LFM2.5-24B-A2B](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B), written from scratch for one GPU: the RTX 3090 Ti (sm_86). Every kernel is hand-written, and every number here was measured on the card, not estimated.
+A CUDA inference engine for [LFM2.5-24B-A2B](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B), written from scratch for the RTX 3090 Ti (sm_86). 
 
 It processes prompts about twice as fast as llama.cpp tuned for the same job, and decodes about 1.6–1.8x faster at short context, on the same weights and the same hardware.
 
-Independent project. Not affiliated with Liquid AI.
-
-## The numbers
+## Figures
 
 Both engines ran the same GGUF, the same token ids, the same corpus. llama.cpp is shown at its defaults and at its best measured prefill setting (`-ub 4096 -b 4096`). One request per point, best of 2. Raw data in [`bench/`](bench/).
 
@@ -28,15 +26,9 @@ Both engines ran the same GGUF, the same token ids, the same corpus. llama.cpp i
   <img src="docs/media/decode_speed_light.svg" alt="Line chart: decode speed in tokens per second against context length. This engine runs 455.7 tok/s at short context falling to 184.9 at 131k; llama.cpp tuned runs 258.7 falling to 148.1. The lead is 1.76x at short context and 1.25x at 131k." width="860">
 </picture>
 
-The model quality is unchanged. Over 126,936 positions of a book-length corpus, the mean next-token loss is **4.3502** against llama.cpp's **4.3503** — the batched prefill does not degrade accuracy anywhere out to the full 131k context. Measured against exact float64 math computed from the weights, this engine is 0.014% off; llama.cpp is 0.220% off the same reference.
+The model quality is unchanged. Over 126,936 positions of a book-length corpus, the mean next-token loss is **4.3502** against llama.cpp's **4.3503**. The batched prefill does not degrade accuracy anywhere out to the full 131k context. Measured against exact float64 math computed from the weights, this engine is 0.014% off; llama.cpp is 0.220% off the same reference.
 
-## What this is, and what it isn't
-
-It is a single-stream, batch-1, greedy-decode engine for one model in one quantization (Q4_0, with the embeddings in Q6_K), on one 24 GB Ampere card. It reads the model's own GGUF, repacks the weights once into a layout the kernels like, and runs.
-
-It is not a server. There is no request handling, no continuous batching, no tokenizer (the engine takes token ids), and it will not run on anything except sm_86. The CUDA graph and the tile shapes are tuned for the 3090 Ti; Ada and Hopper want different choices.
-
-## How it works
+## Architecture
 
 The model is a hybrid: 40 layers, 30 of them short convolutions and 10 attention, with a 64-expert top-4 mixture of experts in every FFN. About 2B of its 24B parameters fire per token. The whole game at batch 1 is streaming 1.47 GB of weights per token from the GPU's memory as efficiently as possible.
 
@@ -112,15 +104,6 @@ The published raw results are in `bench/*_2026-10-22.json`. The accuracy gates:
 make gate-c2      # teacher-forced loss vs exact float64 math from the weights
 python3 tools/nllcurve.py   # per-position NLL vs llama.cpp out to 131k
 ```
-
-## What didn't work
-
-Not everything paid off, and the failures are in the tree with their measurements:
-
-- **Speculative decoding: rejected before building it.** Measuring the real expert routing showed consecutive tokens barely share experts. The draft pass would re-read experts the verify pass already evicted, and lm_head costs the same at every position. A net loss, proven with one afternoon of measurement.
-- **A persistent megakernel: built, bit-identical, slower.** Deleting the 343 kernel boundaries replaces them with threadfences that cost more than they save on Ampere.
-- **Warp-specialized GEMM: built, slower** (see above).
-- Several fusions that measured 0.2–1.6% slower and were switched off, each kept behind a flag so the negative result stays reproducible.
 
 ## Layout
 
